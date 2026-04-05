@@ -1184,7 +1184,14 @@ fi
 echo "Browser installed: $BROWSER"
 
 # ── Step 8: Set Xwrapper.config ─────────────────────────────────────
-sudo sh -c 'echo "allowed_users=anybody" > /etc/X11/Xwrapper.config'
+sudo mkdir -p /etc/X11
+sudo tee /etc/X11/Xwrapper.config > /dev/null <<XEOF
+allowed_users=anybody
+needs_root_rights=yes
+XEOF
+
+# Add user to video and tty groups for X server access
+sudo usermod -aG video,tty,input "$SERVICE_USER"
 
 # ── Step 9: Create kiosk.sh launch script ───────────────────────────
 sudo tee /opt/hamclock-lite/kiosk.sh > /dev/null <<KIOSKEOF
@@ -1221,7 +1228,12 @@ Wants=hamclock-lite.service
 Type=simple
 User=$SERVICE_USER
 Environment=DISPLAY=:0
-ExecStart=/usr/bin/xinit /opt/hamclock-lite/kiosk.sh -- :0 -nocursor
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty7
+TTYReset=yes
+TTYVHangup=yes
+ExecStart=/usr/bin/xinit /opt/hamclock-lite/kiosk.sh -- :0 vt7 -nocursor
 Restart=on-failure
 RestartSec=10
 

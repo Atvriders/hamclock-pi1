@@ -27,7 +27,11 @@ sudo apt update
 sudo apt install -y xserver-xorg xinit x11-xserver-utils unclutter curl
 
 # Allow any user to start X (needed for systemd service)
-sudo sh -c 'echo "allowed_users=anybody" > /etc/X11/Xwrapper.config'
+sudo mkdir -p /etc/X11
+sudo tee /etc/X11/Xwrapper.config > /dev/null <<XEOF
+allowed_users=anybody
+needs_root_rights=yes
+XEOF
 
 # Try browsers in order of lightness
 BROWSER=""
@@ -64,6 +68,9 @@ fi
 
 # Detect the user
 SERVICE_USER="${SUDO_USER:-$USER}"
+
+# Add user to video and tty groups for X server access
+sudo usermod -aG video,tty,input "$SERVICE_USER"
 
 # Create the hamclock service if not exists
 if ! systemctl is-enabled hamclock-lite &>/dev/null; then
@@ -124,7 +131,12 @@ Wants=hamclock-lite.service
 Type=simple
 User=$SERVICE_USER
 Environment=DISPLAY=:0
-ExecStart=/usr/bin/xinit /opt/hamclock-lite/kiosk.sh -- :0 -nocursor
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty7
+TTYReset=yes
+TTYVHangup=yes
+ExecStart=/usr/bin/xinit /opt/hamclock-lite/kiosk.sh -- :0 vt7 -nocursor
 Restart=on-failure
 RestartSec=10
 
