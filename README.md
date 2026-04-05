@@ -18,79 +18,11 @@ A lightweight ham radio dashboard that runs on the oldest Raspberry Pi. The Pi b
 
 ---
 
-## Step-by-Step Installation
+## Installation
 
-### Step 1: Install Raspberry Pi OS on the SD Card
+These steps assume your Pi is already running Raspberry Pi OS and you're logged in (either via SSH or directly on the Pi with a keyboard).
 
-If your Pi already has Raspberry Pi OS installed and you can connect to it, skip to Step 3.
-
-1. On your regular computer, download the **Raspberry Pi Imager** from:
-   - https://www.raspberrypi.com/software/
-2. Insert your microSD card into your computer
-3. Open Raspberry Pi Imager
-4. Click **"Choose OS"** → select **"Raspberry Pi OS (other)"** → select **"Raspberry Pi OS Lite (32-bit)"**
-5. Click **"Choose Storage"** → select your SD card
-6. Click the **gear icon** (⚙️) to open settings:
-   - **Enable SSH** — check the box
-   - **Set username and password** — pick something you'll remember (example: username `pi`, password `hamclock`)
-   - **Configure Wi-Fi** — enter your Wi-Fi name and password (if not using Ethernet)
-7. Click **"Write"** and wait for it to finish
-8. Remove the SD card from your computer
-
-### Step 2: Boot the Pi
-
-1. Insert the SD card into your Raspberry Pi
-2. Connect the Ethernet cable (if not using Wi-Fi)
-3. Connect the power supply — the Pi will boot automatically
-4. Wait about **60 seconds** for it to start up
-
-### Step 3: Find Your Pi's IP Address
-
-You need to know the Pi's IP address to connect to it. Try one of these:
-
-**Option A — Check your router:**
-Log into your router's admin page (usually `192.168.1.1`) and look for a device named `raspberrypi`.
-
-**Option B — Use your computer's terminal:**
-```
-ping raspberrypi.local
-```
-If it responds, your Pi's address is shown (like `192.168.1.42`).
-
-**Option C — If you have a monitor connected to the Pi:**
-Log in and type:
-```
-hostname -I
-```
-It will show the IP address.
-
-Write down the IP address — you'll need it.
-
-### Step 4: Connect to Your Pi via SSH
-
-On your computer, open a terminal (or PuTTY on Windows) and type:
-
-```bash
-ssh pi@YOUR_PI_IP_ADDRESS
-```
-
-Replace `YOUR_PI_IP_ADDRESS` with the actual address (like `192.168.1.42`).
-
-Example:
-```bash
-ssh pi@192.168.1.42
-```
-
-It will ask for your password — type the one you set in Step 1.
-
-If it asks "Are you sure you want to continue connecting?" type `yes` and press Enter.
-
-You should now see a command prompt like:
-```
-pi@raspberrypi:~ $
-```
-
-### Step 5: Update the Pi (Recommended)
+### Step 1: Update the Pi
 
 Type these commands one at a time, pressing Enter after each:
 
@@ -104,7 +36,7 @@ sudo apt upgrade -y
 ```
 Wait for it to finish (may take several minutes on Pi 1).
 
-### Step 6: Make Sure Python 3 and Git Are Installed
+### Step 2: Make Sure Python 3 and Git Are Installed
 
 Type:
 ```bash
@@ -124,7 +56,7 @@ You should see something like `git version 2.39.2`. If you get an error, install
 sudo apt install git -y
 ```
 
-### Step 7: Download HamClock Pi1
+### Step 3: Download HamClock Pi1
 
 Type:
 ```bash
@@ -136,7 +68,7 @@ Then go into the folder:
 cd hamclock-pi1
 ```
 
-### Step 8: Run the Kiosk Installer
+### Step 4: Run the Kiosk Installer
 
 Type:
 ```bash
@@ -154,7 +86,7 @@ The installer will:
 - Disable screen blanking so the display stays on 24/7
 - Start the dashboard
 
-### Step 9: Your Dashboard Is Live
+### Step 5: Your Dashboard Is Live
 
 Your Pi will reboot and display the dashboard fullscreen on its monitor — no login screen, no desktop, just HamClock.
 
