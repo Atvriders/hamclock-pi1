@@ -7,6 +7,7 @@ import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from urllib.request import urlopen, Request
 from urllib.error import URLError
+from urllib.parse import urlparse
 from xml.etree import ElementTree
 import os
 
@@ -37,7 +38,7 @@ def fetch_hamqsl():
 
         def gt(tag, default=''):
             el = sd.find(tag)
-            return el.text if el is not None and el.text else default
+            return el.text.strip() if el is not None and el.text else default
 
         solar = {
             'sfi': gt('solarflux', '0'),
@@ -177,13 +178,14 @@ class Handler(SimpleHTTPRequestHandler):
         super().__init__(*args, directory=os.path.dirname(os.path.abspath(__file__)), **kwargs)
 
     def do_GET(self):
-        if self.path == '/api/solar':
+        path = urlparse(self.path).path
+        if path == '/api/solar':
             self.send_json(CACHE.get('solar') or {})
-        elif self.path == '/api/bands':
+        elif path == '/api/bands':
             self.send_json(CACHE.get('bands') or {})
-        elif self.path == '/api/dxspots':
+        elif path == '/api/dxspots':
             self.send_json(CACHE.get('dxspots') or [])
-        elif self.path == '/api/health':
+        elif path == '/api/health':
             self.send_json({
                 'status': 'ok',
                 'solar_age': int(time.time() - CACHE['solar_updated']) if CACHE['solar_updated'] else -1,

@@ -681,8 +681,9 @@ body {
   }
 
   function escapeHtml(s) {
+    if (s === undefined || s === null) return '';
     var d = document.createElement('div');
-    d.appendChild(document.createTextNode(s));
+    d.appendChild(document.createTextNode(String(s)));
     return d.innerHTML;
   }
 
@@ -745,7 +746,11 @@ body {
   var BAND_ORDER = ['80m-40m', '30m-20m', '17m-15m', '12m-10m'];
 
   function renderBands(data) {
-    if (!data || Object.keys(data).length === 0) return;
+    if (!data || Object.keys(data).length === 0) {
+      document.getElementById('bandBody').innerHTML =
+        '<tr><td colspan="3" class="loading-text">No band data available</td></tr>';
+      return;
+    }
 
     var bands = Object.keys(data).sort(function(a, b) {
       var order = ['80m-40m', '30m-20m', '17m-15m', '12m-10m'];
@@ -774,7 +779,12 @@ body {
 
   // --- Render DX ---
   function renderDX(spots) {
-    if (!spots || spots.length === 0) return;
+    if (!spots || spots.length === 0) {
+      document.getElementById('dxBody').innerHTML =
+        '<tr><td colspan="6" class="loading-text">No DX spots available</td></tr>';
+      document.getElementById('dxUpdated').textContent = '0 spots';
+      return;
+    }
 
     var html = '';
     for (var i = 0; i < spots.length; i++) {

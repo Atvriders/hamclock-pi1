@@ -22,10 +22,12 @@ Lightweight ham radio dashboard designed for the Raspberry Pi 1 (ARMv6). Display
 git clone https://github.com/Atvriders/hamclock-pi1.git
 cd hamclock-pi1
 chmod +x install.sh
-sudo ./install.sh
+./install.sh
 ```
 
-This installs a systemd service that starts automatically on boot.
+This installs a systemd service that starts automatically on boot. The installer uses `sudo` internally and detects the current user automatically (no hardcoded `pi` username).
+
+Running the installer a second time will update files and restart the service.
 
 ## Manual Run
 
@@ -33,7 +35,7 @@ This installs a systemd service that starts automatically on boot.
 python3 server.py
 ```
 
-Open `http://<pi-ip>:8080` in a browser.
+Open `http://<pi-ip>:8080` in a browser (default port 8080).
 
 ## API Endpoints
 
