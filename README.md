@@ -18,16 +18,6 @@ A lightweight ham radio dashboard that runs on the oldest Raspberry Pi. The Pi b
 
 ## Installation
 
-### Quick Install (one command)
-
-If you just want to get it running:
-```bash
-curl -sL https://hamclock-reborn.org/downloads/pi1-install.sh | bash
-```
-This works even if GitHub is blocked. Skip to Step 5 after running this.
-
-### Full Install (from GitHub)
-
 These steps assume your Pi is already running Raspberry Pi OS and you're logged in (either via SSH or directly on the Pi with a keyboard).
 
 ### Step 1: Update the Pi
@@ -236,9 +226,9 @@ Total memory usage: ~15MB. Works on Pi 1 (700MHz, 512MB RAM) and up.
 
 ---
 
-## Alternative: Install Without GitHub
+## Alternative: Quick Install (No GitHub Needed)
 
-If GitHub is blocked on your network (common on college/school networks), you can install directly from hamclock-reborn.org:
+If GitHub is blocked on your network (common on college/school networks), you can install with one command directly from hamclock-reborn.org:
 
 ```bash
 curl -sL https://hamclock-reborn.org/downloads/pi1-install.sh | bash
