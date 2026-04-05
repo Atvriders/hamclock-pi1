@@ -1,28 +1,44 @@
 #!/bin/bash
-# HamClock Pi1 — Offline Installer
-# This single file contains everything needed.
-# Download this on any computer, copy to USB, run on your Pi.
+# HamClock Pi1 — Full Installer (Kiosk + Server)
+# Self-contained: all files are embedded, no external downloads needed.
 #
-# Usage:
+# Usage (online — curl pipe is safe because main() only runs after full download):
+#   curl -sL https://hamclock-reborn.org/downloads/pi1-install.sh | bash
+#
+# Usage (offline — copy to USB):
 #   1. Copy this file to a USB drive
 #   2. Plug USB into your Pi
 #   3. Mount the USB: sudo mount /dev/sda1 /mnt
 #   4. Run: bash /mnt/offline-install.sh
 #   5. Unplug USB when done
 
+main() {
 set -euo pipefail
-
-echo "=== HamClock Pi1 — Offline Installer ==="
-echo ""
 
 INSTALL_DIR="/opt/hamclock-lite"
 SERVICE_USER="${SUDO_USER:-$USER}"
 
-# Create install directory
-sudo mkdir -p "$INSTALL_DIR"
+echo "=== HamClock Pi1 — Full Installer ==="
+echo "This will install HamClock with kiosk mode (fullscreen on monitor)."
+echo "Estimated time: 15-30 minutes on Pi 1"
+echo ""
 
-# Write server.py
+# ── Step 1: Check Python 3 ──────────────────────────────────────────
+if ! command -v python3 &>/dev/null; then
+    echo "ERROR: Python 3 is required. Run: sudo apt install python3"
+    exit 1
+fi
+
+# ── Step 2: Check internet connectivity (needed for apt) ────────────
+if ! ping -c 1 -W 3 google.com &>/dev/null && ! ping -c 1 -W 3 8.8.8.8 &>/dev/null; then
+    echo "ERROR: No internet connection detected."
+    echo "Please connect the Pi to the internet and try again."
+    exit 1
+fi
+
+# ── Step 3: Write embedded server.py ────────────────────────────────
 echo "Writing server.py..."
+sudo mkdir -p "$INSTALL_DIR"
 sudo tee "$INSTALL_DIR/server.py" > /dev/null << 'SERVEREOF'
 #!/usr/bin/env python3
 """HamClock Lite — Lightweight server for Raspberry Pi 1"""
@@ -256,8 +272,9 @@ if __name__ == '__main__':
     print(f'Server ready: http://localhost:{PORT}')
     server.serve_forever()
 SERVEREOF
+sudo chmod +x "$INSTALL_DIR/server.py"
 
-# Write index.html
+# ── Step 4: Write embedded index.html ───────────────────────────────
 echo "Writing index.html..."
 sudo tee "$INSTALL_DIR/index.html" > /dev/null << 'HTMLEOF'
 <!DOCTYPE html>
@@ -1115,10 +1132,8 @@ body {
 </html>
 HTMLEOF
 
-sudo chmod +x "$INSTALL_DIR/server.py"
-
-# Create systemd service
-echo "Creating service..."
+# ── Step 5: Create hamclock-lite systemd service ────────────────────
+echo "Creating HamClock server service..."
 sudo tee /etc/systemd/system/hamclock-lite.service > /dev/null <<EOF
 [Unit]
 Description=HamClock Lite Server
@@ -1139,28 +1154,122 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable hamclock-lite
+sudo systemctl start hamclock-lite
 
-if systemctl is-active --quiet hamclock-lite; then
-    sudo systemctl restart hamclock-lite
-    echo "Service restarted."
-else
-    sudo systemctl start hamclock-lite
-    echo "Service started."
+# ── Step 6: Install X server packages ───────────────────────────────
+echo "Installing display server and browser (this may take 15-30 minutes on a Pi 1)..."
+sudo apt update
+sudo apt install -y xserver-xorg xinit x11-xserver-utils unclutter curl
+
+# ── Step 7: Try browser fallback chain ──────────────────────────────
+BROWSER=""
+BROWSER_CMD=""
+for pkg in surf epiphany-browser midori chromium-browser chromium; do
+    if sudo apt install -y "$pkg" 2>&1 | tail -1; then
+        case "$pkg" in
+            surf) BROWSER="surf"; BROWSER_CMD="surf http://localhost:8080" ;;
+            epiphany-browser) BROWSER="epiphany"; BROWSER_CMD="epiphany-browser --application-mode http://localhost:8080" ;;
+            midori) BROWSER="midori"; BROWSER_CMD="midori -e Fullscreen -a http://localhost:8080" ;;
+            chromium-browser|chromium) BROWSER="chromium"; BROWSER_CMD="$pkg --kiosk --noerrdialogs --disable-translate --no-first-run --disable-features=TranslateUI --disk-cache-size=0 http://localhost:8080" ;;
+        esac
+        break
+    fi
+done
+
+if [ -z "$BROWSER" ]; then
+    echo "ERROR: Could not install any browser (tried surf, epiphany, midori, chromium)."
+    echo "Please install a browser manually and re-run this script."
+    exit 1
+fi
+echo "Browser installed: $BROWSER"
+
+# ── Step 8: Set Xwrapper.config ─────────────────────────────────────
+sudo sh -c 'echo "allowed_users=anybody" > /etc/X11/Xwrapper.config'
+
+# ── Step 9: Create kiosk.sh launch script ───────────────────────────
+sudo tee /opt/hamclock-lite/kiosk.sh > /dev/null <<KIOSKEOF
+#!/bin/bash
+# Wait for HamClock server to be ready
+for i in \$(seq 1 30); do
+    if curl -s http://localhost:8080/api/health > /dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
+# Disable screen blanking and power management
+xset s off
+xset -dpms
+xset s noblank
+
+# Hide mouse cursor after 3 seconds of inactivity
+unclutter -idle 3 -root &
+
+# Launch browser fullscreen
+exec $BROWSER_CMD
+KIOSKEOF
+sudo chmod +x /opt/hamclock-lite/kiosk.sh
+
+# ── Step 10: Create hamclock-kiosk systemd service ──────────────────
+sudo tee /etc/systemd/system/hamclock-kiosk.service > /dev/null <<EOF
+[Unit]
+Description=HamClock Kiosk Display
+After=hamclock-lite.service
+Wants=hamclock-lite.service
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+Environment=DISPLAY=:0
+ExecStart=/usr/bin/xinit /opt/hamclock-lite/kiosk.sh -- :0 -nocursor
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ── Step 11: Fix consoleblank in cmdline.txt ────────────────────────
+CMDLINE=""
+if [ -f /boot/firmware/cmdline.txt ]; then
+    CMDLINE="/boot/firmware/cmdline.txt"
+elif [ -f /boot/cmdline.txt ]; then
+    CMDLINE="/boot/cmdline.txt"
+fi
+if [ -n "$CMDLINE" ]; then
+    if ! grep -q "consoleblank=0" "$CMDLINE"; then
+        sudo sed -i 's/$/ consoleblank=0/' "$CMDLINE"
+    fi
 fi
 
-sleep 2
-if systemctl is-active --quiet hamclock-lite; then
-    PI_IP=$(hostname -I | awk '{print $1}')
-    echo ""
-    echo "=== Installation Complete ==="
-    echo "HamClock is running at: http://${PI_IP}:8080"
-    echo ""
-    echo "Open that URL in any browser on the same network."
-    echo ""
-    echo "Commands:"
-    echo "  sudo systemctl status hamclock-lite   — check status"
-    echo "  sudo systemctl restart hamclock-lite  — restart"
-    echo "  journalctl -u hamclock-lite -f        — view logs"
-else
-    echo "WARNING: Service failed to start. Check: journalctl -u hamclock-lite"
-fi
+# ── Step 12: Enable and start both services ─────────────────────────
+sudo systemctl daemon-reload
+sudo systemctl enable hamclock-lite hamclock-kiosk
+# Always restart to pick up any file changes
+sudo systemctl restart hamclock-lite
+sudo systemctl restart hamclock-kiosk
+
+# ── Step 13: Print IP address and completion message ────────────────
+PI_IP=$(hostname -I | awk '{print $1}')
+
+echo ""
+echo "=== Installation Complete — Kiosk Mode Installed ==="
+echo "HamClock will now display fullscreen on this Pi's monitor."
+echo "It will auto-start on every boot."
+echo ""
+echo "Browser: $BROWSER"
+echo ""
+echo "Commands:"
+echo "  sudo systemctl status hamclock-kiosk   — check kiosk status"
+echo "  sudo systemctl restart hamclock-kiosk  — restart display"
+echo "  sudo systemctl stop hamclock-kiosk     — stop display"
+echo "  sudo systemctl disable hamclock-kiosk  — disable auto-start"
+echo ""
+echo "To go back to normal CLI, run:"
+echo "  sudo systemctl disable hamclock-kiosk"
+echo "  sudo systemctl stop hamclock-kiosk"
+echo ""
+echo "Also accessible from any browser at: http://${PI_IP}:8080"
+
+}
+main "$@"
