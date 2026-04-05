@@ -17,7 +17,7 @@ fi
 # Install minimal X server + lightweight browser
 echo "Installing display server and browser (this may take a few minutes)..."
 sudo apt update
-sudo apt install -y xserver-xorg xinit x11-xserver-utils unclutter
+sudo apt install -y xserver-xorg xinit x11-xserver-utils unclutter curl
 # Try surf first (lightest), fall back to midori, then chromium-browser
 if sudo apt install -y surf 2>/dev/null; then
     BROWSER="surf"
@@ -117,8 +117,18 @@ sudo systemctl daemon-reload
 sudo systemctl enable hamclock-kiosk
 sudo systemctl start hamclock-kiosk
 
-# Disable console blanking
-sudo sh -c 'echo "consoleblank=0" >> /boot/cmdline.txt' 2>/dev/null || true
+# Disable console blanking (must stay on a single line in cmdline.txt)
+CMDLINE=""
+if [ -f /boot/firmware/cmdline.txt ]; then
+    CMDLINE="/boot/firmware/cmdline.txt"
+elif [ -f /boot/cmdline.txt ]; then
+    CMDLINE="/boot/cmdline.txt"
+fi
+if [ -n "$CMDLINE" ]; then
+    if ! grep -q "consoleblank=0" "$CMDLINE"; then
+        sudo sed -i 's/$/ consoleblank=0/' "$CMDLINE"
+    fi
+fi
 
 echo ""
 echo "=== Kiosk Mode Installed ==="
