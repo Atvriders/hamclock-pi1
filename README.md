@@ -8,13 +8,11 @@ A lightweight ham radio dashboard that runs on the oldest Raspberry Pi. The Pi b
 
 ## What You Need
 
-- A **Raspberry Pi** (any model — designed for Pi 1, works on all)
-- A **microSD card** (8GB or larger)
-- A **power supply** for your Pi
-- An **Ethernet cable** or **Wi-Fi adapter** (Pi needs internet)
+- A **Raspberry Pi** running Raspberry Pi OS (any model — designed for Pi 1, works on all)
+- An **internet connection** (Ethernet or Wi-Fi)
 - A **monitor/TV** connected to the Pi (HDMI or composite)
-- A **computer** on the same network (for SSH setup)
-- About **15 minutes** of your time
+- A **keyboard** (for typing the install commands)
+- About **10 minutes** of your time
 
 ---
 
@@ -88,20 +86,17 @@ The installer will:
 
 ### Step 5: Your Dashboard Is Live
 
-Your Pi will reboot and display the dashboard fullscreen on its monitor — no login screen, no desktop, just HamClock.
+The dashboard will appear fullscreen on your Pi's monitor — no desktop, just HamClock.
 
-It also works from any browser on the same network at:
+It also works from any other device on the same network. Open a browser and go to:
 
 ```
 http://YOUR_PI_IP_ADDRESS:8080
 ```
 
-Example:
-```
-http://192.168.1.42:8080
-```
+To find your Pi's IP address, type `hostname -I` on the Pi.
 
-**You should see the HamClock dashboard with solar data, band conditions, and DX spots on the Pi's screen and in any browser!**
+**After a reboot, HamClock starts automatically — no need to log in or type anything.**
 
 ---
 
@@ -196,9 +191,9 @@ Running the installer again is safe — it will update the files and restart the
 - Try refreshing the page in your browser (Ctrl+R or F5)
 
 **Forgot the Pi's IP address:**
-- On the Pi (if you have a monitor): type `hostname -I`
-- On your router's admin page: look for `raspberrypi`
-- On your computer: try `ping raspberrypi.local`
+- On the Pi: press Ctrl+Alt+F2 to get a terminal, log in, type `hostname -I`
+- On your router's admin page: look for a device named `raspberrypi`
+- On another computer: try `ping raspberrypi.local`
 
 ---
 
