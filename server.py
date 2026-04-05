@@ -20,12 +20,42 @@ CACHE = {
     'solar': None,
     'bands': None,
     'dxspots': None,
+    'solar_image': None,
     'solar_updated': 0,
     'bands_updated': 0,
     'dx_updated': 0,
+    'solar_image_updated': 0,
+    'muf_image': None,
+    'muf_image_updated': 0,
+    'hrdlog_image': None,
+    'hrdlog_image_updated': 0,
 }
 
 UA = 'HamClockLite/1.0'
+
+# Solar image proxy (NASA SDO)
+SDO_URL = 'https://sdo.gsfc.nasa.gov/assets/img/latest/latest_256_HMIIC.jpg'
+
+# Approximate lat/lng for top DXCC entities
+COUNTRY_COORDS = {
+    'United States': (39, -98), 'Russia': (55, 37), 'Germany': (51, 10),
+    'Japan': (36, 140), 'United Kingdom': (52, -1), 'France': (47, 2),
+    'Italy': (42, 12), 'Spain': (40, -4), 'Brazil': (-15, -47),
+    'Canada': (45, -75), 'Australia': (-25, 134), 'China': (35, 105),
+    'India': (20, 77), 'Netherlands': (52, 5), 'Poland': (52, 20),
+    'Sweden': (59, 18), 'Argentina': (-34, -58), 'South Africa': (-26, 28),
+    'Greece': (38, 24), 'Belgium': (51, 4), 'Portugal': (39, -8),
+    'Czech Republic': (50, 15), 'Austria': (48, 16), 'Ukraine': (49, 32),
+    'Finland': (61, 25), 'Norway': (60, 11), 'Denmark': (56, 10),
+    'Switzerland': (47, 8), 'Croatia': (45, 16), 'Romania': (45, 25),
+    'Hungary': (47, 19), 'Ireland': (53, -8), 'Serbia': (44, 21),
+    'Bulgaria': (43, 25), 'New Zealand': (-41, 175), 'Chile': (-33, -71),
+    'Mexico': (19, -99), 'Colombia': (4, -74), 'Thailand': (14, 101),
+    'Indonesia': (-5, 120), 'Philippines': (13, 122), 'South Korea': (37, 127),
+    'Turkey': (39, 35), 'Israel': (32, 35), 'Egypt': (30, 31),
+    'Nigeria': (10, 8), 'Kenya': (-1, 37), 'Morocco': (32, -5),
+    'French Guiana': (4, -53), 'Cuba': (22, -80),
+}
 
 
 def fetch_hamqsl():
@@ -134,6 +164,8 @@ def fetch_dx():
                     # Format: spotter^freq^dx^comment^time^...
                     freq = parts[1].strip()
                     freq_khz = float(freq)
+                    country = parts[10].strip() if len(parts) > 10 else ''
+                    coords = COUNTRY_COORDS.get(country)
                     spot = {
                         'frequency': freq,
                         'spotter': parts[0].strip(),
@@ -141,6 +173,9 @@ def fetch_dx():
                         'comment': parts[3].strip() if len(parts) > 3 else '',
                         'time': parts[4].strip() if len(parts) > 4 else '',
                         'band': freq_to_band(freq_khz),
+                        'country': country,
+                        'lat': coords[0] if coords else None,
+                        'lng': coords[1] if coords else None,
                     }
                     spots.append(spot)
                 except (ValueError, IndexError):
@@ -156,10 +191,38 @@ def fetch_dx():
     print(f'[{time.strftime("%H:%M:%S")}] All DX sources failed')
 
 
+def fetch_muf():
+    """Fetch KC2G MUF propagation map SVG"""
+    try:
+        req = Request('https://prop.kc2g.com/renders/current/mufd-normal-now.svg', headers={'User-Agent': UA})
+        with urlopen(req, timeout=20) as resp:
+            data = resp.read()
+        CACHE['muf_image'] = data
+        CACHE['muf_image_updated'] = time.time()
+        print(f'[{time.strftime("%H:%M:%S")}] MUF map updated ({len(data)} bytes)')
+    except Exception as e:
+        print(f'[{time.strftime("%H:%M:%S")}] MUF map fetch failed: {e}')
+
+
+def fetch_hrdlog():
+    """Fetch HRDLog/HamQSL propagation image"""
+    try:
+        req = Request('https://www.hamqsl.com/solar101pic.php', headers={'User-Agent': UA})
+        with urlopen(req, timeout=20) as resp:
+            data = resp.read()
+        CACHE['hrdlog_image'] = data
+        CACHE['hrdlog_image_updated'] = time.time()
+        print(f'[{time.strftime("%H:%M:%S")}] HRDLog image updated ({len(data)} bytes)')
+    except Exception as e:
+        print(f'[{time.strftime("%H:%M:%S")}] HRDLog image fetch failed: {e}')
+
+
 def background_fetcher():
     """Background thread to periodically fetch data"""
     fetch_hamqsl()
     fetch_dx()
+    fetch_muf()
+    fetch_hrdlog()
 
     # Fast retry if initial fetch failed (network might not be ready yet)
     for _ in range(6):
@@ -173,8 +236,12 @@ def background_fetcher():
 
     solar_interval = 300  # 5 minutes
     dx_interval = 120     # 2 minutes
+    muf_interval = 900    # 15 minutes
+    hrdlog_interval = 900 # 15 minutes
     last_solar = time.time()
     last_dx = time.time()
+    last_muf = time.time()
+    last_hrdlog = time.time()
 
     while True:
         time.sleep(10)
@@ -185,6 +252,12 @@ def background_fetcher():
         if now - last_dx >= dx_interval:
             fetch_dx()
             last_dx = now
+        if now - last_muf >= muf_interval:
+            fetch_muf()
+            last_muf = now
+        if now - last_hrdlog >= hrdlog_interval:
+            fetch_hrdlog()
+            last_hrdlog = now
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -199,6 +272,38 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_json(CACHE.get('bands') or {})
         elif path == '/api/dxspots':
             self.send_json(CACHE.get('dxspots') or [])
+        elif path == '/api/solar-image':
+            # Fetch/cache SDO solar image (15 min cache)
+            now = time.time()
+            if CACHE['solar_image'] is None or now - CACHE['solar_image_updated'] > 900:
+                try:
+                    req = Request(SDO_URL, headers={'User-Agent': UA})
+                    with urlopen(req, timeout=20) as resp:
+                        CACHE['solar_image'] = resp.read()
+                        CACHE['solar_image_updated'] = now
+                except Exception as e:
+                    print(f'[{time.strftime("%H:%M:%S")}] SDO image fetch failed: {e}')
+                    if CACHE['solar_image'] is None:
+                        self.send_error(502, 'Failed to fetch solar image')
+                        return
+            self.send_binary(CACHE['solar_image'], 'image/jpeg')
+        elif path.startswith('/api/muf-map'):
+            if CACHE.get('muf_image'):
+                body = CACHE['muf_image']
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/svg+xml')
+                self.send_header('Content-Length', len(body))
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Cache-Control', 'public, max-age=300')
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_json({'error': 'MUF map not yet loaded'})
+        elif path.startswith('/api/hrdlog-image'):
+            if CACHE.get('hrdlog_image'):
+                self.send_binary(CACHE['hrdlog_image'], 'image/gif')
+            else:
+                self.send_json({'error': 'HRDLog image not yet loaded'})
         elif path == '/api/health':
             self.send_json({
                 'status': 'ok',
@@ -217,6 +322,15 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         self.wfile.write(body)
+
+    def send_binary(self, data, content_type):
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', len(data))
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Cache-Control', 'public, max-age=900')
+        self.end_headers()
+        self.wfile.write(data)
 
     def log_message(self, format, *args):
         pass  # Suppress request logs for performance

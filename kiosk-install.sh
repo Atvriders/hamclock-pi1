@@ -66,6 +66,9 @@ if [ ! -f "$INSTALL_DIR/server.py" ]; then
     sudo chmod +x "$INSTALL_DIR/server.py"
 fi
 
+# Copy X11 monitor config for auto-detect resolution (16-bit saves RAM on Pi 1)
+sudo cp "$SCRIPT_DIR/10-monitor.conf" /usr/share/X11/xorg.conf.d/10-monitor.conf 2>/dev/null || true
+
 # Detect the user
 SERVICE_USER="${SUDO_USER:-$USER}"
 
@@ -161,6 +164,18 @@ if [ -n "$CMDLINE" ]; then
     if ! grep -q "consoleblank=0" "$CMDLINE"; then
         sudo sed -i 's/$/ consoleblank=0/' "$CMDLINE"
     fi
+fi
+
+# Force HDMI output even if no monitor detected at boot
+BOOT_CONFIG=""
+if [ -f /boot/firmware/config.txt ]; then
+    BOOT_CONFIG="/boot/firmware/config.txt"
+elif [ -f /boot/config.txt ]; then
+    BOOT_CONFIG="/boot/config.txt"
+fi
+if [ -n "$BOOT_CONFIG" ]; then
+    grep -q "hdmi_force_hotplug" "$BOOT_CONFIG" || sudo sh -c "echo 'hdmi_force_hotplug=1' >> $BOOT_CONFIG"
+    grep -q "hdmi_drive" "$BOOT_CONFIG" || sudo sh -c "echo 'hdmi_drive=2' >> $BOOT_CONFIG"
 fi
 
 echo ""

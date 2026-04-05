@@ -62,12 +62,42 @@ CACHE = {
     'solar': None,
     'bands': None,
     'dxspots': None,
+    'solar_image': None,
     'solar_updated': 0,
     'bands_updated': 0,
     'dx_updated': 0,
+    'solar_image_updated': 0,
+    'muf_image': None,
+    'muf_image_updated': 0,
+    'hrdlog_image': None,
+    'hrdlog_image_updated': 0,
 }
 
 UA = 'HamClockLite/1.0'
+
+# Solar image proxy (NASA SDO)
+SDO_URL = 'https://sdo.gsfc.nasa.gov/assets/img/latest/latest_256_HMIIC.jpg'
+
+# Approximate lat/lng for top DXCC entities
+COUNTRY_COORDS = {
+    'United States': (39, -98), 'Russia': (55, 37), 'Germany': (51, 10),
+    'Japan': (36, 140), 'United Kingdom': (52, -1), 'France': (47, 2),
+    'Italy': (42, 12), 'Spain': (40, -4), 'Brazil': (-15, -47),
+    'Canada': (45, -75), 'Australia': (-25, 134), 'China': (35, 105),
+    'India': (20, 77), 'Netherlands': (52, 5), 'Poland': (52, 20),
+    'Sweden': (59, 18), 'Argentina': (-34, -58), 'South Africa': (-26, 28),
+    'Greece': (38, 24), 'Belgium': (51, 4), 'Portugal': (39, -8),
+    'Czech Republic': (50, 15), 'Austria': (48, 16), 'Ukraine': (49, 32),
+    'Finland': (61, 25), 'Norway': (60, 11), 'Denmark': (56, 10),
+    'Switzerland': (47, 8), 'Croatia': (45, 16), 'Romania': (45, 25),
+    'Hungary': (47, 19), 'Ireland': (53, -8), 'Serbia': (44, 21),
+    'Bulgaria': (43, 25), 'New Zealand': (-41, 175), 'Chile': (-33, -71),
+    'Mexico': (19, -99), 'Colombia': (4, -74), 'Thailand': (14, 101),
+    'Indonesia': (-5, 120), 'Philippines': (13, 122), 'South Korea': (37, 127),
+    'Turkey': (39, 35), 'Israel': (32, 35), 'Egypt': (30, 31),
+    'Nigeria': (10, 8), 'Kenya': (-1, 37), 'Morocco': (32, -5),
+    'French Guiana': (4, -53), 'Cuba': (22, -80),
+}
 
 
 def fetch_hamqsl():
@@ -176,6 +206,8 @@ def fetch_dx():
                     # Format: spotter^freq^dx^comment^time^...
                     freq = parts[1].strip()
                     freq_khz = float(freq)
+                    country = parts[10].strip() if len(parts) > 10 else ''
+                    coords = COUNTRY_COORDS.get(country)
                     spot = {
                         'frequency': freq,
                         'spotter': parts[0].strip(),
@@ -183,6 +215,9 @@ def fetch_dx():
                         'comment': parts[3].strip() if len(parts) > 3 else '',
                         'time': parts[4].strip() if len(parts) > 4 else '',
                         'band': freq_to_band(freq_khz),
+                        'country': country,
+                        'lat': coords[0] if coords else None,
+                        'lng': coords[1] if coords else None,
                     }
                     spots.append(spot)
                 except (ValueError, IndexError):
@@ -198,10 +233,38 @@ def fetch_dx():
     print(f'[{time.strftime("%H:%M:%S")}] All DX sources failed')
 
 
+def fetch_muf():
+    """Fetch KC2G MUF propagation map SVG"""
+    try:
+        req = Request('https://prop.kc2g.com/renders/current/mufd-normal-now.svg', headers={'User-Agent': UA})
+        with urlopen(req, timeout=20) as resp:
+            data = resp.read()
+        CACHE['muf_image'] = data
+        CACHE['muf_image_updated'] = time.time()
+        print(f'[{time.strftime("%H:%M:%S")}] MUF map updated ({len(data)} bytes)')
+    except Exception as e:
+        print(f'[{time.strftime("%H:%M:%S")}] MUF map fetch failed: {e}')
+
+
+def fetch_hrdlog():
+    """Fetch HRDLog/HamQSL propagation image"""
+    try:
+        req = Request('https://www.hamqsl.com/solar101pic.php', headers={'User-Agent': UA})
+        with urlopen(req, timeout=20) as resp:
+            data = resp.read()
+        CACHE['hrdlog_image'] = data
+        CACHE['hrdlog_image_updated'] = time.time()
+        print(f'[{time.strftime("%H:%M:%S")}] HRDLog image updated ({len(data)} bytes)')
+    except Exception as e:
+        print(f'[{time.strftime("%H:%M:%S")}] HRDLog image fetch failed: {e}')
+
+
 def background_fetcher():
     """Background thread to periodically fetch data"""
     fetch_hamqsl()
     fetch_dx()
+    fetch_muf()
+    fetch_hrdlog()
 
     # Fast retry if initial fetch failed (network might not be ready yet)
     for _ in range(6):
@@ -215,8 +278,12 @@ def background_fetcher():
 
     solar_interval = 300  # 5 minutes
     dx_interval = 120     # 2 minutes
+    muf_interval = 900    # 15 minutes
+    hrdlog_interval = 900 # 15 minutes
     last_solar = time.time()
     last_dx = time.time()
+    last_muf = time.time()
+    last_hrdlog = time.time()
 
     while True:
         time.sleep(10)
@@ -227,6 +294,12 @@ def background_fetcher():
         if now - last_dx >= dx_interval:
             fetch_dx()
             last_dx = now
+        if now - last_muf >= muf_interval:
+            fetch_muf()
+            last_muf = now
+        if now - last_hrdlog >= hrdlog_interval:
+            fetch_hrdlog()
+            last_hrdlog = now
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -241,6 +314,38 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_json(CACHE.get('bands') or {})
         elif path == '/api/dxspots':
             self.send_json(CACHE.get('dxspots') or [])
+        elif path == '/api/solar-image':
+            # Fetch/cache SDO solar image (15 min cache)
+            now = time.time()
+            if CACHE['solar_image'] is None or now - CACHE['solar_image_updated'] > 900:
+                try:
+                    req = Request(SDO_URL, headers={'User-Agent': UA})
+                    with urlopen(req, timeout=20) as resp:
+                        CACHE['solar_image'] = resp.read()
+                        CACHE['solar_image_updated'] = now
+                except Exception as e:
+                    print(f'[{time.strftime("%H:%M:%S")}] SDO image fetch failed: {e}')
+                    if CACHE['solar_image'] is None:
+                        self.send_error(502, 'Failed to fetch solar image')
+                        return
+            self.send_binary(CACHE['solar_image'], 'image/jpeg')
+        elif path.startswith('/api/muf-map'):
+            if CACHE.get('muf_image'):
+                body = CACHE['muf_image']
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/svg+xml')
+                self.send_header('Content-Length', len(body))
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Cache-Control', 'public, max-age=300')
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_json({'error': 'MUF map not yet loaded'})
+        elif path.startswith('/api/hrdlog-image'):
+            if CACHE.get('hrdlog_image'):
+                self.send_binary(CACHE['hrdlog_image'], 'image/gif')
+            else:
+                self.send_json({'error': 'HRDLog image not yet loaded'})
         elif path == '/api/health':
             self.send_json({
                 'status': 'ok',
@@ -259,6 +364,15 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         self.wfile.write(body)
+
+    def send_binary(self, data, content_type):
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', len(data))
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Cache-Control', 'public, max-age=900')
+        self.end_headers()
+        self.wfile.write(data)
 
     def log_message(self, format, *args):
         pass  # Suppress request logs for performance
@@ -768,6 +882,104 @@ body {
 .c-poor { color: var(--poor); }
 .c-accent { color: var(--accent); }
 .c-dim { color: var(--text-dim); }
+
+/* World map */
+.map-container {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 2 / 1;
+  background: #080c12;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.map-container svg {
+  width: 100%;
+  height: 100%;
+}
+
+.map-spot {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  opacity: 0.9;
+  box-shadow: 0 0 6px currentColor;
+  pointer-events: none;
+}
+
+.map-spot.pulse {
+  animation: map-pulse 2s ease-in-out infinite;
+}
+
+@keyframes map-pulse {
+  0%, 100% { opacity: 0.9; transform: translate(-50%, -50%) scale(1); }
+  50% { opacity: 0.5; transform: translate(-50%, -50%) scale(1.5); }
+}
+
+/* Solar image card */
+.solar-img-wrap {
+  text-align: center;
+  padding: 12px;
+}
+
+.solar-img-wrap img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  box-shadow: 0 0 20px #f9731620;
+}
+
+/* Full-width row for propagation cards */
+.prop-row {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+  padding: 0 12px 12px;
+  max-width: 1600px;
+  margin: 0 auto;
+}
+
+.prop-row-2col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  padding: 0 12px 12px;
+  max-width: 1600px;
+  margin: 0 auto;
+}
+
+@media (max-width: 900px) {
+  .prop-row-2col { grid-template-columns: 1fr; }
+}
+
+.muf-img-wrap {
+  text-align: center;
+  padding: 12px;
+  background: #080c12;
+}
+
+.muf-img-wrap img, .muf-img-wrap object {
+  max-width: 100%;
+  height: auto;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+.hrdlog-img-wrap {
+  text-align: center;
+  padding: 12px;
+}
+
+.hrdlog-img-wrap img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
 </style>
 </head>
 <body>
@@ -847,10 +1059,59 @@ body {
       </div>
     </div>
 
+    <!-- Solar Image -->
+    <div class="card" style="margin-top:12px">
+      <div class="card-header">
+        <h2>Solar Image</h2>
+        <span class="badge mono">SDO/HMI</span>
+      </div>
+      <div class="solar-img-wrap">
+        <img id="solarImage" src="/api/solar-image" alt="SDO Solar Image" width="256" height="256" loading="lazy">
+      </div>
+    </div>
+
   </div>
 
   <!-- Right column — DX Cluster -->
   <div class="right-col">
+
+    <!-- DX World Map -->
+    <div class="card" style="margin-bottom:12px">
+      <div class="card-header">
+        <h2>DX Map</h2>
+        <span class="badge mono" id="mapSpotCount">--</span>
+      </div>
+      <div class="card-body" style="padding:8px">
+        <div class="map-container" id="mapContainer">
+          <svg viewBox="0 0 720 360" xmlns="http://www.w3.org/2000/svg">
+            <!-- Grid lines -->
+            <line x1="0" y1="180" x2="720" y2="180" stroke="#1e2a3a" stroke-width="0.5" stroke-dasharray="4,4"/>
+            <line x1="360" y1="0" x2="360" y2="360" stroke="#1e2a3a" stroke-width="0.5" stroke-dasharray="4,4"/>
+            <line x1="0" y1="90" x2="720" y2="90" stroke="#1a2332" stroke-width="0.3" stroke-dasharray="2,6"/>
+            <line x1="0" y1="270" x2="720" y2="270" stroke="#1a2332" stroke-width="0.3" stroke-dasharray="2,6"/>
+            <line x1="180" y1="0" x2="180" y2="360" stroke="#1a2332" stroke-width="0.3" stroke-dasharray="2,6"/>
+            <line x1="540" y1="0" x2="540" y2="360" stroke="#1a2332" stroke-width="0.3" stroke-dasharray="2,6"/>
+            <!-- Simplified continent outlines -->
+            <!-- North America -->
+            <polygon points="130,65 140,58 155,55 170,60 180,55 195,58 200,65 210,70 220,85 230,95 225,105 230,115 235,125 230,135 220,140 215,148 205,155 195,160 190,165 185,162 175,158 165,155 160,150 155,145 148,140 142,138 135,130 125,120 120,110 118,100 120,90 122,80 125,72" fill="#1a2a38" stroke="#2a4a5c" stroke-width="0.8"/>
+            <!-- Central America -->
+            <polygon points="160,150 165,155 170,160 175,165 178,172 175,175 170,178 165,180 160,175 155,170 152,165 155,158" fill="#1a2a38" stroke="#2a4a5c" stroke-width="0.8"/>
+            <!-- South America -->
+            <polygon points="195,175 205,170 215,175 225,180 230,190 235,200 238,215 240,230 238,245 235,255 230,265 225,275 218,285 210,290 205,295 198,290 192,280 188,270 185,260 183,250 182,240 183,230 185,220 188,210 190,200 192,190" fill="#1a2a38" stroke="#2a4a5c" stroke-width="0.8"/>
+            <!-- Europe -->
+            <polygon points="340,60 345,55 355,52 365,55 375,58 385,60 395,62 400,65 405,70 400,75 395,80 388,85 382,90 375,92 370,95 365,92 358,88 352,85 345,82 340,78 338,72" fill="#1a2a38" stroke="#2a4a5c" stroke-width="0.8"/>
+            <!-- Africa -->
+            <polygon points="345,115 355,110 365,108 375,110 385,115 395,120 400,130 405,140 408,155 405,170 400,185 395,200 388,210 380,218 370,222 360,220 352,215 345,208 340,198 338,185 336,170 338,155 340,140 342,128" fill="#1a2a38" stroke="#2a4a5c" stroke-width="0.8"/>
+            <!-- Asia -->
+            <polygon points="400,55 415,50 430,48 445,50 460,48 475,50 490,52 505,55 520,58 530,62 540,58 555,55 565,60 570,68 575,75 568,82 560,88 555,95 548,100 540,105 530,108 520,112 510,108 500,105 490,100 480,98 470,95 460,100 450,105 440,110 430,108 420,105 410,98 405,90 400,82 398,72 400,65" fill="#1a2a38" stroke="#2a4a5c" stroke-width="0.8"/>
+            <!-- Australia -->
+            <polygon points="530,210 545,205 560,208 575,212 585,218 590,228 588,240 582,250 575,255 565,258 555,255 545,250 538,242 532,232 530,220" fill="#1a2a38" stroke="#2a4a5c" stroke-width="0.8"/>
+          </svg>
+          <div id="mapSpots"></div>
+        </div>
+      </div>
+    </div>
+
     <div class="card" style="height:100%">
       <div class="card-header">
         <h2>DX Cluster</h2>
@@ -872,6 +1133,31 @@ body {
   </div>
 
 </main>
+
+<!-- Propagation Maps -->
+<section class="prop-row">
+  <div class="card">
+    <div class="card-header">
+      <h2>MUF Propagation Map</h2>
+      <span class="badge mono">KC2G</span>
+    </div>
+    <div class="muf-img-wrap">
+      <img id="mufMap" src="/api/muf-map" alt="MUF Propagation Map" loading="lazy">
+    </div>
+  </div>
+</section>
+
+<section class="prop-row-2col">
+  <div class="card">
+    <div class="card-header">
+      <h2>HF Propagation</h2>
+      <span class="badge mono">HamQSL</span>
+    </div>
+    <div class="hrdlog-img-wrap">
+      <img id="hrdlogImg" src="/api/hrdlog-image" alt="HF Propagation" loading="lazy">
+    </div>
+  </div>
+</section>
 
 <!-- Status bar -->
 <footer class="status-bar">
@@ -1056,6 +1342,32 @@ body {
     document.getElementById('bandsUpdated').textContent = 'LIVE';
   }
 
+  // --- Render DX Map ---
+  function renderMap(spots) {
+    var container = document.getElementById('mapContainer');
+    var spotsDiv = document.getElementById('mapSpots');
+    if (!container || !spotsDiv) return;
+    var w = container.offsetWidth;
+    var h = container.offsetHeight;
+    if (w === 0 || h === 0) return;
+
+    var html = '';
+    var plotted = 0;
+    if (spots && spots.length > 0) {
+      for (var i = 0; i < spots.length; i++) {
+        var s = spots[i];
+        if (s.lat == null || s.lng == null) continue;
+        var x = (s.lng + 180) / 360 * w;
+        var y = (90 - s.lat) / 180 * h;
+        var bc = BAND_COLORS[s.band] || '#6b7d93';
+        html += '<div class="map-spot' + (i < 5 ? ' pulse' : '') + '" style="left:' + x.toFixed(1) + 'px;top:' + y.toFixed(1) + 'px;background:' + bc + ';color:' + bc + '" title="' + escapeHtml(s.dx) + ' ' + escapeHtml(s.frequency) + '"></div>';
+        plotted++;
+      }
+    }
+    spotsDiv.innerHTML = html;
+    document.getElementById('mapSpotCount').textContent = plotted + ' plotted';
+  }
+
   // --- Render DX ---
   function renderDX(spots) {
     if (!spots || spots.length === 0) {
@@ -1088,7 +1400,7 @@ body {
   function fetchAll() {
     fetchJSON('/api/solar', function(data) { renderSolar(data); });
     fetchJSON('/api/bands', function(data) { renderBands(data); });
-    fetchJSON('/api/dxspots', function(data) { renderDX(data); });
+    fetchJSON('/api/dxspots', function(data) { renderDX(data); renderMap(data); });
     fetchJSON('/api/health', function(data) {
       if (data && data.status === 'ok') {
         failCount = 0;
@@ -1121,6 +1433,17 @@ body {
     xhr.ontimeout = xhr.onerror;
     xhr.send();
   }
+
+  // Refresh images every 15 minutes
+  function refreshImages() {
+    var img = document.getElementById('solarImage');
+    if (img) img.src = '/api/solar-image?t=' + Date.now();
+    var muf = document.getElementById('mufMap');
+    if (muf) muf.src = '/api/muf-map?t=' + Date.now();
+    var hrdlog = document.getElementById('hrdlogImg');
+    if (hrdlog) hrdlog.src = '/api/hrdlog-image?t=' + Date.now();
+  }
+  setInterval(refreshImages, 900000);
 
   // Initial fetch + interval
   fetchAll();
@@ -1193,6 +1516,30 @@ XEOF
 # Add user to video and tty groups for X server access
 sudo usermod -aG video,tty,input "$SERVICE_USER"
 
+# ── Step 8b: Write X11 monitor config (auto-detect resolution, 16-bit for Pi 1) ──
+sudo mkdir -p /usr/share/X11/xorg.conf.d
+sudo tee /usr/share/X11/xorg.conf.d/10-monitor.conf > /dev/null << 'MONEOF'
+Section "Device"
+    Identifier "default"
+    Driver "fbdev"
+EndSection
+
+Section "Screen"
+    Identifier "default"
+    Device "default"
+    Monitor "default"
+    DefaultDepth 16
+    SubSection "Display"
+        Depth 16
+    EndSubSection
+EndSection
+
+Section "Monitor"
+    Identifier "default"
+    Option "PreferredMode" "true"
+EndSection
+MONEOF
+
 # ── Step 9: Create kiosk.sh launch script ───────────────────────────
 sudo tee /opt/hamclock-lite/kiosk.sh > /dev/null <<KIOSKEOF
 #!/bin/bash
@@ -1252,6 +1599,18 @@ if [ -n "$CMDLINE" ]; then
     if ! grep -q "consoleblank=0" "$CMDLINE"; then
         sudo sed -i 's/$/ consoleblank=0/' "$CMDLINE"
     fi
+fi
+
+# Force HDMI output even if no monitor detected at boot
+BOOT_CONFIG=""
+if [ -f /boot/firmware/config.txt ]; then
+    BOOT_CONFIG="/boot/firmware/config.txt"
+elif [ -f /boot/config.txt ]; then
+    BOOT_CONFIG="/boot/config.txt"
+fi
+if [ -n "$BOOT_CONFIG" ]; then
+    grep -q "hdmi_force_hotplug" "$BOOT_CONFIG" || sudo sh -c "echo 'hdmi_force_hotplug=1' >> $BOOT_CONFIG"
+    grep -q "hdmi_drive" "$BOOT_CONFIG" || sudo sh -c "echo 'hdmi_drive=2' >> $BOOT_CONFIG"
 fi
 
 # ── Step 12: Enable and start both services ─────────────────────────
