@@ -432,6 +432,8 @@ sudo tee "$INSTALL_DIR/index.html" > /dev/null << 'HTMLEOF'
 }
 
 html, body {
+  margin: 0;
+  padding: 0;
   width: 100%;
   height: 100%;
   overflow: hidden;
@@ -442,17 +444,18 @@ html, body {
 
 .mono { font-family: 'Share Tech Mono', 'Courier New', monospace; }
 
-/* Full-screen grid shell */
+/* Full-screen flex shell */
 .shell {
-  display: grid;
-  grid-template-rows: auto 1fr auto;
-  width: 100vw;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
   height: 100vh;
   overflow: hidden;
 }
 
 /* Header */
 .header {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -519,10 +522,11 @@ html, body {
 
 /* Main 3-column content area */
 .content {
+  flex: 1;
   display: grid;
   grid-template-columns: 280px 1fr 1fr;
-  gap: 12px;
-  padding: 12px;
+  gap: 8px;
+  padding: 8px;
   overflow: hidden;
   min-height: 0;
 }
@@ -916,6 +920,7 @@ html, body {
 
 /* Status bar */
 .status-bar {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1051,8 +1056,19 @@ html, body {
 
   </div>
 
-  <!-- Middle column: Propagation + Solar Image -->
+  <!-- Middle column: Solar Image + Propagation -->
   <div class="col">
+
+    <!-- Solar Image -->
+    <div class="card">
+      <div class="card-header">
+        <h2>Solar Image</h2>
+        <span class="badge mono">SDO/HMI</span>
+      </div>
+      <div class="solar-img-wrap">
+        <img id="solarImage" src="/api/solar-image" alt="SDO Solar Image" width="256" height="256" loading="lazy">
+      </div>
+    </div>
 
     <!-- MUF Map -->
     <div class="card">
@@ -1073,17 +1089,6 @@ html, body {
       </div>
       <div class="hrdlog-img-wrap">
         <img id="hrdlogImg" src="/api/hrdlog-image" alt="HF Propagation" loading="lazy">
-      </div>
-    </div>
-
-    <!-- Solar Image -->
-    <div class="card">
-      <div class="card-header">
-        <h2>Solar Image</h2>
-        <span class="badge mono">SDO/HMI</span>
-      </div>
-      <div class="solar-img-wrap">
-        <img id="solarImage" src="/api/solar-image" alt="SDO Solar Image" width="256" height="256" loading="lazy">
       </div>
     </div>
 
