@@ -233,7 +233,7 @@ Total memory usage: ~15MB. Works on Pi 1 (700MHz, 512MB RAM) and up.
 
 ## Alternative: Headless Mode
 
-If you don't have a monitor connected to the Pi, you can run HamClock in headless mode instead. In Step 8, use `./install.sh` instead of `./kiosk-install.sh`:
+If you don't have a monitor connected to the Pi, you can run HamClock in headless mode instead. In Step 4, use `./install.sh` instead of `./kiosk-install.sh`:
 
 ```bash
 chmod +x install.sh
