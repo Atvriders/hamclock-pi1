@@ -4,7 +4,11 @@
 import json
 import time
 import threading
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import SimpleHTTPRequestHandler
+try:
+    from http.server import ThreadingHTTPServer as HTTPServer
+except ImportError:
+    from http.server import HTTPServer  # Python < 3.7 fallback
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 from urllib.parse import urlparse
@@ -156,6 +160,16 @@ def background_fetcher():
     """Background thread to periodically fetch data"""
     fetch_hamqsl()
     fetch_dx()
+
+    # Fast retry if initial fetch failed (network might not be ready yet)
+    for _ in range(6):
+        if CACHE['solar'] and CACHE['dxspots']:
+            break
+        time.sleep(10)
+        if not CACHE['solar']:
+            fetch_hamqsl()
+        if not CACHE['dxspots']:
+            fetch_dx()
 
     solar_interval = 300  # 5 minutes
     dx_interval = 120     # 2 minutes

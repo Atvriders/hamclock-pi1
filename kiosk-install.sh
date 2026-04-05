@@ -14,21 +14,40 @@ if ! command -v python3 &>/dev/null; then
     exit 1
 fi
 
+# Check internet connectivity
+if ! ping -c 1 -W 3 google.com &>/dev/null && ! ping -c 1 -W 3 8.8.8.8 &>/dev/null; then
+    echo "ERROR: No internet connection detected."
+    echo "Please connect the Pi to the internet and try again."
+    exit 1
+fi
+
 # Install minimal X server + lightweight browser
-echo "Installing display server and browser (this may take a few minutes)..."
+echo "Installing display server and browser (this may take 15-30 minutes on a Pi 1)..."
 sudo apt update
 sudo apt install -y xserver-xorg xinit x11-xserver-utils unclutter curl
-# Try surf first (lightest), fall back to midori, then chromium-browser
-if sudo apt install -y surf 2>/dev/null; then
-    BROWSER="surf"
-    BROWSER_CMD="surf -F http://localhost:8080"
-elif sudo apt install -y midori 2>/dev/null; then
-    BROWSER="midori"
-    BROWSER_CMD="midori -e Fullscreen -a http://localhost:8080"
-else
-    sudo apt install -y chromium-browser
-    BROWSER="chromium-browser"
-    BROWSER_CMD="chromium-browser --kiosk --noerrdialogs --disable-translate --no-first-run --fast --fast-start --disable-features=TranslateUI --disk-cache-size=0 http://localhost:8080"
+
+# Allow any user to start X (needed for systemd service)
+sudo sh -c 'echo "allowed_users=anybody" > /etc/X11/Xwrapper.config'
+
+# Try browsers in order of lightness
+BROWSER=""
+BROWSER_CMD=""
+for pkg in surf epiphany-browser midori chromium-browser chromium; do
+    if sudo apt install -y "$pkg" 2>&1 | tail -1; then
+        case "$pkg" in
+            surf) BROWSER="surf"; BROWSER_CMD="surf http://localhost:8080" ;;
+            epiphany-browser) BROWSER="epiphany"; BROWSER_CMD="epiphany-browser --application-mode http://localhost:8080" ;;
+            midori) BROWSER="midori"; BROWSER_CMD="midori -e Fullscreen -a http://localhost:8080" ;;
+            chromium-browser|chromium) BROWSER="chromium"; BROWSER_CMD="$pkg --kiosk --noerrdialogs --disable-translate --no-first-run --disable-features=TranslateUI --disk-cache-size=0 http://localhost:8080" ;;
+        esac
+        break
+    fi
+done
+
+if [ -z "$BROWSER" ]; then
+    echo "ERROR: Could not install any browser (tried surf, epiphany, midori, chromium)."
+    echo "Please install a browser manually and re-run this script."
+    exit 1
 fi
 echo "Browser installed: $BROWSER"
 
@@ -114,8 +133,10 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable hamclock-kiosk
-sudo systemctl start hamclock-kiosk
+sudo systemctl enable hamclock-lite hamclock-kiosk
+# Always restart to pick up any file changes
+sudo systemctl restart hamclock-lite
+sudo systemctl restart hamclock-kiosk
 
 # Disable console blanking (must stay on a single line in cmdline.txt)
 CMDLINE=""
@@ -146,3 +167,6 @@ echo ""
 echo "To go back to normal CLI, run:"
 echo "  sudo systemctl disable hamclock-kiosk"
 echo "  sudo systemctl stop hamclock-kiosk"
+echo ""
+PI_IP=$(hostname -I | awk '{print $1}')
+echo "Also accessible from any browser at: http://${PI_IP}:8080"
