@@ -171,6 +171,38 @@ http://192.168.1.42:8080
 
 ---
 
+### Optional: Kiosk Mode (Display on Pi's Own Monitor)
+
+If your Pi is connected to a monitor and you want HamClock to display fullscreen on it automatically at boot:
+
+```bash
+chmod +x kiosk-install.sh
+./kiosk-install.sh
+```
+
+This will:
+- Install a minimal display server (no full desktop environment)
+- Install the lightest available browser (`surf`, `midori`, or `chromium` as fallback)
+- Auto-launch HamClock fullscreen on boot
+- Hide the mouse cursor after 3 seconds
+- Disable screen blanking so the display stays on 24/7
+
+The Pi will boot straight into HamClock — no login screen, no desktop, just the dashboard.
+
+**To stop kiosk mode and go back to the normal command line:**
+```bash
+sudo systemctl disable hamclock-kiosk
+sudo systemctl stop hamclock-kiosk
+```
+
+**To re-enable kiosk mode:**
+```bash
+sudo systemctl enable hamclock-kiosk
+sudo systemctl start hamclock-kiosk
+```
+
+---
+
 ## What the Dashboard Shows
 
 | Section | Data | Updates |
