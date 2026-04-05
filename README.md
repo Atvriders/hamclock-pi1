@@ -1,8 +1,8 @@
 # HamClock Pi1 — Ham Radio Dashboard for Raspberry Pi 1
 
-A lightweight ham radio dashboard that runs on the oldest Raspberry Pi. Shows solar conditions, HF band conditions, and DX cluster spots — the same data as [HamClock Reborn](https://github.com/Atvriders/hamclock-reborn), but designed to run on hardware with just 512MB RAM and a 700MHz processor.
+A lightweight ham radio dashboard that runs on the oldest Raspberry Pi. The Pi boots directly into the dashboard on its own screen — no desktop, no login, just HamClock fullscreen. Shows solar conditions, HF band conditions, and DX cluster spots — the same data as [HamClock Reborn](https://github.com/Atvriders/hamclock-reborn), but designed to run on hardware with just 512MB RAM and a 700MHz processor.
 
-**No build tools. No npm. No Node.js. Just Python 3 and a web browser.**
+**No build tools. No npm. No Node.js. Just Python 3 and a display.**
 
 ---
 
@@ -12,7 +12,8 @@ A lightweight ham radio dashboard that runs on the oldest Raspberry Pi. Shows so
 - A **microSD card** (8GB or larger)
 - A **power supply** for your Pi
 - An **Ethernet cable** or **Wi-Fi adapter** (Pi needs internet)
-- A **computer** on the same network to view the dashboard in a web browser
+- A **monitor/TV** connected to the Pi (HDMI or composite)
+- A **computer** on the same network (for SSH setup)
 - About **15 minutes** of your time
 
 ---
@@ -135,28 +136,29 @@ Then go into the folder:
 cd hamclock-pi1
 ```
 
-### Step 8: Run the Installer
+### Step 8: Run the Kiosk Installer
 
 Type:
 ```bash
-chmod +x install.sh
-./install.sh
+chmod +x kiosk-install.sh
+./kiosk-install.sh
 ```
 
 The installer will:
 - Copy the files to `/opt/hamclock-lite/`
 - Create a system service that starts automatically on boot
+- Install a minimal display server (no full desktop environment)
+- Install the lightest available browser (`surf`, `midori`, or `chromium` as fallback)
+- Auto-launch HamClock fullscreen on boot
+- Hide the mouse cursor after 3 seconds
+- Disable screen blanking so the display stays on 24/7
 - Start the dashboard
 
-You should see:
-```
-=== Installation Complete ===
-HamClock Lite is running at: http://192.168.1.42:8080
-```
+### Step 9: Your Dashboard Is Live
 
-### Step 9: Open the Dashboard
+Your Pi will reboot and display the dashboard fullscreen on its monitor — no login screen, no desktop, just HamClock.
 
-On any computer, phone, or tablet on the same Wi-Fi network, open a web browser and go to:
+It also works from any browser on the same network at:
 
 ```
 http://YOUR_PI_IP_ADDRESS:8080
@@ -167,39 +169,7 @@ Example:
 http://192.168.1.42:8080
 ```
 
-**You should see the HamClock dashboard with solar data, band conditions, and DX spots!**
-
----
-
-### Optional: Kiosk Mode (Display on Pi's Own Monitor)
-
-If your Pi is connected to a monitor and you want HamClock to display fullscreen on it automatically at boot:
-
-```bash
-chmod +x kiosk-install.sh
-./kiosk-install.sh
-```
-
-This will:
-- Install a minimal display server (no full desktop environment)
-- Install the lightest available browser (`surf`, `midori`, or `chromium` as fallback)
-- Auto-launch HamClock fullscreen on boot
-- Hide the mouse cursor after 3 seconds
-- Disable screen blanking so the display stays on 24/7
-
-The Pi will boot straight into HamClock — no login screen, no desktop, just the dashboard.
-
-**To stop kiosk mode and go back to the normal command line:**
-```bash
-sudo systemctl disable hamclock-kiosk
-sudo systemctl stop hamclock-kiosk
-```
-
-**To re-enable kiosk mode:**
-```bash
-sudo systemctl enable hamclock-kiosk
-sudo systemctl start hamclock-kiosk
-```
+**You should see the HamClock dashboard with solar data, band conditions, and DX spots on the Pi's screen and in any browser!**
 
 ---
 
@@ -242,6 +212,26 @@ cd /opt/hamclock-lite
 python3 server.py
 ```
 
+Restart the kiosk display:
+```bash
+sudo systemctl restart hamclock-kiosk
+```
+
+Stop the kiosk display:
+```bash
+sudo systemctl stop hamclock-kiosk
+```
+
+Disable kiosk mode (go back to CLI):
+```bash
+sudo systemctl disable hamclock-kiosk && sudo systemctl stop hamclock-kiosk
+```
+
+Re-enable kiosk mode:
+```bash
+sudo systemctl enable hamclock-kiosk && sudo systemctl start hamclock-kiosk
+```
+
 ---
 
 ## Re-Installing / Updating
@@ -250,7 +240,7 @@ To update to the latest version:
 ```bash
 cd ~/hamclock-pi1
 git pull
-./install.sh
+./kiosk-install.sh
 ```
 
 Running the installer again is safe — it will update the files and restart the service.
@@ -301,10 +291,24 @@ index.html   — The dashboard page (HTML + CSS + JavaScript in one file)
                Fetches data from server.py every 30 seconds
                Displays everything with color coding and auto-refresh
 
-install.sh   — Sets up a systemd service so HamClock starts on boot
+install.sh       — Sets up the web server service (headless mode)
+kiosk-install.sh — Sets up the web server + fullscreen display on the Pi's monitor
 ```
 
 Total memory usage: ~15MB. Works on Pi 1 (700MHz, 512MB RAM) and up.
+
+---
+
+## Alternative: Headless Mode
+
+If you don't have a monitor connected to the Pi, you can run HamClock in headless mode instead. In Step 8, use `./install.sh` instead of `./kiosk-install.sh`:
+
+```bash
+chmod +x install.sh
+./install.sh
+```
+
+This skips the display server and kiosk setup. The dashboard runs as a web server only — access it from any browser on the same network at `http://YOUR_PI_IP_ADDRESS:8080`.
 
 ---
 
