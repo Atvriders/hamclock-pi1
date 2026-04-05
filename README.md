@@ -226,6 +226,35 @@ Total memory usage: ~15MB. Works on Pi 1 (700MHz, 512MB RAM) and up.
 
 ---
 
+## Alternative: Offline Install (No GitHub Needed)
+
+If GitHub is blocked on your network (common on college/school networks), you can install from a USB drive:
+
+### On any computer with internet access:
+
+1. Download the offline installer: [offline-install.sh](https://github.com/Atvriders/hamclock-pi1/raw/master/offline-install.sh)
+2. Copy `offline-install.sh` to a USB drive
+
+### On the Raspberry Pi:
+
+1. Plug in the USB drive
+2. Mount it:
+   ```bash
+   sudo mkdir -p /mnt/usb
+   sudo mount /dev/sda1 /mnt/usb
+   ```
+3. Run the installer:
+   ```bash
+   bash /mnt/usb/offline-install.sh
+   ```
+4. Unplug the USB drive when done
+
+This installs HamClock without needing git or GitHub access. The Pi still needs internet to fetch ham radio data (solar conditions, DX spots) — just not GitHub specifically.
+
+**Note:** For kiosk mode (fullscreen display), the Pi needs internet access to install the display server packages via `apt`. The offline installer only covers the headless (browser-access) mode.
+
+---
+
 ## Alternative: Headless Mode
 
 If you don't have a monitor connected to the Pi, you can run HamClock in headless mode instead. In Step 4, use `./install.sh` instead of `./kiosk-install.sh`:
