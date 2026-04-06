@@ -1417,7 +1417,7 @@ sudo systemctl start hamclock-lite
 # ── Step 6: Install X server packages ───────────────────────────────
 echo "Installing display server and browser (this may take 15-30 minutes on a Pi 1)..."
 sudo apt update
-sudo apt install -y xserver-xorg xinit x11-xserver-utils unclutter curl
+sudo apt install -y xserver-xorg xinit x11-xserver-utils unclutter curl matchbox-window-manager
 
 # ── Step 7: Try browser fallback chain ──────────────────────────────
 BROWSER=""
@@ -1494,7 +1494,11 @@ xset s noblank
 # Hide mouse cursor after 3 seconds of inactivity
 unclutter -idle 3 -root &
 
-# Launch browser fullscreen
+# Start matchbox window manager (auto-maximizes all windows)
+matchbox-window-manager -use_titlebar no -use_desktop_mode plain &
+sleep 1
+
+# Launch browser (matchbox will maximize it)
 exec $BROWSER_CMD
 KIOSKEOF
 sudo chmod +x /opt/hamclock-lite/kiosk.sh
