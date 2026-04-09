@@ -675,46 +675,54 @@ h+='<tr><td class="dx-freq">'+esc(s.frequency)+'</td><td class="dx-band" style="
 elDxBody.innerHTML=h;
 }
 
-// XHR with timeout
-function fetchJSON(url,cb){
+// Fetch queue — one request at a time, 1.5s gap between each
+var fetchQueue=[];
+var fetchBusy=false;
+
+function queueFetch(url,callback){
+fetchQueue.push({url:url,cb:callback});
+processQueue();
+}
+
+function processQueue(){
+if(fetchBusy||fetchQueue.length===0)return;
+fetchBusy=true;
+var item=fetchQueue.shift();
 var xhr=new XMLHttpRequest();
-xhr.open('GET',url,true);
+xhr.open('GET',item.url);
 xhr.timeout=8000;
 xhr.onload=function(){
-if(xhr.status===200){try{cb(null,JSON.parse(xhr.responseText));}catch(e){cb(e);}}
-else cb(new Error(xhr.status));
+if(xhr.status===200){
+try{item.cb(JSON.parse(xhr.responseText));}catch(e){}
+}
+fetchBusy=false;
+setTimeout(processQueue,1500);
 };
-xhr.onerror=function(){cb(new Error('net'));};
-xhr.ontimeout=function(){cb(new Error('timeout'));};
+xhr.onerror=xhr.ontimeout=function(){
+fetchBusy=false;
+setTimeout(processQueue,1500);
+};
 xhr.send();
 }
 
 function fetchAll(){
-var now=Math.floor(Date.now()/1000);
 updateCountdowns();
-
-// Solar + Bands (from same source conceptually)
-fetchJSON('/api/solar',function(err,d){
-if(!err&&d){lastSolarFetch=now;renderSolar(d);}
-else{solarStale=true;if(lastSolar)renderSolar(lastSolar);}
+queueFetch('/api/solar',function(data){
+renderSolar(data);
+lastSolarFetch=Math.floor(Date.now()/1000);
 });
-fetchJSON('/api/bands',function(err,d){
-if(!err&&d){renderBands(d);}
-else{bandsStale=true;if(lastBands)renderBands(lastBands);}
+queueFetch('/api/bands',function(data){
+renderBands(data);
 });
-
-// DX
-fetchJSON('/api/dxspots',function(err,d){
-if(!err&&d){lastDxFetch=now;renderDX(d);}
-else{dxStale=true;if(lastDx)renderDX(lastDx);}
+queueFetch('/api/dxspots',function(data){
+renderDX(data);
+lastDxFetch=Math.floor(Date.now()/1000);
 });
-
-// Health
-fetchJSON('/api/health',function(err,d){
-if(!err&&d&&d.status==='ok'){
+queueFetch('/api/health',function(data){
+if(data&&data.status==='ok'){
 failCount=0;
 elDot.style.background='var(--green)';
-elSbarL.textContent='Solar:'+fmtAge(d.solar_age)+' Bands:'+fmtAge(d.bands_age)+' DX:'+fmtAge(d.dx_age);
+elSbarL.textContent='Solar:'+fmtAge(data.solar_age)+' Bands:'+fmtAge(data.bands_age)+' DX:'+fmtAge(data.dx_age);
 elSbarL.className='';
 }else{
 failCount++;
@@ -730,19 +738,30 @@ if(s<60)return' '+s+'s';
 return' '+Math.floor(s/60)+'m';
 }
 
-// Image refresh (separate, every 15 min)
+// Image refresh (separate, every 15 min) — staggered to spread CPU load
+var elImgSolar=document.getElementById('imgSolar');
+var elImgMuf=document.getElementById('imgMuf');
+var elImgHrd=document.getElementById('imgHrd');
+
 function refreshImages(){
 var t=Date.now();
 lastImageFetch=Math.floor(t/1000);
-var a=document.getElementById('imgSolar');if(a)a.src='/api/solar-image?t='+t;
-var b=document.getElementById('imgMuf');if(b)b.src='/api/muf-map?t='+t;
-var c=document.getElementById('imgHrd');if(c)c.src='/api/hrdlog-image?t='+t;
+if(elImgSolar)elImgSolar.src='/api/solar-image?t='+t;
+setTimeout(function(){
+if(elImgMuf)elImgMuf.src='/api/muf-map?t='+t;
+},3000);
+setTimeout(function(){
+if(elImgHrd)elImgHrd.src='/api/hrdlog-image?t='+t;
+},6000);
 updateCountdowns();
 }
 
-// Init
+// Init — stagger initial fetches to avoid boot lag
 lastImageFetch=Math.floor(Date.now()/1000);
-fetchAll();
+setTimeout(function(){queueFetch('/api/solar',function(d){renderSolar(d);lastSolarFetch=Math.floor(Date.now()/1000);});},500);
+setTimeout(function(){queueFetch('/api/bands',function(d){renderBands(d);});},2000);
+setTimeout(function(){queueFetch('/api/dxspots',function(d){renderDX(d);lastDxFetch=Math.floor(Date.now()/1000);});},3500);
+setTimeout(refreshImages,5000);
 setInterval(fetchAll,POLL_INTERVAL);
 setInterval(refreshImages,IMAGE_INTERVAL*1000);
 })();
