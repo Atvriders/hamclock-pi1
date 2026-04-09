@@ -253,7 +253,7 @@ cursor:pointer;
 <span class="theme-swatch" style="background:#1a0a0a;border-bottom:3px solid #f87171"></span>
 <span class="theme-name">RED</span>
 </label>
-<label class="theme-opt">
+<label class="theme-opt" id="themeKstate" style="display:none">
 <input type="radio" name="theme" value="kstate">
 <span class="theme-swatch" style="background:#512888;border-bottom:3px solid #F4C55C"></span>
 <span class="theme-name">K-STATE</span>
@@ -374,6 +374,10 @@ document.getElementById('dashboard').style.display='none';
 document.getElementById('setup').style.display='none';
 document.getElementById('dashboard').style.display='';
 applySettings(settings);
+if(settings&&settings.theme==='kstate'){
+var kstateEl=document.getElementById('themeKstate');
+if(kstateEl)kstateEl.style.display='';
+}
 }
 
 // Make saveSetup global
@@ -399,6 +403,20 @@ var callsignTimer=null;
 document.getElementById('inCallsign').addEventListener('input',function(){
 var call=this.value.toUpperCase().trim();
 clearTimeout(callsignTimer);
+// Show/hide K-State theme based on callsign
+var kstateEl=document.getElementById('themeKstate');
+if(call==='W0QQQ'){
+if(kstateEl)kstateEl.style.display='';
+var kstateRadio=document.querySelector('input[name="theme"][value="kstate"]');
+if(kstateRadio)kstateRadio.checked=true;
+document.getElementById('inNtp').value='ntp.ksu.edu';
+}else{
+if(kstateEl)kstateEl.style.display='none';
+var currentTheme=document.querySelector('input[name="theme"]:checked');
+if(currentTheme&&currentTheme.value==='kstate'){
+document.querySelector('input[name="theme"][value="classic"]').checked=true;
+}
+}
 if(call.length<3)return;
 callsignTimer=setTimeout(function(){
 var xhr=new XMLHttpRequest();
@@ -432,12 +450,6 @@ if(d.name){
 var nameEl=document.getElementById('callLookupName');
 if(nameEl)nameEl.textContent=d.name+(d.country?' \u2014 '+d.country:'');
 }
-// Special: W0QQQ gets K-State theme + KSU NTP
-if(call==='W0QQQ'){
-var kstateRadio=document.querySelector('input[name="theme"][value="kstate"]');
-if(kstateRadio)kstateRadio.checked=true;
-document.getElementById('inNtp').value='ntp.ksu.edu';
-}
 }catch(e){}
 };
 xhr.send();
@@ -454,6 +466,11 @@ document.getElementById('inTimezone').value=settings.timezone||'auto';
 document.getElementById('inNtp').value=settings.ntp||'';
 var radios=document.querySelectorAll('input[name="theme"]');
 for(var i=0;i<radios.length;i++){radios[i].checked=radios[i].value===(settings.theme||'classic');}
+// Show K-State swatch if current theme is kstate
+if(settings.theme==='kstate'){
+var kstateEl=document.getElementById('themeKstate');
+if(kstateEl)kstateEl.style.display='';
+}
 }
 document.getElementById('setup').style.display='flex';
 };
