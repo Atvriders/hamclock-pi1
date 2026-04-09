@@ -100,6 +100,46 @@ COUNTRY_COORDS = {
 }
 
 
+def lookup_callsign(call):
+    """Look up callsign via callook.info (US) or hamdb.org (international)"""
+    result = {'callsign': call, 'grid': None, 'lat': None, 'lng': None, 'name': None, 'country': None}
+
+    # Try callook.info first (US callsigns)
+    try:
+        req = Request(f'https://callook.info/{call}/json', headers={'User-Agent': UA})
+        with urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        if data.get('status') == 'VALID':
+            loc = data.get('location', {})
+            result['grid'] = loc.get('gridsquare', '')[:6]
+            result['lat'] = float(loc.get('latitude', 0))
+            result['lng'] = float(loc.get('longitude', 0))
+            result['name'] = data.get('name', '')
+            result['country'] = data.get('address', {}).get('line2', 'United States')
+            return result
+    except Exception:
+        pass
+
+    # Fallback: hamdb.org (international)
+    try:
+        req = Request(f'https://api.hamdb.org/{call}/json/hamclock', headers={'User-Agent': UA})
+        with urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        cs = data.get('hamdb', {}).get('callsign', {})
+        if cs.get('grid'):
+            result['grid'] = cs['grid'][:6]
+        if cs.get('lat'):
+            result['lat'] = float(cs['lat'])
+        if cs.get('lon'):
+            result['lng'] = float(cs['lon'])
+        result['name'] = f"{cs.get('fname', '')} {cs.get('name', '')}".strip()
+        result['country'] = cs.get('country', '')
+    except Exception:
+        pass
+
+    return result
+
+
 def fetch_hamqsl():
     """Fetch solar and band data from HamQSL XML"""
     try:
@@ -346,6 +386,10 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_binary(CACHE['hrdlog_image'], 'image/gif')
             else:
                 self.send_json({'error': 'HRDLog image not yet loaded'})
+        elif path.startswith('/api/callsign/'):
+            call = path.split('/')[-1].upper()
+            result = lookup_callsign(call)
+            self.send_json(result)
         elif path == '/api/health':
             self.send_json({
                 'status': 'ok',
@@ -596,6 +640,7 @@ cursor:pointer;
 <div class="setup-field">
 <label class="setup-label">YOUR CALLSIGN</label>
 <input type="text" id="inCallsign" class="setup-input" placeholder="W1ABC" style="text-transform:uppercase">
+<span id="callLookupName" style="font-size:10px;color:var(--green);display:block;margin-top:2px;min-height:14px"></span>
 </div>
 <div class="setup-field">
 <label class="setup-label">GRID SQUARE</label>
@@ -644,6 +689,11 @@ cursor:pointer;
 <input type="radio" name="theme" value="red">
 <span class="theme-swatch" style="background:#1a0a0a;border-bottom:3px solid #f87171"></span>
 <span class="theme-name">RED</span>
+</label>
+<label class="theme-opt">
+<input type="radio" name="theme" value="kstate">
+<span class="theme-swatch" style="background:#512888;border-bottom:3px solid #F4C55C"></span>
+<span class="theme-name">K-STATE</span>
 </label>
 </div>
 </div>
@@ -734,7 +784,8 @@ var themes={
 classic:{cyan:'#06b6d4',green:'#22c55e',bg:'#0a0e14',card:'#111820',border:'#1a2530'},
 amber:{cyan:'#f59e0b',green:'#f59e0b',bg:'#1a1000',card:'#1f1800',border:'#332800'},
 blue:{cyan:'#3b82f6',green:'#60a5fa',bg:'#0a0f1e',card:'#0f1628',border:'#1a2540'},
-red:{cyan:'#ef4444',green:'#f87171',bg:'#1a0a0a',card:'#201010',border:'#3a1a1a'}
+red:{cyan:'#ef4444',green:'#f87171',bg:'#1a0a0a',card:'#201010',border:'#3a1a1a'},
+kstate:{cyan:'#F4C55C',green:'#CEA152',bg:'#1a0e2d',card:'#241540',border:'#3d2660',bright:'#E7DED0',text:'#E7DED0',label:'#9F694F',muted:'#6b5080'}
 };
 
 function applySettings(s){
@@ -747,6 +798,10 @@ root.style.setProperty('--green',t.green);
 root.style.setProperty('--bg',t.bg);
 root.style.setProperty('--card',t.card);
 root.style.setProperty('--border',t.border);
+if(t.bright)root.style.setProperty('--bright',t.bright);
+if(t.text)root.style.setProperty('--text',t.text);
+if(t.label)root.style.setProperty('--label',t.label);
+if(t.muted)root.style.setProperty('--muted',t.muted);
 }
 
 if(!settings){
@@ -775,6 +830,56 @@ document.getElementById('dashboard').style.display='';
 applySettings(s);
 startFetching();
 };
+
+// Callsign auto-lookup with debounce
+var callsignTimer=null;
+document.getElementById('inCallsign').addEventListener('input',function(){
+var call=this.value.toUpperCase().trim();
+clearTimeout(callsignTimer);
+if(call.length<3)return;
+callsignTimer=setTimeout(function(){
+var xhr=new XMLHttpRequest();
+xhr.open('GET','/api/callsign/'+encodeURIComponent(call));
+xhr.timeout=8000;
+xhr.onload=function(){
+if(xhr.status!==200)return;
+try{
+var d=JSON.parse(xhr.responseText);
+// Auto-fill grid
+if(d.grid){
+document.getElementById('inGrid').value=d.grid;
+}
+// Auto-fill timezone from longitude
+if(d.lng!=null){
+var offset=Math.round(d.lng/15);
+var tzMap={
+'-5':'US/Eastern','-6':'US/Central','-7':'US/Mountain',
+'-8':'US/Pacific','-9':'US/Alaska','-10':'US/Hawaii',
+'0':'Europe/London','1':'Europe/Paris','2':'Europe/Berlin',
+'3':'Europe/Moscow','9':'Asia/Tokyo','8':'Asia/Shanghai',
+'5':'Asia/Kolkata','10':'Australia/Sydney'
+};
+var tz=tzMap[String(offset)];
+if(tz){
+document.getElementById('inTimezone').value=tz;
+}
+}
+// Show name as confirmation
+if(d.name){
+var nameEl=document.getElementById('callLookupName');
+if(nameEl)nameEl.textContent=d.name+(d.country?' \u2014 '+d.country:'');
+}
+// Special: W0QQQ gets K-State theme + KSU NTP
+if(call==='W0QQQ'){
+var kstateRadio=document.querySelector('input[name="theme"][value="kstate"]');
+if(kstateRadio)kstateRadio.checked=true;
+document.getElementById('inNtp').value='ntp.ksu.edu';
+}
+}catch(e){}
+};
+xhr.send();
+},800);
+});
 
 // Re-open settings when callsign is clicked
 document.getElementById('hdrCallsign').onclick=function(){

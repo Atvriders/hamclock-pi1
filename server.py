@@ -58,6 +58,46 @@ COUNTRY_COORDS = {
 }
 
 
+def lookup_callsign(call):
+    """Look up callsign via callook.info (US) or hamdb.org (international)"""
+    result = {'callsign': call, 'grid': None, 'lat': None, 'lng': None, 'name': None, 'country': None}
+
+    # Try callook.info first (US callsigns)
+    try:
+        req = Request(f'https://callook.info/{call}/json', headers={'User-Agent': UA})
+        with urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        if data.get('status') == 'VALID':
+            loc = data.get('location', {})
+            result['grid'] = loc.get('gridsquare', '')[:6]
+            result['lat'] = float(loc.get('latitude', 0))
+            result['lng'] = float(loc.get('longitude', 0))
+            result['name'] = data.get('name', '')
+            result['country'] = data.get('address', {}).get('line2', 'United States')
+            return result
+    except Exception:
+        pass
+
+    # Fallback: hamdb.org (international)
+    try:
+        req = Request(f'https://api.hamdb.org/{call}/json/hamclock', headers={'User-Agent': UA})
+        with urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        cs = data.get('hamdb', {}).get('callsign', {})
+        if cs.get('grid'):
+            result['grid'] = cs['grid'][:6]
+        if cs.get('lat'):
+            result['lat'] = float(cs['lat'])
+        if cs.get('lon'):
+            result['lng'] = float(cs['lon'])
+        result['name'] = f"{cs.get('fname', '')} {cs.get('name', '')}".strip()
+        result['country'] = cs.get('country', '')
+    except Exception:
+        pass
+
+    return result
+
+
 def fetch_hamqsl():
     """Fetch solar and band data from HamQSL XML"""
     try:
@@ -304,6 +344,10 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_binary(CACHE['hrdlog_image'], 'image/gif')
             else:
                 self.send_json({'error': 'HRDLog image not yet loaded'})
+        elif path.startswith('/api/callsign/'):
+            call = path.split('/')[-1].upper()
+            result = lookup_callsign(call)
+            self.send_json(result)
         elif path == '/api/health':
             self.send_json({
                 'status': 'ok',
