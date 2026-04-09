@@ -699,7 +699,7 @@ cursor:pointer;
 </div>
 <div class="setup-field">
 <label class="setup-label">TIME SERVER (NTP)</label>
-<input type="text" id="inNtp" class="setup-input" placeholder="pool.ntp.org">
+<input type="text" id="inNtp" class="setup-input" placeholder="pool.ntp.org (default)">
 </div>
 <button class="setup-btn" onclick="saveSetup()">START</button>
 </div>
@@ -824,7 +824,7 @@ callsign:document.getElementById('inCallsign').value.toUpperCase().trim(),
 grid:document.getElementById('inGrid').value.toUpperCase().trim(),
 timezone:document.getElementById('inTimezone').value,
 theme:(document.querySelector('input[name="theme"]:checked')||{}).value||'classic',
-ntp:document.getElementById('inNtp').value.trim()
+ntp:document.getElementById('inNtp').value.trim()||'pool.ntp.org'
 };
 if(!s.callsign){alert('Please enter your callsign');return;}
 localStorage.setItem('hamclock-settings',JSON.stringify(s));
@@ -852,6 +852,10 @@ if(kstateEl)kstateEl.style.display='none';
 var currentTheme=document.querySelector('input[name="theme"]:checked');
 if(currentTheme&&currentTheme.value==='kstate'){
 document.querySelector('input[name="theme"][value="classic"]').checked=true;
+}
+var ntpEl=document.getElementById('inNtp');
+if(ntpEl&&ntpEl.value==='ntp.ksu.edu'){
+ntpEl.value='';
 }
 }
 if(call.length<3)return;
@@ -1122,7 +1126,6 @@ startFetching();
 </script>
 </body>
 </html>
-
 HTMLEOF
 
 # ── Step 5: Create hamclock-lite systemd service ────────────────────
