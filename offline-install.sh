@@ -411,10 +411,10 @@ font-size:clamp(10px,1.4vh,16px);
 }
 .hdr{
 display:flex;align-items:center;justify-content:space-between;
-height:clamp(24px,4vh,40px);
-padding:0 clamp(6px,1vw,20px);
+height:clamp(20px,3vh,30px);
+padding:0 clamp(4px,0.8vw,12px);
 background:var(--card);border-bottom:1px solid var(--border);
-font-size:clamp(10px,1.6vh,18px);
+font-size:clamp(9px,1.3vh,14px);
 }
 .hdr-title{color:var(--cyan);font-weight:bold;letter-spacing:2px}
 .hdr-clocks{color:var(--bright);letter-spacing:1px}
@@ -423,10 +423,10 @@ font-size:clamp(10px,1.6vh,18px);
 .hdr-dot{display:inline-block;width:8px;height:8px;background:var(--green);margin-left:clamp(8px,1.5vw,16px)}
 .grid{
 display:grid;
-grid-template-columns:minmax(180px,22vw) minmax(200px,28vw) 1fr;
+grid-template-columns:18vw 25vw 1fr;
 gap:clamp(2px,0.4vh,6px);
 padding:clamp(2px,0.4vh,6px);
-height:calc(100vh - clamp(24px,4vh,40px) - clamp(16px,2.5vh,28px));
+height:calc(100vh - clamp(20px,3vh,30px) - clamp(16px,2.5vh,28px));
 overflow:hidden;
 }
 .col{display:flex;flex-direction:column;gap:clamp(2px,0.4vh,6px);overflow:hidden;min-height:0}
@@ -437,18 +437,18 @@ display:flex;flex-direction:column;
 }
 .panel-title{
 display:flex;justify-content:space-between;align-items:center;
-padding:clamp(1px,0.3vh,4px) clamp(4px,0.6vw,10px);
+padding:2px 6px;
 background:var(--bg);
 font-size:clamp(8px,1.1vh,13px);
 color:var(--label);letter-spacing:1px;
 border-bottom:1px solid var(--border);
 flex-shrink:0;
 }
-.panel-body{padding:clamp(2px,0.4vh,6px) clamp(4px,0.6vw,10px);flex:1;overflow:hidden}
+.panel-body{padding:4px 6px;flex:1;overflow:hidden}
 .timer{color:var(--muted);font-size:clamp(7px,0.9vh,11px)}
 .solar-flex{flex:1}
 .bands-flex{flex:0 0 auto}
-.mid-img{flex:1;min-height:0}
+.mid-img{flex:0 0 auto;min-height:0;overflow:hidden}
 .dx-full{flex:1;min-height:0}
 .s-row{
 display:flex;justify-content:space-between;align-items:center;
@@ -479,9 +479,12 @@ padding:clamp(0px,0.1vh,1px) 0;
 .cG{background:var(--green);color:#000}.cF{background:var(--yellow);color:#000}.cP{background:var(--red);color:#fff}.cN{background:var(--muted);color:#fff}
 .img-wrap{flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;min-height:0}
 .img-wrap img{object-fit:contain;max-width:100%;max-height:100%;display:block}
+#imgSolar{height:20vh;width:100%;object-fit:contain}
+#imgMuf{height:28vh;width:100%;object-fit:contain}
+#imgHrd{height:20vh;width:100%;object-fit:contain}
 .dx-tbl{width:100%;border-collapse:collapse}
 .dx-tbl th{
-font-size:clamp(7px,0.9vh,11px);color:var(--label);
+font-size:clamp(9px,1vw,12px);color:var(--label);
 text-align:left;padding:clamp(1px,0.2vh,3px) clamp(2px,0.3vw,6px);
 border-bottom:1px solid var(--border);
 position:sticky;top:0;background:var(--card);
@@ -490,14 +493,14 @@ letter-spacing:1px;
 .dx-tbl td{
 padding:clamp(1px,0.15vh,2px) clamp(2px,0.3vw,6px);
 border-bottom:1px solid var(--border);
-font-size:clamp(8px,1vh,13px);
+font-size:clamp(10px,1.2vw,13px);
 white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 }
-.dx-freq{color:var(--label)}
-.dx-band{color:var(--cyan);font-size:clamp(7px,0.9vh,11px)}
-.dx-call{color:var(--bright);font-weight:bold}
-.dx-sp{color:var(--muted);font-size:clamp(7px,0.9vh,11px)}
-.dx-tm{color:var(--muted);font-size:clamp(7px,0.9vh,11px)}
+.dx-freq{color:var(--label);font-size:clamp(10px,1.2vw,13px)}
+.dx-band{color:var(--cyan);font-size:clamp(9px,1.1vw,12px)}
+.dx-call{color:var(--bright);font-weight:bold;font-size:clamp(10px,1.2vw,13px)}
+.dx-sp{color:var(--muted);font-size:clamp(9px,1.1vw,12px)}
+.dx-tm{color:var(--muted);font-size:clamp(9px,1.1vw,12px)}
 .dx-body-wrap{flex:1;overflow:hidden;min-height:0}
 .sbar{
 display:flex;align-items:center;justify-content:space-between;
@@ -509,11 +512,155 @@ flex-shrink:0;
 }
 .stale{opacity:0.5}
 .stale::after{content:' (stale)';color:var(--yellow)}
+/* Setup screen */
+#setup{
+position:fixed;inset:0;z-index:9999;
+background:var(--bg);
+display:flex;align-items:center;justify-content:center;
+font-family:'Courier New','Liberation Mono',monospace;
+}
+.setup-card{
+background:var(--card);
+border:1px solid var(--border);
+padding:24px 32px;
+max-width:460px;
+width:90%;
+}
+.setup-title{
+color:var(--cyan);
+font-size:18px;
+font-weight:bold;
+letter-spacing:3px;
+text-align:center;
+margin-bottom:20px;
+}
+.setup-field{margin-bottom:14px}
+.setup-label{
+display:block;
+color:var(--label);
+font-size:10px;
+letter-spacing:1px;
+margin-bottom:4px;
+}
+.setup-input{
+width:100%;
+background:var(--bg);
+border:1px solid var(--border);
+color:var(--bright);
+padding:6px 10px;
+font-family:inherit;
+font-size:14px;
+}
+.setup-input:focus{border-color:var(--cyan);outline:none}
+.setup-select{
+width:100%;
+background:var(--bg);
+border:1px solid var(--border);
+color:var(--bright);
+padding:6px 10px;
+font-family:inherit;
+font-size:13px;
+}
+.theme-row{display:flex;gap:12px}
+.theme-opt{flex:1;text-align:center;cursor:pointer}
+.theme-opt input{display:none}
+.theme-swatch{
+display:block;
+height:32px;
+border:2px solid var(--border);
+margin-bottom:4px;
+}
+.theme-opt input:checked + .theme-swatch{border-color:var(--bright)}
+.theme-name{font-size:10px;color:var(--label)}
+.setup-btn{
+display:block;
+width:100%;
+margin-top:20px;
+padding:10px;
+background:var(--cyan);
+color:var(--bg);
+border:none;
+font-family:inherit;
+font-size:14px;
+font-weight:bold;
+letter-spacing:2px;
+cursor:pointer;
+}
 </style>
 </head>
 <body>
+<!-- Setup wizard overlay -->
+<div id="setup" style="display:none">
+<div class="setup-card">
+<div class="setup-title">HAMCLOCK LITE SETUP</div>
+<div class="setup-field">
+<label class="setup-label">YOUR CALLSIGN</label>
+<input type="text" id="inCallsign" class="setup-input" placeholder="W1ABC" style="text-transform:uppercase">
+</div>
+<div class="setup-field">
+<label class="setup-label">GRID SQUARE</label>
+<input type="text" id="inGrid" class="setup-input" placeholder="FN31" maxlength="6" style="text-transform:uppercase">
+</div>
+<div class="setup-field">
+<label class="setup-label">TIMEZONE</label>
+<select id="inTimezone" class="setup-select">
+<option value="auto">Auto (Browser)</option>
+<option value="UTC">UTC</option>
+<option value="US/Eastern">US/Eastern</option>
+<option value="US/Central">US/Central</option>
+<option value="US/Mountain">US/Mountain</option>
+<option value="US/Pacific">US/Pacific</option>
+<option value="US/Alaska">US/Alaska</option>
+<option value="US/Hawaii">US/Hawaii</option>
+<option value="Europe/London">Europe/London</option>
+<option value="Europe/Berlin">Europe/Berlin</option>
+<option value="Europe/Paris">Europe/Paris</option>
+<option value="Europe/Moscow">Europe/Moscow</option>
+<option value="Asia/Tokyo">Asia/Tokyo</option>
+<option value="Asia/Shanghai">Asia/Shanghai</option>
+<option value="Asia/Kolkata">Asia/Kolkata</option>
+<option value="Australia/Sydney">Australia/Sydney</option>
+</select>
+</div>
+<div class="setup-field">
+<label class="setup-label">COLOR THEME</label>
+<div class="theme-row">
+<label class="theme-opt">
+<input type="radio" name="theme" value="classic" checked>
+<span class="theme-swatch" style="background:#0a0e14;border-bottom:3px solid #22c55e"></span>
+<span class="theme-name">CLASSIC</span>
+</label>
+<label class="theme-opt">
+<input type="radio" name="theme" value="amber">
+<span class="theme-swatch" style="background:#1a1000;border-bottom:3px solid #f59e0b"></span>
+<span class="theme-name">AMBER</span>
+</label>
+<label class="theme-opt">
+<input type="radio" name="theme" value="blue">
+<span class="theme-swatch" style="background:#0a0f1e;border-bottom:3px solid #60a5fa"></span>
+<span class="theme-name">BLUE</span>
+</label>
+<label class="theme-opt">
+<input type="radio" name="theme" value="red">
+<span class="theme-swatch" style="background:#1a0a0a;border-bottom:3px solid #f87171"></span>
+<span class="theme-name">RED</span>
+</label>
+</div>
+</div>
+<div class="setup-field">
+<label class="setup-label">TIME SERVER (NTP)</label>
+<input type="text" id="inNtp" class="setup-input" placeholder="pool.ntp.org">
+</div>
+<button class="setup-btn" onclick="saveSetup()">START</button>
+</div>
+</div>
+<!-- Dashboard -->
+<div id="dashboard">
 <div class="hdr">
+<span>
 <span class="hdr-title">HAMCLOCK LITE</span>
+<span id="hdrCallsign" style="color:var(--green);margin-left:12px;cursor:pointer"></span>
+</span>
 <span class="hdr-clocks">
 <span class="hdr-utc" id="utc">UTC --:--:--</span>
 <span id="lcl">LOCAL --:--:--</span>
@@ -558,6 +705,7 @@ flex-shrink:0;
 <span id="sbarLeft">Connecting...</span>
 <span id="sbarRight">HamClock Lite v2.0</span>
 </div>
+</div><!-- end dashboard -->
 <script>
 (function(){
 'use strict';
@@ -577,6 +725,71 @@ var failCount=0;
 var lastSolar=null,lastBands=null,lastDx=null;
 var solarStale=false,bandsStale=false,dxStale=false;
 
+// Settings
+var settings=null;
+try{settings=JSON.parse(localStorage.getItem('hamclock-settings'));}catch(e){}
+
+// Theme definitions
+var themes={
+classic:{cyan:'#06b6d4',green:'#22c55e',bg:'#0a0e14',card:'#111820',border:'#1a2530'},
+amber:{cyan:'#f59e0b',green:'#f59e0b',bg:'#1a1000',card:'#1f1800',border:'#332800'},
+blue:{cyan:'#3b82f6',green:'#60a5fa',bg:'#0a0f1e',card:'#0f1628',border:'#1a2540'},
+red:{cyan:'#ef4444',green:'#f87171',bg:'#1a0a0a',card:'#201010',border:'#3a1a1a'}
+};
+
+function applySettings(s){
+var el=document.getElementById('hdrCallsign');
+if(el)el.textContent=s.callsign||'';
+var root=document.documentElement;
+var t=themes[s.theme]||themes.classic;
+root.style.setProperty('--cyan',t.cyan);
+root.style.setProperty('--green',t.green);
+root.style.setProperty('--bg',t.bg);
+root.style.setProperty('--card',t.card);
+root.style.setProperty('--border',t.border);
+}
+
+if(!settings){
+document.getElementById('setup').style.display='flex';
+document.getElementById('dashboard').style.display='none';
+}else{
+document.getElementById('setup').style.display='none';
+document.getElementById('dashboard').style.display='';
+applySettings(settings);
+}
+
+// Make saveSetup global
+window.saveSetup=function(){
+var s={
+callsign:document.getElementById('inCallsign').value.toUpperCase().trim(),
+grid:document.getElementById('inGrid').value.toUpperCase().trim(),
+timezone:document.getElementById('inTimezone').value,
+theme:(document.querySelector('input[name="theme"]:checked')||{}).value||'classic',
+ntp:document.getElementById('inNtp').value.trim()
+};
+if(!s.callsign){alert('Please enter your callsign');return;}
+localStorage.setItem('hamclock-settings',JSON.stringify(s));
+settings=s;
+document.getElementById('setup').style.display='none';
+document.getElementById('dashboard').style.display='';
+applySettings(s);
+startFetching();
+};
+
+// Re-open settings when callsign is clicked
+document.getElementById('hdrCallsign').onclick=function(){
+// Pre-fill form with current settings
+if(settings){
+document.getElementById('inCallsign').value=settings.callsign||'';
+document.getElementById('inGrid').value=settings.grid||'';
+document.getElementById('inTimezone').value=settings.timezone||'auto';
+document.getElementById('inNtp').value=settings.ntp||'';
+var radios=document.querySelectorAll('input[name="theme"]');
+for(var i=0;i<radios.length;i++){radios[i].checked=radios[i].value===(settings.theme||'classic');}
+}
+document.getElementById('setup').style.display='flex';
+};
+
 // DOM refs
 var elUtc=document.getElementById('utc');
 var elLcl=document.getElementById('lcl');
@@ -592,11 +805,20 @@ var tmSolarImg=document.getElementById('tmSolarImg');
 var tmMuf=document.getElementById('tmMuf');
 var tmHrd=document.getElementById('tmHrd');
 
-// Clock only — no countdown ticking (countdowns updated statically per fetch cycle)
+// Clock — uses timezone setting if available
 setInterval(function(){
 var d=new Date();
 elUtc.textContent='UTC '+P(d.getUTCHours())+':'+P(d.getUTCMinutes())+':'+P(d.getUTCSeconds());
+if(settings&&settings.timezone&&settings.timezone!=='auto'){
+try{
+var opts={hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false,timeZone:settings.timezone};
+elLcl.textContent='LOCAL '+d.toLocaleTimeString('en-US',opts);
+}catch(e){
 elLcl.textContent='LOCAL '+P(d.getHours())+':'+P(d.getMinutes())+':'+P(d.getSeconds());
+}
+}else{
+elLcl.textContent='LOCAL '+P(d.getHours())+':'+P(d.getMinutes())+':'+P(d.getSeconds());
+}
 },1000);
 
 // Static countdown — called once per fetch cycle, not every second
@@ -756,7 +978,11 @@ if(elImgHrd)elImgHrd.src='/api/hrdlog-image?t='+t;
 updateCountdowns();
 }
 
-// Init — stagger initial fetches to avoid boot lag
+// Start fetching data
+var fetchStarted=false;
+function startFetching(){
+if(fetchStarted)return;
+fetchStarted=true;
 lastImageFetch=Math.floor(Date.now()/1000);
 setTimeout(function(){queueFetch('/api/solar',function(d){renderSolar(d);lastSolarFetch=Math.floor(Date.now()/1000);});},500);
 setTimeout(function(){queueFetch('/api/bands',function(d){renderBands(d);});},2000);
@@ -764,6 +990,12 @@ setTimeout(function(){queueFetch('/api/dxspots',function(d){renderDX(d);lastDxFe
 setTimeout(refreshImages,5000);
 setInterval(fetchAll,POLL_INTERVAL);
 setInterval(refreshImages,IMAGE_INTERVAL*1000);
+}
+
+// Init — only start fetching if settings exist (setup already done)
+if(settings){
+startFetching();
+}
 })();
 </script>
 </body>
