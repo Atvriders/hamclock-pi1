@@ -2,995 +2,361 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>HamClock Lite</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
 <style>
-*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
-
-:root {
-  --bg: #0a0e14;
-  --bg-card: #111820;
-  --bg-card-alt: #151d28;
-  --border: #1e2a3a;
-  --border-glow: #00ff8830;
-  --accent: #00ff88;
-  --accent-dim: #00cc6a;
-  --accent-bg: #00ff8810;
-  --text: #e0e8f0;
-  --text-dim: #6b7d93;
-  --text-muted: #3a4a5c;
-  --good: #22c55e;
-  --fair: #eab308;
-  --poor: #ef4444;
-  --band-160: #8b5cf6;
-  --band-80: #6366f1;
-  --band-60: #3b82f6;
-  --band-40: #06b6d4;
-  --band-30: #14b8a6;
-  --band-20: #22c55e;
-  --band-17: #84cc16;
-  --band-15: #eab308;
-  --band-12: #f97316;
-  --band-10: #ef4444;
-  --band-6: #ec4899;
-  --band-2: #a855f7;
-}
-
-html, body {
-  margin: 0;
-  padding: 0;
-  width: 100%;
-  height: 100%;
-  overflow: hidden;
-  background: var(--bg);
-  color: var(--text);
-  font-family: 'Rajdhani', 'Segoe UI', sans-serif;
-}
-
-.mono { font-family: 'Share Tech Mono', 'Courier New', monospace; }
-
-/* Full-screen flex shell */
-.shell {
-  display: flex;
-  flex-direction: column;
-  width: 100%;
-  height: 100vh;
-  overflow: hidden;
-}
-
-/* Header */
-.header {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 20px;
-  background: linear-gradient(180deg, #0f1520 0%, var(--bg) 100%);
-  border-bottom: 1px solid var(--border);
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.header-title {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.header-title h1 {
-  font-size: 1.3rem;
-  font-weight: 700;
-  letter-spacing: 3px;
-  color: var(--accent);
-  text-shadow: 0 0 20px var(--accent), 0 0 40px #00ff8840;
-}
-
-.header-title .dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 8px var(--accent);
-  animation: pulse 2s ease-in-out infinite;
-}
-
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.3; }
-}
-
-.clocks {
-  display: flex;
-  gap: 20px;
-  align-items: center;
-}
-
-.clock-block {
-  text-align: center;
-}
-
-.clock-label {
-  font-size: 0.65rem;
-  color: var(--text-dim);
-  letter-spacing: 2px;
-  text-transform: uppercase;
-}
-
-.clock-time {
-  font-size: 1.4rem;
-  font-weight: 600;
-  letter-spacing: 2px;
-  color: var(--text);
-}
-
-.clock-time.utc { color: var(--accent); }
-
-/* Main 3-column content area */
-.content {
-  flex: 1;
-  display: grid;
-  grid-template-columns: 280px 1fr 1fr;
-  gap: 8px;
-  padding: 8px;
-  overflow: hidden;
-  min-height: 0;
-}
-
-/* Each column scrolls independently */
-.col {
-  overflow-y: auto;
-  overflow-x: hidden;
-  min-height: 0;
-  scrollbar-width: thin;
-  scrollbar-color: var(--border) transparent;
-}
-
-.col::-webkit-scrollbar { width: 4px; }
-.col::-webkit-scrollbar-track { background: transparent; }
-.col::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-
-/* Cards */
-.card {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  overflow: hidden;
-}
-
-.card + .card {
-  margin-top: 12px;
-}
-
-.card-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 16px;
-  background: var(--bg-card-alt);
-  border-bottom: 1px solid var(--border);
-}
-
-.card-header h2 {
-  font-size: 0.8rem;
-  font-weight: 600;
-  letter-spacing: 2px;
-  text-transform: uppercase;
-  color: var(--text-dim);
-}
-
-.card-header .badge {
-  font-size: 0.65rem;
-  padding: 2px 8px;
-  border-radius: 4px;
-  background: var(--accent-bg);
-  color: var(--accent);
-  border: 1px solid var(--border-glow);
-}
-
-.card-body { padding: 16px; }
-
-/* Solar panel */
-.solar-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
-}
-
-.solar-item {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 8px 6px;
-  text-align: center;
-  transition: border-color 0.3s;
-}
-
-.solar-item:hover {
-  border-color: var(--accent);
-}
-
-.solar-item .label {
-  font-size: 0.6rem;
-  color: var(--text-dim);
-  letter-spacing: 1.5px;
-  text-transform: uppercase;
-  margin-bottom: 2px;
-}
-
-.solar-item .value {
-  font-size: 1.3rem;
-  font-weight: 700;
-  line-height: 1.2;
-}
-
-.solar-item .value.small {
-  font-size: 0.9rem;
-}
-
-.solar-item .unit {
-  font-size: 0.55rem;
-  color: var(--text-dim);
-  margin-top: 1px;
-}
-
-/* Kp bar */
-.kp-container {
-  margin-top: 10px;
-}
-
-.kp-label-row {
-  display: flex;
-  justify-content: space-between;
-  margin-bottom: 4px;
-}
-
-.kp-label-row span {
-  font-size: 0.65rem;
-  color: var(--text-dim);
-  letter-spacing: 1px;
-}
-
-.kp-bar-bg {
-  height: 10px;
-  background: var(--bg);
-  border-radius: 5px;
-  overflow: hidden;
-  border: 1px solid var(--border);
-}
-
-.kp-bar-fill {
-  height: 100%;
-  border-radius: 5px;
-  transition: width 0.8s ease, background 0.8s ease;
-  box-shadow: 0 0 10px currentColor;
-}
-
-.kp-ticks {
-  display: flex;
-  justify-content: space-between;
-  margin-top: 2px;
-  padding: 0 1px;
-}
-
-.kp-ticks span {
-  font-size: 0.5rem;
-  color: var(--text-muted);
-  width: 11.11%;
-  text-align: center;
-}
-
-/* Geomag status */
-.geomag-status {
-  margin-top: 10px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  background: var(--bg);
-  border-radius: 6px;
-  border: 1px solid var(--border);
-}
-
-.geomag-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-
-.geomag-text {
-  font-size: 0.75rem;
-  color: var(--text-dim);
-}
-
-.geomag-text strong {
-  color: var(--text);
-  text-transform: capitalize;
-}
-
-/* Signal noise */
-.signal-noise {
-  margin-top: 10px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 10px;
-  background: var(--bg);
-  border-radius: 6px;
-  border: 1px solid var(--border);
-}
-
-.signal-noise .label {
-  font-size: 0.65rem;
-  color: var(--text-dim);
-  letter-spacing: 1px;
-  text-transform: uppercase;
-  white-space: nowrap;
-}
-
-.signal-noise .value {
-  font-size: 1rem;
-  font-weight: 600;
-  color: var(--accent);
-}
-
-/* Band conditions */
-.band-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-
-.band-table th {
-  font-size: 0.65rem;
-  color: var(--text-dim);
-  letter-spacing: 1.5px;
-  text-transform: uppercase;
-  padding: 8px 12px;
-  text-align: left;
-  border-bottom: 1px solid var(--border);
-}
-
-.band-table th:not(:first-child) { text-align: center; }
-
-.band-table td {
-  padding: 7px 12px;
-  border-bottom: 1px solid #1a2332;
-  font-size: 0.85rem;
-}
-
-.band-table td:not(:first-child) { text-align: center; }
-
-.band-table tr:hover { background: #ffffff06; }
-
-.band-name {
-  font-weight: 600;
-  letter-spacing: 1px;
-}
-
-.condition-cell {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.condition-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-
-.condition-dot.good { background: var(--good); box-shadow: 0 0 6px var(--good); }
-.condition-dot.fair { background: var(--fair); box-shadow: 0 0 6px var(--fair); }
-.condition-dot.poor { background: var(--poor); box-shadow: 0 0 6px var(--poor); }
-
-.condition-text {
-  font-size: 0.75rem;
-  color: var(--text-dim);
-}
-
-/* DX cluster */
-.dx-table-wrap {
-  overflow-y: auto;
-  scrollbar-width: thin;
-  scrollbar-color: var(--border) transparent;
-  flex: 1;
-}
-
-.dx-table-wrap::-webkit-scrollbar { width: 4px; }
-.dx-table-wrap::-webkit-scrollbar-track { background: transparent; }
-.dx-table-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-
-.dx-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-
-.dx-table th {
-  font-size: 0.6rem;
-  color: var(--text-dim);
-  letter-spacing: 1.5px;
-  text-transform: uppercase;
-  padding: 8px 10px;
-  text-align: left;
-  border-bottom: 1px solid var(--border);
-  position: sticky;
-  top: 0;
-  background: var(--bg-card);
-  z-index: 1;
-}
-
-.dx-table td {
-  padding: 6px 10px;
-  border-bottom: 1px solid #1a2332;
-  font-size: 0.8rem;
-  white-space: nowrap;
-}
-
-.dx-table tr:hover { background: #ffffff06; }
-
-.dx-freq {
-  color: var(--text-dim);
-}
-
-.dx-call {
-  font-weight: 600;
-  color: var(--text);
-}
-
-.dx-spotter {
-  color: var(--text-dim);
-  font-size: 0.75rem;
-}
-
-.dx-comment {
-  color: var(--text-dim);
-  font-size: 0.7rem;
-  max-width: 140px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.dx-time {
-  color: var(--text-muted);
-  font-size: 0.7rem;
-}
-
-.band-badge {
-  display: inline-block;
-  padding: 1px 6px;
-  border-radius: 3px;
-  font-size: 0.65rem;
-  font-weight: 600;
-  letter-spacing: 0.5px;
-  color: #fff;
-  min-width: 32px;
-  text-align: center;
-}
-
-/* DX column card fills entire column */
-.dx-card {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-}
-
-.dx-card .card-body {
-  padding: 0;
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-
-/* Propagation images */
-.muf-img-wrap {
-  text-align: center;
-  padding: 12px;
-  background: #080c12;
-}
-
-.muf-img-wrap img, .muf-img-wrap object {
-  max-width: 100%;
-  height: auto;
-  border-radius: 4px;
-  border: 1px solid var(--border);
-}
-
-.hrdlog-img-wrap {
-  text-align: center;
-  padding: 12px;
-}
-
-.hrdlog-img-wrap img {
-  max-width: 100%;
-  height: auto;
-  border-radius: 4px;
-  border: 1px solid var(--border);
-}
-
-/* Solar image */
-.solar-img-wrap {
-  text-align: center;
-  padding: 12px;
-}
-
-.solar-img-wrap img {
-  max-width: 100%;
-  height: auto;
-  border-radius: 50%;
-  border: 2px solid var(--border);
-  box-shadow: 0 0 20px #f9731620;
-}
-
-/* Status bar */
-.status-bar {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 20px;
-  background: var(--bg-card-alt);
-  border-top: 1px solid var(--border);
-  font-size: 0.6rem;
-  color: var(--text-muted);
-  letter-spacing: 0.5px;
-  flex-wrap: wrap;
-  gap: 4px;
-}
-
-.status-bar .status-item {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.status-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-}
-
-.status-dot.ok { background: var(--good); }
-.status-dot.warn { background: var(--fair); }
-.status-dot.err { background: var(--poor); }
-
-/* Loading / empty states */
-.loading-text {
-  text-align: center;
-  padding: 30px;
-  color: var(--text-muted);
-  font-size: 0.85rem;
-  letter-spacing: 1px;
-}
-
-/* Color helpers */
-.c-good { color: var(--good); }
-.c-fair { color: var(--fair); }
-.c-poor { color: var(--poor); }
-.c-accent { color: var(--accent); }
-.c-dim { color: var(--text-dim); }
-
-/* Responsive: stack to 1 column on narrow screens */
-@media (max-width: 900px) {
-  .content {
-    grid-template-columns: 1fr;
-    overflow-y: auto;
-  }
-}
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+--bg:#0a0e14;--card:#111820;--border:#1a2530;--text:#c8d0d8;--bright:#e8f0f0;
+--green:#22c55e;--yellow:#eab308;--red:#ef4444;--cyan:#06b6d4;--muted:#4a5568;--label:#6b7b8d;
+}
+html,body{
+width:100%;height:100vh;overflow:hidden;
+background:var(--bg);color:var(--text);
+font-family:'Courier New','Liberation Mono',monospace;
+font-size:clamp(10px,1.4vh,16px);
+}
+.hdr{
+display:flex;align-items:center;justify-content:space-between;
+height:clamp(24px,4vh,40px);
+padding:0 clamp(6px,1vw,20px);
+background:var(--card);border-bottom:1px solid var(--border);
+font-size:clamp(10px,1.6vh,18px);
+}
+.hdr-title{color:var(--cyan);font-weight:bold;letter-spacing:2px}
+.hdr-clocks{color:var(--bright);letter-spacing:1px}
+.hdr-clocks span{margin-left:clamp(8px,2vw,24px)}
+.hdr-utc{color:var(--cyan)}
+.hdr-dot{display:inline-block;width:8px;height:8px;background:var(--green);margin-left:clamp(8px,1.5vw,16px)}
+.grid{
+display:grid;
+grid-template-columns:minmax(180px,22vw) minmax(200px,28vw) 1fr;
+gap:clamp(2px,0.4vh,6px);
+padding:clamp(2px,0.4vh,6px);
+height:calc(100vh - clamp(24px,4vh,40px) - clamp(16px,2.5vh,28px));
+overflow:hidden;
+}
+.col{display:flex;flex-direction:column;gap:clamp(2px,0.4vh,6px);overflow:hidden;min-height:0}
+.panel{
+background:var(--card);border:1px solid var(--border);
+overflow:hidden;position:relative;
+display:flex;flex-direction:column;
+}
+.panel-title{
+display:flex;justify-content:space-between;align-items:center;
+padding:clamp(1px,0.3vh,4px) clamp(4px,0.6vw,10px);
+background:var(--bg);
+font-size:clamp(8px,1.1vh,13px);
+color:var(--label);letter-spacing:1px;
+border-bottom:1px solid var(--border);
+flex-shrink:0;
+}
+.panel-body{padding:clamp(2px,0.4vh,6px) clamp(4px,0.6vw,10px);flex:1;overflow:hidden;will-change:contents}
+.timer{color:var(--muted);font-size:clamp(7px,0.9vh,11px)}
+.solar-flex{flex:1}
+.bands-flex{flex:0 0 auto}
+.mid-img{flex:1;min-height:0}
+.dx-full{flex:1;min-height:0}
+.s-row{
+display:flex;justify-content:space-between;align-items:center;
+padding:clamp(1px,0.2vh,3px) 0;
+border-bottom:1px solid var(--border);
+}
+.s-lbl{color:var(--label);font-size:clamp(8px,1vh,12px);flex:0 0 clamp(40px,5vw,70px)}
+.s-val{color:var(--bright);font-size:clamp(9px,1.2vh,14px);font-weight:bold;text-align:right;flex:1}
+.kp-wrap{display:flex;align-items:center;gap:clamp(2px,0.3vw,6px)}
+.kp-bar{height:clamp(6px,0.8vh,10px);background:var(--bg);flex:1;overflow:hidden}
+.kp-fill{height:100%}
+.band-row{
+display:flex;align-items:center;
+padding:clamp(1px,0.15vh,2px) 0;
+border-bottom:1px solid var(--border);
+font-size:clamp(8px,1vh,12px);
+}
+.band-name{flex:0 0 clamp(40px,5vw,60px);color:var(--bright);font-weight:bold}
+.band-cond{
+flex:0 0 clamp(16px,2vw,24px);
+text-align:center;
+font-weight:bold;
+font-size:clamp(8px,1vh,12px);
+margin:0 clamp(2px,0.3vw,4px);
+padding:clamp(0px,0.1vh,1px) 0;
+}
+.band-lbl{color:var(--label);font-size:clamp(7px,0.8vh,10px);flex:0 0 clamp(24px,3vw,36px);text-align:center}
+.cG{background:var(--green);color:#000}.cF{background:var(--yellow);color:#000}.cP{background:var(--red);color:#fff}.cN{background:var(--muted);color:#fff}
+.img-wrap{flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;min-height:0}
+.img-wrap img{object-fit:contain;max-width:100%;max-height:100%;display:block}
+.dx-tbl{width:100%;border-collapse:collapse}
+.dx-tbl th{
+font-size:clamp(7px,0.9vh,11px);color:var(--label);
+text-align:left;padding:clamp(1px,0.2vh,3px) clamp(2px,0.3vw,6px);
+border-bottom:1px solid var(--border);
+position:sticky;top:0;background:var(--card);
+letter-spacing:1px;
+}
+.dx-tbl td{
+padding:clamp(1px,0.15vh,2px) clamp(2px,0.3vw,6px);
+border-bottom:1px solid var(--border);
+font-size:clamp(8px,1vh,13px);
+white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.dx-freq{color:var(--label)}
+.dx-band{color:var(--cyan);font-size:clamp(7px,0.9vh,11px)}
+.dx-call{color:var(--bright);font-weight:bold}
+.dx-sp{color:var(--muted);font-size:clamp(7px,0.9vh,11px)}
+.dx-tm{color:var(--muted);font-size:clamp(7px,0.9vh,11px)}
+.dx-body-wrap{flex:1;overflow:hidden;min-height:0}
+.sbar{
+display:flex;align-items:center;justify-content:space-between;
+height:clamp(16px,2.5vh,28px);
+padding:0 clamp(6px,1vw,20px);
+background:var(--card);border-top:1px solid var(--border);
+font-size:clamp(7px,0.9vh,11px);color:var(--muted);
+flex-shrink:0;
+}
+.stale{opacity:0.5}
+.stale::after{content:' (stale)';color:var(--yellow)}
 </style>
 </head>
 <body>
-
-<div class="shell">
-
-<!-- Header -->
-<header class="header">
-  <div class="header-title">
-    <div class="dot"></div>
-    <h1>HAMCLOCK LITE</h1>
-  </div>
-  <div class="clocks">
-    <div class="clock-block">
-      <div class="clock-label">UTC</div>
-      <div class="clock-time utc mono" id="utcClock">--:--:--</div>
-    </div>
-    <div class="clock-block">
-      <div class="clock-label">LOCAL</div>
-      <div class="clock-time mono" id="localClock">--:--:--</div>
-    </div>
-  </div>
-</header>
-
-<!-- 3-column content -->
-<main class="content">
-
-  <!-- Left column: Solar + Bands -->
-  <div class="col">
-
-    <!-- Solar Data -->
-    <div class="card">
-      <div class="card-header">
-        <h2>Solar Conditions</h2>
-        <span class="badge mono" id="solarUpdated">--</span>
-      </div>
-      <div class="card-body">
-        <div class="solar-grid" id="solarGrid">
-          <div class="loading-text" style="grid-column:1/-1">Waiting for data...</div>
-        </div>
-        <div class="kp-container" id="kpContainer" style="display:none">
-          <div class="kp-label-row">
-            <span>KP INDEX</span>
-            <span class="mono" id="kpValue">--</span>
-          </div>
-          <div class="kp-bar-bg">
-            <div class="kp-bar-fill" id="kpBar" style="width:0%"></div>
-          </div>
-          <div class="kp-ticks">
-            <span>0</span><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span><span>9</span>
-          </div>
-        </div>
-        <div class="geomag-status" id="geomagStatus" style="display:none">
-          <div class="geomag-dot" id="geomagDot"></div>
-          <div class="geomag-text">Geomagnetic Field: <strong id="geomagText">--</strong></div>
-        </div>
-        <div class="signal-noise" id="signalNoise" style="display:none">
-          <span class="label">Signal Noise</span>
-          <span class="value mono" id="signalNoiseValue">--</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- Band Conditions -->
-    <div class="card">
-      <div class="card-header">
-        <h2>HF Band Conditions</h2>
-        <span class="badge mono" id="bandsUpdated">--</span>
-      </div>
-      <div class="card-body" style="padding:0">
-        <table class="band-table" id="bandTable">
-          <thead>
-            <tr><th>Band</th><th>Day</th><th>Night</th></tr>
-          </thead>
-          <tbody id="bandBody">
-            <tr><td colspan="3" class="loading-text">Waiting for data...</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-
-  </div>
-
-  <!-- Middle column: Solar Image + Propagation -->
-  <div class="col">
-
-    <!-- Solar Image -->
-    <div class="card">
-      <div class="card-header">
-        <h2>Solar Image</h2>
-        <span class="badge mono">SDO/HMI</span>
-      </div>
-      <div class="solar-img-wrap">
-        <img id="solarImage" src="/api/solar-image" alt="SDO Solar Image" width="256" height="256" loading="lazy">
-      </div>
-    </div>
-
-    <!-- MUF Map -->
-    <div class="card">
-      <div class="card-header">
-        <h2>MUF Propagation Map</h2>
-        <span class="badge mono">KC2G</span>
-      </div>
-      <div class="muf-img-wrap">
-        <img id="mufMap" src="/api/muf-map" alt="MUF Propagation Map" loading="lazy">
-      </div>
-    </div>
-
-    <!-- HF Propagation -->
-    <div class="card">
-      <div class="card-header">
-        <h2>HF Propagation</h2>
-        <span class="badge mono">HamQSL</span>
-      </div>
-      <div class="hrdlog-img-wrap">
-        <img id="hrdlogImg" src="/api/hrdlog-image" alt="HF Propagation" loading="lazy">
-      </div>
-    </div>
-
-  </div>
-
-  <!-- Right column: DX Cluster -->
-  <div class="col">
-    <div class="card dx-card">
-      <div class="card-header">
-        <h2>DX Cluster</h2>
-        <span class="badge mono" id="dxUpdated">--</span>
-      </div>
-      <div class="card-body">
-        <div class="dx-table-wrap">
-          <table class="dx-table">
-            <thead>
-              <tr><th>Freq</th><th>Band</th><th>DX Call</th><th>Spotter</th><th>UTC</th><th>Comment</th></tr>
-            </thead>
-            <tbody id="dxBody">
-              <tr><td colspan="6" class="loading-text">Waiting for data...</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-  </div>
-
-</main>
-
-<!-- Status bar -->
-<footer class="status-bar">
-  <div class="status-item">
-    <div class="status-dot" id="serverDot"></div>
-    <span id="serverStatus">Connecting...</span>
-  </div>
-  <div class="status-item">
-    <span id="dataAges">Solar: -- | Bands: -- | DX: --</span>
-  </div>
-  <div class="status-item">
-    <span>HamClock Lite v1.0</span>
-  </div>
-</footer>
-
+<div class="hdr">
+<span class="hdr-title">HAMCLOCK LITE</span>
+<span class="hdr-clocks">
+<span class="hdr-utc" id="utc">UTC --:--:--</span>
+<span id="lcl">LOCAL --:--:--</span>
+</span>
+<span class="hdr-dot" id="statusDot"></span>
 </div>
-
+<div class="grid">
+<div class="col">
+<div class="panel solar-flex">
+<div class="panel-title"><span>SOLAR</span><span class="timer" id="tmSolar"></span></div>
+<div class="panel-body" id="solarPanel">Loading...</div>
+</div>
+<div class="panel bands-flex">
+<div class="panel-title"><span>BANDS</span><span class="timer" id="tmBands"></span></div>
+<div class="panel-body" id="bandsPanel">Loading...</div>
+</div>
+</div>
+<div class="col">
+<div class="panel mid-img">
+<div class="panel-title"><span>SDO IMAGE</span><span class="timer" id="tmSolarImg"></span></div>
+<div class="img-wrap"><img id="imgSolar" src="/api/solar-image" alt="SDO"></div>
+</div>
+<div class="panel mid-img">
+<div class="panel-title"><span>MUF MAP</span><span class="timer" id="tmMuf"></span></div>
+<div class="img-wrap"><img id="imgMuf" src="/api/muf-map" alt="MUF"></div>
+</div>
+<div class="panel mid-img">
+<div class="panel-title"><span>HF PROP</span><span class="timer" id="tmHrd"></span></div>
+<div class="img-wrap"><img id="imgHrd" src="/api/hrdlog-image" alt="HRD"></div>
+</div>
+</div>
+<div class="col">
+<div class="panel dx-full">
+<div class="panel-title"><span>DX CLUSTER</span><span class="timer" id="tmDx"></span></div>
+<div class="panel-body dx-body-wrap" style="padding:0">
+<table class="dx-tbl"><thead><tr><th>FREQ</th><th>B</th><th>DX CALL</th><th>DE</th><th>UTC</th></tr></thead><tbody id="dxBody"><tr><td colspan="5" style="color:var(--muted);padding:8px">Loading...</td></tr></tbody></table>
+</div>
+</div>
+</div>
+</div>
+<div class="sbar">
+<span id="sbarLeft">Connecting...</span>
+<span id="sbarRight">HamClock Lite v2.0</span>
+</div>
 <script>
-(function() {
-  'use strict';
+(function(){
+'use strict';
+var P=function(n){return n<10?'0'+n:''+n};
+var esc=function(s){
+if(s==null)return'';
+return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+};
 
-  // --- Clocks ---
-  function pad(n) { return n < 10 ? '0' + n : '' + n; }
+// Timestamps for countdown timers
+var lastSolarFetch=0,lastDxFetch=0,lastImageFetch=0;
+var SOLAR_INTERVAL=300,DX_INTERVAL=120,IMAGE_INTERVAL=900;
+var POLL_INTERVAL=60000;
+var failCount=0;
 
-  function updateClocks() {
-    var now = new Date();
-    document.getElementById('utcClock').textContent =
-      pad(now.getUTCHours()) + ':' + pad(now.getUTCMinutes()) + ':' + pad(now.getUTCSeconds());
-    document.getElementById('localClock').textContent =
-      pad(now.getHours()) + ':' + pad(now.getMinutes()) + ':' + pad(now.getSeconds());
-  }
-  setInterval(updateClocks, 1000);
-  updateClocks();
+// Cached last-known data for stale display
+var lastSolar=null,lastBands=null,lastDx=null;
+var solarStale=false,bandsStale=false,dxStale=false;
 
-  // --- Color helpers ---
-  var BAND_COLORS = {
-    '160m': '#8b5cf6', '80m': '#6366f1', '60m': '#3b82f6', '40m': '#06b6d4',
-    '30m': '#14b8a6', '20m': '#22c55e', '17m': '#84cc16', '15m': '#eab308',
-    '12m': '#f97316', '10m': '#ef4444', '6m': '#ec4899', '2m': '#a855f7', '70cm': '#f472b6'
-  };
+// DOM refs
+var elUtc=document.getElementById('utc');
+var elLcl=document.getElementById('lcl');
+var elSolar=document.getElementById('solarPanel');
+var elBands=document.getElementById('bandsPanel');
+var elDxBody=document.getElementById('dxBody');
+var elDot=document.getElementById('statusDot');
+var elSbarL=document.getElementById('sbarLeft');
+var tmSolar=document.getElementById('tmSolar');
+var tmBands=document.getElementById('tmBands');
+var tmDx=document.getElementById('tmDx');
+var tmSolarImg=document.getElementById('tmSolarImg');
+var tmMuf=document.getElementById('tmMuf');
+var tmHrd=document.getElementById('tmHrd');
 
-  function conditionColor(c) {
-    if (!c) return '#3a4a5c';
-    var l = c.toLowerCase();
-    if (l === 'good') return '#22c55e';
-    if (l === 'fair') return '#eab308';
-    if (l === 'poor') return '#ef4444';
-    return '#3a4a5c';
-  }
+// Clocks + countdown timers (single interval)
+function tick(){
+var now=new Date();
+var ts=Math.floor(now.getTime()/1000);
+elUtc.textContent='UTC '+P(now.getUTCHours())+':'+P(now.getUTCMinutes())+':'+P(now.getUTCSeconds());
+elLcl.textContent='LOCAL '+P(now.getHours())+':'+P(now.getMinutes())+':'+P(now.getSeconds());
+// Countdowns
+showCD(tmSolar,lastSolarFetch,SOLAR_INTERVAL,ts);
+showCD(tmBands,lastSolarFetch,SOLAR_INTERVAL,ts);
+showCD(tmDx,lastDxFetch,DX_INTERVAL,ts);
+showCD(tmSolarImg,lastImageFetch,IMAGE_INTERVAL,ts);
+showCD(tmMuf,lastImageFetch,IMAGE_INTERVAL,ts);
+showCD(tmHrd,lastImageFetch,IMAGE_INTERVAL,ts);
+}
+function showCD(el,last,interval,now){
+if(!last){el.textContent='';return;}
+var elapsed=now-last;
+var remain=interval-elapsed;
+if(remain<0)remain=0;
+var m=Math.floor(remain/60);
+var s=remain%60;
+el.textContent='\u21BB '+m+':'+P(s);
+}
+setInterval(tick,1000);
+tick();
 
-  function conditionClass(c) {
-    if (!c) return '';
-    var l = c.toLowerCase();
-    if (l === 'good') return 'good';
-    if (l === 'fair') return 'fair';
-    if (l === 'poor') return 'poor';
-    return '';
-  }
+// Color helpers
+function kpColor(k){k=parseFloat(k)||0;if(k<=2)return'var(--green)';if(k<=4)return'var(--yellow)';return'var(--red)';}
+function sfiColor(s){s=parseFloat(s)||0;if(s>=150)return'var(--green)';if(s>=100)return'var(--cyan)';if(s>=70)return'var(--yellow)';return'var(--red)';}
+function condLetter(c){if(!c)return{l:'?',cls:'cN'};var v=c.toLowerCase();if(v==='good')return{l:'G',cls:'cG'};if(v==='fair')return{l:'F',cls:'cF'};if(v==='poor')return{l:'P',cls:'cP'};return{l:'?',cls:'cN'};}
+function geoColor(s){if(!s)return'var(--muted)';var v=s.toLowerCase();if(v==='quiet'||v==='inactive')return'var(--green)';if(v==='unsettled'||v==='active')return'var(--yellow)';return'var(--red)';}
 
-  function kpColor(kp) {
-    var k = parseFloat(kp) || 0;
-    if (k <= 2) return '#22c55e';
-    if (k <= 4) return '#eab308';
-    if (k <= 6) return '#f97316';
-    return '#ef4444';
-  }
+// Render solar
+function renderSolar(d){
+if(!d||!d.sfi)return;
+lastSolar=d;solarStale=false;
+var kp=parseFloat(d.kIndex)||0;
+var kpPct=Math.min(kp/9*100,100);
+var h='';
+h+='<div class="s-row"><span class="s-lbl">SFI</span><span class="s-val" style="color:'+sfiColor(d.sfi)+'">'+esc(d.sfi)+'</span></div>';
+h+='<div class="s-row"><span class="s-lbl">Kp</span><span class="s-val"><span class="kp-wrap"><span class="kp-bar"><span class="kp-fill" style="width:'+kpPct+'%;background:'+kpColor(d.kIndex)+'"></span></span><span style="color:'+kpColor(d.kIndex)+'">'+esc(d.kIndex)+'</span></span></span></div>';
+h+='<div class="s-row"><span class="s-lbl">SSN</span><span class="s-val" style="color:var(--cyan)">'+esc(d.ssn)+'</span></div>';
+h+='<div class="s-row"><span class="s-lbl">A</span><span class="s-val" style="color:'+(parseInt(d.aIndex)>20?'var(--red)':'var(--green)')+'">'+esc(d.aIndex)+'</span></div>';
+h+='<div class="s-row"><span class="s-lbl">X-Ray</span><span class="s-val" style="color:var(--yellow)">'+esc(d.xray)+'</span></div>';
+h+='<div class="s-row"><span class="s-lbl">Wind</span><span class="s-val" style="color:'+(parseFloat(d.solarWind)>500?'var(--red)':'var(--cyan)')+'">'+esc(d.solarWind)+'</span></div>';
+h+='<div class="s-row"><span class="s-lbl">Bz</span><span class="s-val" style="color:'+(parseFloat(d.magneticField)<0?'var(--red)':'var(--green)')+'">'+esc(d.magneticField)+'</span></div>';
+h+='<div class="s-row"><span class="s-lbl">Geo</span><span class="s-val" style="color:'+geoColor(d.geomagField)+'">'+esc(d.geomagField)+'</span></div>';
+if(d.signalNoise){h+='<div class="s-row"><span class="s-lbl">S/N</span><span class="s-val" style="color:var(--cyan)">'+esc(d.signalNoise)+'</span></div>';}
+if(d.aurora){h+='<div class="s-row"><span class="s-lbl">Aurora</span><span class="s-val" style="color:#a855f7">'+esc(d.aurora)+'</span></div>';}
+if(d.fof2){h+='<div class="s-row"><span class="s-lbl">foF2</span><span class="s-val" style="color:#3b82f6">'+esc(d.fof2)+'</span></div>';}
+elSolar.innerHTML=h;
+}
 
-  function sfiColor(sfi) {
-    var s = parseFloat(sfi) || 0;
-    if (s >= 150) return '#22c55e';
-    if (s >= 100) return '#84cc16';
-    if (s >= 70) return '#eab308';
-    return '#ef4444';
-  }
+// Render bands
+function renderBands(d){
+if(!d||Object.keys(d).length===0)return;
+lastBands=d;bandsStale=false;
+var order=['80m-40m','30m-20m','17m-15m','12m-10m'];
+var keys=Object.keys(d).sort(function(a,b){
+var ai=order.indexOf(a),bi=order.indexOf(b);
+if(ai===-1)ai=99;if(bi===-1)bi=99;return ai-bi;
+});
+var h='<div class="band-row"><span class="band-name"></span><span class="band-lbl">DAY</span><span class="band-lbl">NITE</span></div>';
+for(var i=0;i<keys.length;i++){
+var n=keys[i],b=d[n];
+var dc=condLetter(b.day||b.Day);
+var nc=condLetter(b.night||b.Night);
+h+='<div class="band-row"><span class="band-name">'+esc(n)+'</span><span class="band-cond '+dc.cls+'">'+dc.l+'</span><span class="band-cond '+nc.cls+'">'+nc.l+'</span></div>';
+}
+elBands.innerHTML=h;
+}
 
-  function geomagColor(status) {
-    if (!status) return '#3a4a5c';
-    var l = status.toLowerCase();
-    if (l === 'quiet' || l === 'inactive') return '#22c55e';
-    if (l === 'unsettled' || l === 'active') return '#eab308';
-    return '#ef4444';
-  }
+// Render DX
+var BAND_COLORS={'160m':'#8b5cf6','80m':'#6366f1','60m':'#3b82f6','40m':'#06b6d4','30m':'#14b8a6','20m':'#22c55e','17m':'#84cc16','15m':'#eab308','12m':'#f97316','10m':'#ef4444','6m':'#ec4899','2m':'#a855f7','70cm':'#f472b6'};
+function renderDX(spots){
+if(!spots||spots.length===0){elDxBody.innerHTML='<tr><td colspan="5" style="color:var(--muted);padding:8px">No spots</td></tr>';return;}
+lastDx=spots;dxStale=false;
+// Limit to visible rows based on viewport
+var maxRows=Math.min(spots.length,Math.floor((window.innerHeight-120)/18));
+if(maxRows<5)maxRows=5;
+if(maxRows>spots.length)maxRows=spots.length;
+var h='';
+for(var i=0;i<maxRows;i++){
+var s=spots[i];
+var bc=BAND_COLORS[s.band]||'var(--muted)';
+h+='<tr><td class="dx-freq">'+esc(s.frequency)+'</td><td class="dx-band" style="color:'+bc+'">'+esc(s.band)+'</td><td class="dx-call">'+esc(s.dx)+'</td><td class="dx-sp">'+esc(s.spotter)+'</td><td class="dx-tm">'+esc(s.time)+'</td></tr>';
+}
+elDxBody.innerHTML=h;
+}
 
-  function timeAgo(seconds) {
-    if (seconds < 0) return 'never';
-    if (seconds < 60) return seconds + 's ago';
-    return Math.floor(seconds / 60) + 'm ago';
-  }
+// XHR with timeout
+function fetchJSON(url,cb){
+var xhr=new XMLHttpRequest();
+xhr.open('GET',url,true);
+xhr.timeout=8000;
+xhr.onload=function(){
+if(xhr.status===200){try{cb(null,JSON.parse(xhr.responseText));}catch(e){cb(e);}}
+else cb(new Error(xhr.status));
+};
+xhr.onerror=function(){cb(new Error('net'));};
+xhr.ontimeout=function(){cb(new Error('timeout'));};
+xhr.send();
+}
 
-  function escapeHtml(s) {
-    if (s === undefined || s === null) return '';
-    var d = document.createElement('div');
-    d.appendChild(document.createTextNode(String(s)));
-    return d.innerHTML;
-  }
+function fetchAll(){
+var now=Math.floor(Date.now()/1000);
 
-  // --- Render solar ---
-  function renderSolar(data) {
-    if (!data || !data.sfi) return;
+// Solar + Bands (from same source conceptually)
+fetchJSON('/api/solar',function(err,d){
+if(!err&&d){lastSolarFetch=now;renderSolar(d);}
+else{solarStale=true;if(lastSolar)renderSolar(lastSolar);}
+});
+fetchJSON('/api/bands',function(err,d){
+if(!err&&d){renderBands(d);}
+else{bandsStale=true;if(lastBands)renderBands(lastBands);}
+});
 
-    var items = [
-      { label: 'SFI', value: data.sfi, unit: 'Solar Flux', color: sfiColor(data.sfi) },
-      { label: 'SSN', value: data.ssn, unit: 'Sunspots', color: '#06b6d4' },
-      { label: 'A-INDEX', value: data.aIndex, unit: 'Planetary', color: parseInt(data.aIndex) > 20 ? '#ef4444' : '#22c55e' },
-      { label: 'X-RAY', value: data.xray, unit: 'Class', color: '#eab308', small: true },
-      { label: 'SOLAR WIND', value: data.solarWind, unit: 'km/s', color: parseFloat(data.solarWind) > 500 ? '#ef4444' : '#06b6d4' },
-      { label: 'BZ', value: data.magneticField, unit: 'nT', color: parseFloat(data.magneticField) < 0 ? '#ef4444' : '#22c55e' },
-      { label: 'AURORA', value: data.aurora, unit: 'Activity', color: '#a855f7' },
-      { label: 'FOF2', value: data.fof2, unit: 'MHz', color: '#3b82f6' },
-    ];
+// DX
+fetchJSON('/api/dxspots',function(err,d){
+if(!err&&d){lastDxFetch=now;renderDX(d);}
+else{dxStale=true;if(lastDx)renderDX(lastDx);}
+});
 
-    var html = '';
-    for (var i = 0; i < items.length; i++) {
-      var it = items[i];
-      html += '<div class="solar-item">' +
-        '<div class="label">' + it.label + '</div>' +
-        '<div class="value mono' + (it.small ? ' small' : '') + '" style="color:' + it.color + '">' + escapeHtml(it.value) + '</div>' +
-        '<div class="unit">' + it.unit + '</div>' +
-        '</div>';
-    }
-    document.getElementById('solarGrid').innerHTML = html;
+// Health
+fetchJSON('/api/health',function(err,d){
+if(!err&&d&&d.status==='ok'){
+failCount=0;
+elDot.style.background='var(--green)';
+elSbarL.textContent='Solar:'+fmtAge(d.solar_age)+' Bands:'+fmtAge(d.bands_age)+' DX:'+fmtAge(d.dx_age);
+elSbarL.className='';
+}else{
+failCount++;
+if(failCount>3){elDot.style.background='var(--red)';elSbarL.textContent='Disconnected';elSbarL.className='stale';}
+else{elDot.style.background='var(--yellow)';elSbarL.textContent='Retrying...';}
+}
+});
+}
 
-    // Kp bar
-    var kp = parseFloat(data.kIndex) || 0;
-    var kpPct = Math.min(kp / 9 * 100, 100);
-    var kc = kpColor(data.kIndex);
-    document.getElementById('kpContainer').style.display = 'block';
-    document.getElementById('kpValue').textContent = data.kIndex;
-    document.getElementById('kpValue').style.color = kc;
-    var bar = document.getElementById('kpBar');
-    bar.style.width = kpPct + '%';
-    bar.style.background = 'linear-gradient(90deg, #22c55e, ' + kc + ')';
-    bar.style.color = kc;
+function fmtAge(s){
+if(s==null||s<0)return' --';
+if(s<60)return' '+s+'s';
+return' '+Math.floor(s/60)+'m';
+}
 
-    // Geomag
-    document.getElementById('geomagStatus').style.display = 'flex';
-    var gc = geomagColor(data.geomagField);
-    document.getElementById('geomagDot').style.background = gc;
-    document.getElementById('geomagDot').style.boxShadow = '0 0 8px ' + gc;
-    document.getElementById('geomagText').textContent = data.geomagField;
-    document.getElementById('geomagText').style.color = gc;
+// Image refresh (separate, every 15 min)
+function refreshImages(){
+var t=Date.now();
+lastImageFetch=Math.floor(t/1000);
+var a=document.getElementById('imgSolar');if(a)a.src='/api/solar-image?t='+t;
+var b=document.getElementById('imgMuf');if(b)b.src='/api/muf-map?t='+t;
+var c=document.getElementById('imgHrd');if(c)c.src='/api/hrdlog-image?t='+t;
+}
 
-    // Signal noise
-    if (data.signalNoise) {
-      document.getElementById('signalNoise').style.display = 'flex';
-      document.getElementById('signalNoiseValue').textContent = data.signalNoise;
-    }
-
-    document.getElementById('solarUpdated').textContent = data.updated || '--';
-  }
-
-  // --- Render bands ---
-  var BAND_ORDER = ['80m-40m', '30m-20m', '17m-15m', '12m-10m'];
-
-  function renderBands(data) {
-    if (!data || Object.keys(data).length === 0) {
-      document.getElementById('bandBody').innerHTML =
-        '<tr><td colspan="3" class="loading-text">No band data available</td></tr>';
-      return;
-    }
-
-    var bands = Object.keys(data).sort(function(a, b) {
-      var order = ['80m-40m', '30m-20m', '17m-15m', '12m-10m'];
-      var ai = order.indexOf(a);
-      var bi = order.indexOf(b);
-      if (ai === -1) ai = 99;
-      if (bi === -1) bi = 99;
-      return ai - bi;
-    });
-
-    var html = '';
-    for (var i = 0; i < bands.length; i++) {
-      var name = bands[i];
-      var bd = data[name];
-      var dayC = bd.day || bd.Day || 'N/A';
-      var nightC = bd.night || bd.Night || 'N/A';
-      html += '<tr>' +
-        '<td><span class="band-name">' + escapeHtml(name) + '</span></td>' +
-        '<td><span class="condition-cell"><span class="condition-dot ' + conditionClass(dayC) + '"></span><span class="condition-text">' + escapeHtml(dayC) + '</span></span></td>' +
-        '<td><span class="condition-cell"><span class="condition-dot ' + conditionClass(nightC) + '"></span><span class="condition-text">' + escapeHtml(nightC) + '</span></span></td>' +
-        '</tr>';
-    }
-    document.getElementById('bandBody').innerHTML = html;
-    document.getElementById('bandsUpdated').textContent = 'LIVE';
-  }
-
-  // --- Render DX ---
-  function renderDX(spots) {
-    if (!spots || spots.length === 0) {
-      document.getElementById('dxBody').innerHTML =
-        '<tr><td colspan="6" class="loading-text">No DX spots available</td></tr>';
-      document.getElementById('dxUpdated').textContent = '0 spots';
-      return;
-    }
-
-    var html = '';
-    for (var i = 0; i < spots.length; i++) {
-      var s = spots[i];
-      var bc = BAND_COLORS[s.band] || '#6b7d93';
-      html += '<tr>' +
-        '<td class="dx-freq mono">' + escapeHtml(s.frequency) + '</td>' +
-        '<td><span class="band-badge" style="background:' + bc + '20;color:' + bc + ';border:1px solid ' + bc + '40">' + escapeHtml(s.band) + '</span></td>' +
-        '<td class="dx-call mono">' + escapeHtml(s.dx) + '</td>' +
-        '<td class="dx-spotter mono">' + escapeHtml(s.spotter) + '</td>' +
-        '<td class="dx-time mono">' + escapeHtml(s.time) + '</td>' +
-        '<td class="dx-comment">' + escapeHtml(s.comment) + '</td>' +
-        '</tr>';
-    }
-    document.getElementById('dxBody').innerHTML = html;
-    document.getElementById('dxUpdated').textContent = spots.length + ' spots';
-  }
-
-  // --- Fetch data ---
-  var failCount = 0;
-
-  function fetchAll() {
-    fetchJSON('/api/solar', function(data) { renderSolar(data); });
-    fetchJSON('/api/bands', function(data) { renderBands(data); });
-    fetchJSON('/api/dxspots', function(data) { renderDX(data); });
-    fetchJSON('/api/health', function(data) {
-      if (data && data.status === 'ok') {
-        failCount = 0;
-        document.getElementById('serverDot').className = 'status-dot ok';
-        document.getElementById('serverStatus').textContent = 'Connected';
-        document.getElementById('dataAges').textContent =
-          'Solar: ' + timeAgo(data.solar_age) +
-          ' | Bands: ' + timeAgo(data.bands_age) +
-          ' | DX: ' + timeAgo(data.dx_age);
-      }
-    });
-  }
-
-  function fetchJSON(url, cb) {
-    var xhr = new XMLHttpRequest();
-    xhr.open('GET', url, true);
-    xhr.timeout = 8000;
-    xhr.onload = function() {
-      if (xhr.status === 200) {
-        try { cb(JSON.parse(xhr.responseText)); } catch(e) {}
-      }
-    };
-    xhr.onerror = function() {
-      failCount++;
-      if (failCount > 3) {
-        document.getElementById('serverDot').className = 'status-dot err';
-        document.getElementById('serverStatus').textContent = 'Disconnected — retrying...';
-      }
-    };
-    xhr.ontimeout = xhr.onerror;
-    xhr.send();
-  }
-
-  // Refresh images every 15 minutes
-  function refreshImages() {
-    var img = document.getElementById('solarImage');
-    if (img) img.src = '/api/solar-image?t=' + Date.now();
-    var muf = document.getElementById('mufMap');
-    if (muf) muf.src = '/api/muf-map?t=' + Date.now();
-    var hrdlog = document.getElementById('hrdlogImg');
-    if (hrdlog) hrdlog.src = '/api/hrdlog-image?t=' + Date.now();
-  }
-  setInterval(refreshImages, 900000);
-
-  // Initial fetch + interval
-  fetchAll();
-  setInterval(fetchAll, 30000);
-
+// Init
+lastImageFetch=Math.floor(Date.now()/1000);
+fetchAll();
+setInterval(fetchAll,POLL_INTERVAL);
+setInterval(refreshImages,IMAGE_INTERVAL*1000);
 })();
 </script>
 </body>
