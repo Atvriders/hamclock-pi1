@@ -213,9 +213,9 @@ var remaining=Math.max(0,intervalSec-elapsed);
 return remaining>=60?Math.ceil(remaining/60)+'m':remaining+'s';
 }
 function updateCountdowns(){
-if(lastSolarFetch){var sc='\u21BB '+formatCountdown(lastSolarFetch,SOLAR_INTERVAL);tmSolar.textContent=sc;tmBands.textContent=sc;}
-if(lastDxFetch){tmDx.textContent='\u21BB '+formatCountdown(lastDxFetch,DX_INTERVAL);}
-if(lastImageFetch){var ic='\u21BB '+formatCountdown(lastImageFetch,IMAGE_INTERVAL);tmSolarImg.textContent=ic;tmMuf.textContent=ic;tmHrd.textContent=ic;}
+if(lastSolarFetch){var sc='next \u21BB '+formatCountdown(lastSolarFetch,SOLAR_INTERVAL);tmSolar.textContent=sc;tmBands.textContent=sc;}
+if(lastDxFetch){tmDx.textContent='next \u21BB '+formatCountdown(lastDxFetch,DX_INTERVAL);}
+if(lastImageFetch){var ic='next \u21BB '+formatCountdown(lastImageFetch,IMAGE_INTERVAL);tmSolarImg.textContent=ic;tmMuf.textContent=ic;tmHrd.textContent=ic;}
 }
 
 // Color helpers
@@ -254,7 +254,7 @@ var keys=Object.keys(d).sort(function(a,b){
 var ai=order.indexOf(a),bi=order.indexOf(b);
 if(ai===-1)ai=99;if(bi===-1)bi=99;return ai-bi;
 });
-var h='<div class="band-row"><span class="band-name"></span><span class="band-lbl">DAY</span><span class="band-lbl">NITE</span></div>';
+var h='<div class="band-row"><span class="band-name"></span><span class="band-lbl">DAY</span><span class="band-lbl">NIGHT</span></div>';
 for(var i=0;i<keys.length;i++){
 var n=keys[i],b=d[n];
 var dc=condLetter(b.day||b.Day);
