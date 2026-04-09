@@ -51,7 +51,7 @@ color:var(--label);letter-spacing:1px;
 border-bottom:1px solid var(--border);
 flex-shrink:0;
 }
-.panel-body{padding:clamp(2px,0.4vh,6px) clamp(4px,0.6vw,10px);flex:1;overflow:hidden;will-change:contents}
+.panel-body{padding:clamp(2px,0.4vh,6px) clamp(4px,0.6vw,10px);flex:1;overflow:hidden}
 .timer{color:var(--muted);font-size:clamp(7px,0.9vh,11px)}
 .solar-flex{flex:1}
 .bands-flex{flex:0 0 auto}
@@ -199,31 +199,24 @@ var tmSolarImg=document.getElementById('tmSolarImg');
 var tmMuf=document.getElementById('tmMuf');
 var tmHrd=document.getElementById('tmHrd');
 
-// Clocks + countdown timers (single interval)
-function tick(){
-var now=new Date();
-var ts=Math.floor(now.getTime()/1000);
-elUtc.textContent='UTC '+P(now.getUTCHours())+':'+P(now.getUTCMinutes())+':'+P(now.getUTCSeconds());
-elLcl.textContent='LOCAL '+P(now.getHours())+':'+P(now.getMinutes())+':'+P(now.getSeconds());
-// Countdowns
-showCD(tmSolar,lastSolarFetch,SOLAR_INTERVAL,ts);
-showCD(tmBands,lastSolarFetch,SOLAR_INTERVAL,ts);
-showCD(tmDx,lastDxFetch,DX_INTERVAL,ts);
-showCD(tmSolarImg,lastImageFetch,IMAGE_INTERVAL,ts);
-showCD(tmMuf,lastImageFetch,IMAGE_INTERVAL,ts);
-showCD(tmHrd,lastImageFetch,IMAGE_INTERVAL,ts);
+// Clock only — no countdown ticking (countdowns updated statically per fetch cycle)
+setInterval(function(){
+var d=new Date();
+elUtc.textContent='UTC '+P(d.getUTCHours())+':'+P(d.getUTCMinutes())+':'+P(d.getUTCSeconds());
+elLcl.textContent='LOCAL '+P(d.getHours())+':'+P(d.getMinutes())+':'+P(d.getSeconds());
+},1000);
+
+// Static countdown — called once per fetch cycle, not every second
+function formatCountdown(lastFetch,intervalSec){
+var elapsed=Math.floor((Date.now()/1000)-lastFetch);
+var remaining=Math.max(0,intervalSec-elapsed);
+return remaining>=60?Math.ceil(remaining/60)+'m':remaining+'s';
 }
-function showCD(el,last,interval,now){
-if(!last){el.textContent='';return;}
-var elapsed=now-last;
-var remain=interval-elapsed;
-if(remain<0)remain=0;
-var m=Math.floor(remain/60);
-var s=remain%60;
-el.textContent='\u21BB '+m+':'+P(s);
+function updateCountdowns(){
+if(lastSolarFetch){var sc='\u21BB '+formatCountdown(lastSolarFetch,SOLAR_INTERVAL);tmSolar.textContent=sc;tmBands.textContent=sc;}
+if(lastDxFetch){tmDx.textContent='\u21BB '+formatCountdown(lastDxFetch,DX_INTERVAL);}
+if(lastImageFetch){var ic='\u21BB '+formatCountdown(lastImageFetch,IMAGE_INTERVAL);tmSolarImg.textContent=ic;tmMuf.textContent=ic;tmHrd.textContent=ic;}
 }
-setInterval(tick,1000);
-tick();
 
 // Color helpers
 function kpColor(k){k=parseFloat(k)||0;if(k<=2)return'var(--green)';if(k<=4)return'var(--yellow)';return'var(--red)';}
@@ -305,6 +298,7 @@ xhr.send();
 
 function fetchAll(){
 var now=Math.floor(Date.now()/1000);
+updateCountdowns();
 
 // Solar + Bands (from same source conceptually)
 fetchJSON('/api/solar',function(err,d){
@@ -350,6 +344,7 @@ lastImageFetch=Math.floor(t/1000);
 var a=document.getElementById('imgSolar');if(a)a.src='/api/solar-image?t='+t;
 var b=document.getElementById('imgMuf');if(b)b.src='/api/muf-map?t='+t;
 var c=document.getElementById('imgHrd');if(c)c.src='/api/hrdlog-image?t='+t;
+updateCountdowns();
 }
 
 // Init
