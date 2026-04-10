@@ -4,6 +4,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 echo "=== HamClock Pi1 Kiosk Mode Installer ==="
 echo "This will set up your Pi to boot directly into HamClock on its monitor."
 echo ""
@@ -59,7 +61,6 @@ echo "Browser installed: $BROWSER"
 INSTALL_DIR="/opt/hamclock-lite"
 if [ ! -f "$INSTALL_DIR/server.py" ]; then
     echo "Installing HamClock server..."
-    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
     sudo mkdir -p "$INSTALL_DIR"
     sudo cp "$SCRIPT_DIR/server.py" "$INSTALL_DIR/"
     sudo cp "$SCRIPT_DIR/index.html" "$INSTALL_DIR/"

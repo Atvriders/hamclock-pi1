@@ -369,6 +369,9 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=os.path.dirname(os.path.abspath(__file__)), **kwargs)
 
+    def do_HEAD(self):
+        self.do_GET()
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == '/api/solar':
@@ -401,24 +404,25 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.send_header('Cache-Control', 'public, max-age=300')
                 self.end_headers()
-                self.wfile.write(body)
+                if self.command != 'HEAD':
+                    self.wfile.write(body)
             else:
-                self.send_json({'error': 'MUF map not yet loaded'})
+                self.send_error(503, 'MUF map not yet loaded')
         elif path.startswith('/api/enlil'):
             if CACHE.get('enlil_image'):
                 self.send_binary(CACHE['enlil_image'], 'image/jpeg')
             else:
-                self.send_json({'error': 'not loaded'})
+                self.send_error(503, 'Enlil image not yet loaded')
         elif path.startswith('/api/real-drap'):
             if CACHE.get('real_drap_image'):
                 self.send_binary(CACHE['real_drap_image'], 'image/png')
             else:
-                self.send_json({'error': 'not loaded'})
+                self.send_error(503, 'DRAP image not yet loaded')
         elif path.startswith('/api/drap'):
             if CACHE.get('drap_image'):
                 self.send_binary(CACHE['drap_image'], 'image/jpeg')
             else:
-                self.send_json({'error': 'not loaded'})
+                self.send_error(503, 'Aurora image not yet loaded')
         elif path.startswith('/api/callsign/'):
             call = path.split('/')[-1].upper()
             result = lookup_callsign(call)
@@ -431,7 +435,10 @@ class Handler(SimpleHTTPRequestHandler):
                 'dx_age': int(time.time() - CACHE['dx_updated']) if CACHE['dx_updated'] else -1,
             })
         else:
-            super().do_GET()
+            if self.command == 'HEAD':
+                super().do_HEAD()
+            else:
+                super().do_GET()
 
     def send_json(self, data):
         body = json.dumps(data).encode('utf-8')
@@ -440,7 +447,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header('Content-Length', len(body))
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != 'HEAD':
+            self.wfile.write(body)
 
     def send_binary(self, data, content_type):
         self.send_response(200)
@@ -449,7 +457,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Cache-Control', 'public, max-age=900')
         self.end_headers()
-        self.wfile.write(data)
+        if self.command != 'HEAD':
+            self.wfile.write(data)
 
     def log_message(self, format, *args):
         pass  # Suppress request logs for performance

@@ -411,6 +411,9 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=os.path.dirname(os.path.abspath(__file__)), **kwargs)
 
+    def do_HEAD(self):
+        self.do_GET()
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == '/api/solar':
@@ -443,24 +446,25 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.send_header('Cache-Control', 'public, max-age=300')
                 self.end_headers()
-                self.wfile.write(body)
+                if self.command != 'HEAD':
+                    self.wfile.write(body)
             else:
-                self.send_json({'error': 'MUF map not yet loaded'})
+                self.send_error(503, 'MUF map not yet loaded')
         elif path.startswith('/api/enlil'):
             if CACHE.get('enlil_image'):
                 self.send_binary(CACHE['enlil_image'], 'image/jpeg')
             else:
-                self.send_json({'error': 'not loaded'})
+                self.send_error(503, 'Enlil image not yet loaded')
         elif path.startswith('/api/real-drap'):
             if CACHE.get('real_drap_image'):
                 self.send_binary(CACHE['real_drap_image'], 'image/png')
             else:
-                self.send_json({'error': 'not loaded'})
+                self.send_error(503, 'DRAP image not yet loaded')
         elif path.startswith('/api/drap'):
             if CACHE.get('drap_image'):
                 self.send_binary(CACHE['drap_image'], 'image/jpeg')
             else:
-                self.send_json({'error': 'not loaded'})
+                self.send_error(503, 'Aurora image not yet loaded')
         elif path.startswith('/api/callsign/'):
             call = path.split('/')[-1].upper()
             result = lookup_callsign(call)
@@ -473,7 +477,10 @@ class Handler(SimpleHTTPRequestHandler):
                 'dx_age': int(time.time() - CACHE['dx_updated']) if CACHE['dx_updated'] else -1,
             })
         else:
-            super().do_GET()
+            if self.command == 'HEAD':
+                super().do_HEAD()
+            else:
+                super().do_GET()
 
     def send_json(self, data):
         body = json.dumps(data).encode('utf-8')
@@ -482,7 +489,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header('Content-Length', len(body))
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != 'HEAD':
+            self.wfile.write(body)
 
     def send_binary(self, data, content_type):
         self.send_response(200)
@@ -491,7 +499,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Cache-Control', 'public, max-age=900')
         self.end_headers()
-        self.wfile.write(data)
+        if self.command != 'HEAD':
+            self.wfile.write(data)
 
     def log_message(self, format, *args):
         pass  # Suppress request logs for performance
@@ -526,14 +535,14 @@ html,body{
 width:100%;height:100vh;overflow:hidden;
 background:var(--bg);color:var(--text);
 font-family:'Courier New','Liberation Mono',monospace;
-font-size:clamp(10px,1.4vh,16px);
+font-size:clamp(16px,1.4vh,16px);
 }
 .hdr{
 display:flex;align-items:center;justify-content:space-between;
 height:clamp(20px,3vh,30px);
 padding:0 clamp(4px,0.8vw,12px);
 background:var(--card);border-bottom:1px solid var(--border);
-font-size:clamp(9px,1.3vh,14px);
+font-size:clamp(14px,1.3vh,14px);
 }
 .hdr-title{color:var(--cyan);font-weight:bold;letter-spacing:2px}
 .hdr-clocks{color:var(--bright);letter-spacing:1px}
@@ -558,13 +567,15 @@ display:flex;flex-direction:column;
 display:flex;justify-content:space-between;align-items:center;
 padding:2px 6px;
 background:var(--bg);
-font-size:clamp(8px,1.1vh,13px);
+font-size:clamp(13px,1.1vh,13px);
 color:var(--label);letter-spacing:1px;
 border-bottom:1px solid var(--border);
 flex-shrink:0;
 }
 .panel-body{padding:4px 6px;flex:1;overflow:hidden}
-.timer{color:var(--muted);font-size:clamp(7px,0.9vh,11px)}
+.timer{color:var(--muted);font-size:clamp(11px,0.9vh,11px)}
+.tab{cursor:pointer;padding:0 8px;color:var(--label);user-select:none}
+.tab-active{color:var(--cyan);font-weight:bold}
 .solar-flex{flex:1}
 .bands-flex{flex:0 0 auto}
 .mid-img{flex:0 0 auto;min-height:0;overflow:hidden}
@@ -574,8 +585,8 @@ display:flex;justify-content:space-between;align-items:center;
 padding:clamp(1px,0.2vh,3px) 0;
 border-bottom:1px solid var(--border);
 }
-.s-lbl{color:var(--label);font-size:clamp(8px,1vh,12px);flex:0 0 clamp(40px,5vw,70px)}
-.s-val{color:var(--bright);font-size:clamp(9px,1.2vh,14px);font-weight:bold;text-align:right;flex:1}
+.s-lbl{color:var(--label);font-size:clamp(12px,1vh,12px);flex:0 0 clamp(40px,5vw,70px)}
+.s-val{color:var(--bright);font-size:clamp(14px,1.2vh,14px);font-weight:bold;text-align:right;flex:1}
 .kp-wrap{display:flex;align-items:center;gap:clamp(2px,0.3vw,6px)}
 .kp-bar{height:clamp(6px,0.8vh,10px);background:var(--bg);flex:1;overflow:hidden}
 .kp-fill{height:100%}
@@ -583,28 +594,28 @@ border-bottom:1px solid var(--border);
 display:flex;align-items:center;
 padding:clamp(1px,0.15vh,2px) 0;
 border-bottom:1px solid var(--border);
-font-size:clamp(8px,1vh,12px);
+font-size:clamp(12px,1vh,12px);
 }
 .band-name{flex:0 0 clamp(40px,5vw,60px);color:var(--bright);font-weight:bold}
 .band-cond{
 flex:0 0 clamp(16px,2vw,24px);
 text-align:center;
 font-weight:bold;
-font-size:clamp(8px,1vh,12px);
+font-size:clamp(12px,1vh,12px);
 margin:0 clamp(2px,0.3vw,4px);
 padding:clamp(0px,0.1vh,1px) 0;
 }
-.band-lbl{color:var(--label);font-size:clamp(7px,0.8vh,10px);flex:0 0 clamp(24px,3vw,36px);text-align:center}
+.band-lbl{color:var(--label);font-size:clamp(10px,0.8vh,10px);flex:0 0 clamp(24px,3vw,36px);text-align:center}
 .cG{background:#22c55e;color:#000}.cF{background:#eab308;color:#000}.cP{background:#ef4444;color:#fff}.cN{background:var(--muted);color:#fff}
 .img-wrap{flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;min-height:0}
 .img-wrap img{object-fit:contain;max-width:100%;max-height:100%;display:block}
-#imgSolar{height:12vh;width:100%;object-fit:contain}
+#imgSolar{height:26vh;width:100%;object-fit:contain}
 #imgMuf{height:auto;width:100%;max-height:90vh;object-fit:contain}
-#imgEnlil{height:12vh;width:100%;object-fit:contain}
-#imgDrap{height:12vh;width:100%;object-fit:contain}
+#imgEnlil{width:100%;object-fit:contain}
+#imgDrap{width:100%;object-fit:contain}
 .dx-tbl{width:100%;border-collapse:collapse}
 .dx-tbl th{
-font-size:clamp(9px,1vw,12px);color:var(--label);
+font-size:clamp(12px,1vw,12px);color:var(--label);
 text-align:left;padding:clamp(1px,0.2vh,3px) clamp(2px,0.3vw,6px);
 border-bottom:1px solid var(--border);
 position:sticky;top:0;background:var(--card);
@@ -613,21 +624,21 @@ letter-spacing:1px;
 .dx-tbl td{
 padding:clamp(1px,0.15vh,2px) clamp(2px,0.3vw,6px);
 border-bottom:1px solid var(--border);
-font-size:clamp(10px,1.2vw,13px);
+font-size:clamp(13px,1.2vw,13px);
 white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 }
-.dx-freq{color:var(--label);font-size:clamp(10px,1.2vw,13px)}
-.dx-band{color:var(--cyan);font-size:clamp(9px,1.1vw,12px)}
-.dx-call{color:var(--bright);font-weight:bold;font-size:clamp(10px,1.2vw,13px)}
-.dx-sp{color:var(--muted);font-size:clamp(9px,1.1vw,12px)}
-.dx-tm{color:var(--muted);font-size:clamp(9px,1.1vw,12px)}
+.dx-freq{color:var(--label);font-size:clamp(13px,1.2vw,13px)}
+.dx-band{color:var(--cyan);font-size:clamp(12px,1.1vw,12px)}
+.dx-call{color:var(--bright);font-weight:bold;font-size:clamp(13px,1.2vw,13px)}
+.dx-sp{color:var(--muted);font-size:clamp(12px,1.1vw,12px)}
+.dx-tm{color:var(--muted);font-size:clamp(12px,1.1vw,12px)}
 .dx-body-wrap{flex:1;overflow:hidden;min-height:0}
 .sbar{
 display:flex;align-items:center;justify-content:space-between;
 height:clamp(16px,2.5vh,28px);
 padding:0 clamp(6px,1vw,20px);
 background:var(--card);border-top:1px solid var(--border);
-font-size:clamp(7px,0.9vh,11px);color:var(--muted);
+font-size:clamp(11px,0.9vh,11px);color:var(--muted);
 flex-shrink:0;
 }
 .stale{opacity:0.5}
@@ -808,16 +819,22 @@ cursor:pointer;
 <div class="img-wrap"><img id="imgSolar" src="/api/solar-image" alt="SDO"></div>
 </div>
 <div class="panel" style="flex:0 0 auto">
-<div class="panel-title"><span>WSA-ENLIL</span><span class="timer" id="tmEnlil"></span></div>
-<div class="panel-body img-wrap" style="padding:2px"><img id="imgEnlil" src="/api/enlil" alt="Enlil" style="height:12vh;width:100%;object-fit:contain"></div>
+<div class="panel-title"><span>GEOMAGNETIC</span></div>
+<div class="panel-body" id="geomagBody" style="padding:4px 6px">
+<span style="color:var(--muted);font-size:clamp(11px,1vh,11px)">Waiting for data...</span>
+</div>
 </div>
 <div class="panel" style="flex:0 0 auto">
-<div class="panel-title"><span>AURORA</span><span class="timer" id="tmDrap"></span></div>
-<div class="panel-body img-wrap" style="padding:2px"><img id="imgDrap" src="/api/drap" alt="Aurora" style="height:10vh;width:100%;object-fit:contain"></div>
+<div class="panel-title"><span>X-RAY FLUX</span></div>
+<div class="panel-body" id="xrayBody" style="padding:4px 6px">
+<span style="color:var(--muted);font-size:clamp(11px,1vh,11px)">Waiting for data...</span>
+</div>
 </div>
 <div class="panel" style="flex:0 0 auto">
-<div class="panel-title"><span>DRAP</span><span class="timer" id="tmRealDrap"></span></div>
-<div class="panel-body img-wrap" style="padding:2px"><img id="imgRealDrap" src="/api/real-drap" alt="DRAP" style="height:10vh;width:100%;object-fit:contain"></div>
+<div class="panel-title"><span>OPEN BANDS</span></div>
+<div class="panel-body" id="openBandsBody" style="padding:4px 6px;overflow-y:auto">
+<span style="color:var(--muted);font-size:clamp(11px,1vh,11px)">Waiting for data...</span>
+</div>
 </div>
 </div>
 <div class="col">
@@ -828,34 +845,27 @@ cursor:pointer;
 </div>
 <div class="col">
 <!-- Right column: DX, band activity, x-ray, geomag, open bands -->
-<div class="panel" style="flex:0 0 auto;max-height:25vh;min-height:0">
-<div class="panel-title"><span>DX CLUSTER</span><span class="timer" id="tmDx"></span></div>
-<div class="panel-body dx-body-wrap" style="padding:0;overflow-y:auto;max-height:calc(25vh - 22px)">
+<div class="panel" style="flex:0 0 auto;max-height:18vh;min-height:0">
+<div class="panel-title"><span>DX SPOTS</span><span class="timer" id="tmDx"></span></div>
+<div class="panel-body dx-body-wrap" style="padding:0;overflow-y:auto;max-height:calc(18vh - 22px)">
 <table class="dx-tbl"><thead><tr><th>FREQ</th><th>B</th><th>DX CALL</th><th>DE</th><th>UTC</th></tr></thead><tbody id="dxBody"><tr><td colspan="5" style="color:var(--muted);padding:8px">Loading...</td></tr></tbody></table>
 </div>
 </div>
 <div class="panel" style="flex:0 0 auto">
 <div class="panel-title"><span>BAND ACTIVITY</span></div>
 <div class="panel-body" id="bandActivity" style="padding:4px 6px;overflow-y:auto">
-<span style="color:var(--muted);font-size:clamp(8px,1vh,11px)">Waiting for DX data...</span>
-</div>
-</div>
-<div class="panel" style="flex:0 0 auto">
-<div class="panel-title"><span>X-RAY FLUX</span></div>
-<div class="panel-body" id="xrayBody" style="padding:4px 6px">
-<span style="color:var(--muted);font-size:clamp(8px,1vh,11px)">Waiting for data...</span>
-</div>
-</div>
-<div class="panel" style="flex:0 0 auto">
-<div class="panel-title"><span>GEOMAGNETIC</span></div>
-<div class="panel-body" id="geomagBody" style="padding:4px 6px">
-<span style="color:var(--muted);font-size:clamp(8px,1vh,11px)">Waiting for data...</span>
+<span style="color:var(--muted);font-size:clamp(11px,1vh,11px)">Waiting for DX data...</span>
 </div>
 </div>
 <div class="panel" style="flex:1;min-height:0">
-<div class="panel-title"><span>OPEN BANDS</span></div>
-<div class="panel-body" id="openBandsBody" style="padding:4px 6px;overflow-y:auto">
-<span style="color:var(--muted);font-size:clamp(8px,1vh,11px)">Waiting for data...</span>
+<div class="panel-title">
+<span><span class="tab tab-active" data-tab="drap">DRAP</span><span class="tab" data-tab="aurora">AURORA</span><span class="tab" data-tab="enlil">ENLIL</span></span>
+<span class="timer" id="tmDrap"></span>
+</div>
+<div class="panel-body img-wrap" style="padding:2px">
+<img id="imgDrap" src="/api/drap" alt="Aurora" data-tab="aurora" style="width:100%;object-fit:contain;display:none">
+<img id="imgRealDrap" src="/api/real-drap" alt="DRAP" data-tab="drap" style="width:100%;object-fit:contain">
+<img id="imgEnlil" src="/api/enlil" alt="WSA-ENLIL" data-tab="enlil" style="width:100%;object-fit:contain;display:none">
 </div>
 </div>
 </div>
@@ -907,8 +917,8 @@ root.style.setProperty('--green',t.green);
 root.style.setProperty('--bg',t.bg);
 root.style.setProperty('--card',t.card);
 root.style.setProperty('--border',t.border);
-if(t.bright)root.style.setProperty('--bright',t.bright);
-if(t.text)root.style.setProperty('--text',t.text);
+root.style.setProperty('--bright',t.bright||'#e8f0f0');
+root.style.setProperty('--text',t.text||'#c8d0d8');
 if(t.label)root.style.setProperty('--label',t.label);
 if(t.muted)root.style.setProperty('--muted',t.muted);
 }
@@ -1025,6 +1035,19 @@ if(kstateEl)kstateEl.style.display='';
 document.getElementById('setup').style.display='flex';
 };
 
+// Tab switcher for AURORA/DRAP combined panel
+document.querySelectorAll('.tab').forEach(function(t){
+t.addEventListener('click',function(){
+var name=this.getAttribute('data-tab');
+document.querySelectorAll('.tab').forEach(function(s){
+s.classList.toggle('tab-active',s.getAttribute('data-tab')===name);
+});
+document.querySelectorAll('img[data-tab]').forEach(function(im){
+im.style.display=im.getAttribute('data-tab')===name?'':'none';
+});
+});
+});
+
 // DOM refs
 var elUtc=document.getElementById('utc');
 var elLcl=document.getElementById('lcl');
@@ -1038,9 +1061,7 @@ var tmBands=document.getElementById('tmBands');
 var tmDx=document.getElementById('tmDx');
 var tmSolarImg=document.getElementById('tmSolarImg');
 var tmMuf=document.getElementById('tmMuf');
-var tmEnlil=document.getElementById('tmEnlil');
 var tmDrap=document.getElementById('tmDrap');
-var tmRealDrap=document.getElementById('tmRealDrap');
 
 // Clock — uses timezone setting if available
 setInterval(function(){
@@ -1067,7 +1088,7 @@ return remaining>=60?Math.ceil(remaining/60)+'m':remaining+'s';
 function updateCountdowns(){
 if(lastSolarFetch){var sc='next \u21BB '+formatCountdown(lastSolarFetch,SOLAR_INTERVAL);tmSolar.textContent=sc;tmBands.textContent=sc;}
 if(lastDxFetch){tmDx.textContent='next \u21BB '+formatCountdown(lastDxFetch,DX_INTERVAL);}
-if(lastImageFetch){var ic='next \u21BB '+formatCountdown(lastImageFetch,IMAGE_INTERVAL);tmSolarImg.textContent=ic;tmMuf.textContent=ic;tmEnlil.textContent=ic;tmDrap.textContent=ic;if(tmRealDrap)tmRealDrap.textContent=ic;}
+if(lastImageFetch){var ic='next \u21BB '+formatCountdown(lastImageFetch,IMAGE_INTERVAL);tmSolarImg.textContent=ic;tmMuf.textContent=ic;tmDrap.textContent=ic;}
 }
 
 // Color helpers
@@ -1121,10 +1142,8 @@ var BAND_COLORS={'160m':'#8b5cf6','80m':'#6366f1','60m':'#3b82f6','40m':'#06b6d4
 function renderDX(spots){
 if(!spots||spots.length===0){elDxBody.innerHTML='<tr><td colspan="5" style="color:var(--muted);padding:8px">No spots</td></tr>';return;}
 lastDx=spots;dxStale=false;
-// Limit to visible rows based on viewport
-var maxRows=Math.min(spots.length,Math.floor((window.innerHeight-120)/18));
-if(maxRows<5)maxRows=5;
-if(maxRows>spots.length)maxRows=spots.length;
+// Hard cap at 10 rows
+var maxRows=Math.min(spots.length,5);
 var h='';
 for(var i=0;i<maxRows;i++){
 var s=spots[i];
@@ -1141,7 +1160,7 @@ var counts={};
 spots.forEach(function(s){
 counts[s.band]=(counts[s.band]||0)+1;
 });
-var bandOrder=['160m','80m','60m','40m','30m','20m','17m','15m','12m','10m','6m','2m','70cm'];
+var bandOrder=['160m','80m','60m','40m','30m','20m','17m','15m','12m','10m'];
 var sorted=bandOrder.filter(function(b){return counts[b];});
 var max=counts[sorted[0]]||1;
 var h='';
@@ -1153,12 +1172,12 @@ var bandColors={
 sorted.forEach(function(band){
 var pct=Math.round(counts[band]/max*100);
 var color=bandColors[band]||'#666';
-h+='<div style="display:flex;align-items:center;gap:6px;margin:2px 0">';
-h+='<span style="width:30px;text-align:right;color:var(--label);font-size:clamp(9px,1vw,11px)">'+esc(band)+'</span>';
-h+='<div style="flex:1;height:clamp(8px,1.2vh,14px);background:var(--bg)">';
+h+='<div style="display:flex;align-items:center;gap:6px;margin:5px 0">';
+h+='<span style="width:30px;text-align:right;color:var(--label);font-size:clamp(13px,1.3vw,13px)">'+esc(band)+'</span>';
+h+='<div style="flex:1;height:clamp(14px,2.4vh,24px);background:var(--bg)">';
 h+='<div style="width:'+pct+'%;height:100%;background:'+color+'"></div>';
 h+='</div>';
-h+='<span style="width:20px;color:var(--text);font-size:clamp(9px,1vw,11px)">'+counts[band]+'</span>';
+h+='<span style="width:20px;color:var(--text);font-size:clamp(11px,1vw,11px)">'+counts[band]+'</span>';
 h+='</div>';
 });
 document.getElementById('bandActivity').innerHTML=h;
@@ -1175,10 +1194,10 @@ var color=(cls==='A'||cls==='B')?'#22c55e':cls==='C'?'#eab308':cls==='M'?'#ff8c0
 var level=cls==='A'?10:cls==='B'?25:cls==='C'?50:cls==='M'?75:cls==='X'?100:0;
 var label=(cls==='A'||cls==='B')?'QUIET':cls==='C'?'ACTIVE':cls==='M'?'STORM':cls==='X'?'MAJOR':'';
 el.innerHTML='<div style="display:flex;align-items:center;gap:8px">'+
-'<span style="font-size:clamp(14px,2.5vh,24px);font-weight:bold;color:'+color+'">'+esc(xr)+'</span>'+
+'<span style="font-size:clamp(24px,2.5vh,24px);font-weight:bold;color:'+color+'">'+esc(xr)+'</span>'+
 '<div style="flex:1;height:clamp(6px,1vh,10px);background:var(--bg)">'+
 '<div style="width:'+level+'%;height:100%;background:'+color+'"></div></div>'+
-'<span style="font-size:clamp(8px,1vh,11px);color:'+color+'">'+label+'</span></div>';
+'<span style="font-size:clamp(11px,1vh,11px);color:'+color+'">'+label+'</span></div>';
 }
 
 // Render Geomagnetic panel
@@ -1191,10 +1210,10 @@ var geo=solar.geomagField||'unknown';
 var color=kp<=3?'#22c55e':kp<=5?'#eab308':kp<=7?'#ff8c00':'#ef4444';
 var pct=Math.min(100,kp/9*100);
 el.innerHTML='<div style="display:flex;align-items:center;gap:8px">'+
-'<span style="font-size:clamp(14px,2.5vh,24px);font-weight:bold;color:'+color+'">Kp '+kp+'</span>'+
+'<span style="font-size:clamp(24px,2.5vh,24px);font-weight:bold;color:'+color+'">Kp '+kp+'</span>'+
 '<div style="flex:1;height:clamp(6px,1vh,10px);background:var(--bg)">'+
 '<div style="width:'+pct+'%;height:100%;background:'+color+'"></div></div>'+
-'<span style="font-size:clamp(8px,1vh,11px);color:'+color+'">'+esc(geo.toUpperCase())+'</span></div>';
+'<span style="font-size:clamp(11px,1vh,11px);color:'+color+'">'+esc(geo.toUpperCase())+'</span></div>';
 }
 
 // Render Open Bands panel
@@ -1213,12 +1232,12 @@ if(dayOk||nightOk||dayOk2||nightOk2){open.push(key);}else{closed.push(key);}
 }
 var h='';
 if(open.length){
-h+='<div style="margin-bottom:4px"><span style="color:#22c55e;font-size:clamp(8px,1vh,11px)">OPEN: </span>';
+h+='<div style="margin-bottom:4px"><span style="color:#22c55e;font-size:clamp(11px,1vh,11px)">OPEN: </span>';
 h+=open.map(function(b){return'<span style="color:#22c55e;font-weight:bold;margin-right:6px">'+esc(b)+'</span>';}).join('');
 h+='</div>';
 }
 if(closed.length){
-h+='<div><span style="color:#ef4444;font-size:clamp(8px,1vh,11px)">CLOSED: </span>';
+h+='<div><span style="color:#ef4444;font-size:clamp(11px,1vh,11px)">CLOSED: </span>';
 h+=closed.map(function(b){return'<span style="color:#ef4444;margin-right:6px">'+esc(b)+'</span>';}).join('');
 h+='</div>';
 }
@@ -1340,12 +1359,12 @@ startFetching();
 </script>
 </body>
 </html>
-
 HTMLEOF
 
 # ── Step 5: Create hamclock-lite systemd service ────────────────────
 echo "Creating HamClock server service..."
-sudo tee /etc/systemd/system/hamclock-lite.service > /dev/null <<EOF
+if ! systemctl is-enabled hamclock-lite &>/dev/null; then
+    sudo tee /etc/systemd/system/hamclock-lite.service > /dev/null <<EOF
 [Unit]
 Description=HamClock Lite Server
 After=network-online.target
@@ -1363,9 +1382,10 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-sudo systemctl daemon-reload
-sudo systemctl enable hamclock-lite
-sudo systemctl start hamclock-lite
+    sudo systemctl daemon-reload
+    sudo systemctl enable hamclock-lite
+    sudo systemctl start hamclock-lite
+fi
 
 # ── Step 6: Install X server packages ───────────────────────────────
 echo "Installing display server and browser (this may take 15-30 minutes on a Pi 1)..."
