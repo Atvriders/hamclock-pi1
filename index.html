@@ -27,7 +27,8 @@ font-size:clamp(14px,1.3vh,14px);
 .hdr-clocks{color:var(--bright);letter-spacing:1px}
 .hdr-clocks span{margin-left:clamp(8px,2vw,24px)}
 .hdr-utc{color:var(--cyan)}
-.hdr-dot{display:inline-block;width:8px;height:8px;background:var(--green);margin-left:clamp(8px,1.5vw,16px)}
+.hdr-dot{display:inline-block;width:8px;height:8px;background:#000;margin-left:clamp(8px,1.5vw,16px);animation:pulse-status 2.4s ease-in-out infinite}
+@keyframes pulse-status{0%,100%{background:#000}50%{background:#512888}}
 .grid{
 display:grid;
 grid-template-columns:20vw 1fr 25vw;
@@ -793,7 +794,7 @@ lastDxFetch=Math.floor(Date.now()/1000);
 queueFetch('/api/health',function(data){
 if(data&&data.status==='ok'){
 failCount=0;
-elDot.style.background='var(--green)';
+elDot.style.background='';
 elSbarL.textContent='Solar:'+fmtAge(data.solar_age)+' Bands:'+fmtAge(data.bands_age)+' DX:'+fmtAge(data.dx_age);
 elSbarL.className='';
 }else{
