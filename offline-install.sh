@@ -760,11 +760,15 @@ cursor:pointer;
 <div class="s-row"><span class="s-lbl">NTP</span><span class="s-val" style="color:var(--bright)">--</span></div>
 </div>
 </div>
-<div class="panel" style="flex:1;min-height:0">
+<div class="panel" style="flex:0 0 auto">
 <div class="panel-title"><span>BAND ACTIVITY</span></div>
 <div class="panel-body" id="bandActivity" style="padding:4px 6px;overflow-y:auto">
 <span style="color:var(--muted);font-size:clamp(8px,1vh,11px)">Waiting for DX data...</span>
 </div>
+</div>
+<div class="panel" style="flex:1;min-height:0">
+<div class="panel-title"><span>RECENT ACTIVITY</span></div>
+<div class="panel-body" id="activityLog" style="padding:4px 6px;overflow-y:auto;font-size:clamp(8px,1vh,11px)"></div>
 </div>
 </div>
 </div>
@@ -1062,7 +1066,8 @@ var counts={};
 spots.forEach(function(s){
 counts[s.band]=(counts[s.band]||0)+1;
 });
-var sorted=Object.keys(counts).sort(function(a,b){return counts[b]-counts[a];});
+var bandOrder=['160m','80m','60m','40m','30m','20m','17m','15m','12m','10m','6m','2m','70cm'];
+var sorted=bandOrder.filter(function(b){return counts[b];});
 var max=counts[sorted[0]]||1;
 var h='';
 var bandColors={
@@ -1082,6 +1087,23 @@ h+='<span style="width:20px;color:var(--text);font-size:clamp(9px,1vw,11px)">'+c
 h+='</div>';
 });
 document.getElementById('bandActivity').innerHTML=h;
+}
+
+// Recent activity log
+var activityEntries=[];
+function addActivity(msg){
+var now=new Date();
+var ts=P(now.getUTCHours())+':'+P(now.getUTCMinutes());
+activityEntries.push({time:ts,msg:msg});
+if(activityEntries.length>15)activityEntries.shift();
+var el=document.getElementById('activityLog');
+if(!el)return;
+var h='';
+for(var i=activityEntries.length-1;i>=0;i--){
+var e=activityEntries[i];
+h+='<div style="color:var(--muted);margin:1px 0"><span style="color:var(--label)">'+e.time+'</span> '+esc(e.msg)+'</div>';
+}
+el.innerHTML=h;
 }
 
 // Fetch queue — one request at a time, 1.5s gap between each
@@ -1119,14 +1141,17 @@ updateCountdowns();
 queueFetch('/api/solar',function(data){
 renderSolar(data);
 lastSolarFetch=Math.floor(Date.now()/1000);
+addActivity('Solar: SFI '+data.sfi+' Kp '+data.kIndex+' '+data.xray);
 });
 queueFetch('/api/bands',function(data){
 renderBands(data);
+addActivity('Bands updated');
 });
 queueFetch('/api/dxspots',function(data){
 renderDX(data);
 renderBandActivity(data);
 lastDxFetch=Math.floor(Date.now()/1000);
+addActivity(data.length+' DX spots loaded');
 });
 queueFetch('/api/health',function(data){
 if(data&&data.status==='ok'){
@@ -1164,6 +1189,7 @@ setTimeout(function(){
 if(elImgHrd)elImgHrd.src='/api/hrdlog-image?t='+t;
 },6000);
 updateCountdowns();
+addActivity('Images refreshed');
 }
 
 // Start fetching data
@@ -1171,10 +1197,11 @@ var fetchStarted=false;
 function startFetching(){
 if(fetchStarted)return;
 fetchStarted=true;
+addActivity('HamClock Lite started');
 lastImageFetch=Math.floor(Date.now()/1000);
-setTimeout(function(){queueFetch('/api/solar',function(d){renderSolar(d);lastSolarFetch=Math.floor(Date.now()/1000);});},500);
-setTimeout(function(){queueFetch('/api/bands',function(d){renderBands(d);});},2000);
-setTimeout(function(){queueFetch('/api/dxspots',function(d){renderDX(d);renderBandActivity(d);lastDxFetch=Math.floor(Date.now()/1000);});},3500);
+setTimeout(function(){queueFetch('/api/solar',function(d){renderSolar(d);lastSolarFetch=Math.floor(Date.now()/1000);addActivity('Solar: SFI '+d.sfi+' Kp '+d.kIndex+' '+d.xray);});},500);
+setTimeout(function(){queueFetch('/api/bands',function(d){renderBands(d);addActivity('Bands updated');});},2000);
+setTimeout(function(){queueFetch('/api/dxspots',function(d){renderDX(d);renderBandActivity(d);lastDxFetch=Math.floor(Date.now()/1000);addActivity(d.length+' DX spots loaded');});},3500);
 setTimeout(refreshImages,5000);
 setInterval(fetchAll,POLL_INTERVAL);
 setInterval(refreshImages,IMAGE_INTERVAL*1000);
