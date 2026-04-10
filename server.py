@@ -31,6 +31,8 @@ CACHE = {
     'enlil_image_updated': 0,
     'drap_image': None,
     'drap_image_updated': 0,
+    'real_drap_image': None,
+    'real_drap_image_updated': 0,
 }
 
 UA = 'HamClockLite/1.0'
@@ -293,6 +295,25 @@ def fetch_drap():
             print(f'[{time.strftime("%H:%M:%S")}] DRAP fetch failed ({url}): {e}')
 
 
+def fetch_real_drap():
+    """Fetch DRAP (D-Region Absorption Prediction) global image"""
+    urls = [
+        'https://services.swpc.noaa.gov/images/animations/d-rap/global/latest.png',
+        'https://services.swpc.noaa.gov/images/d-rap/global_f10.png',
+    ]
+    for url in urls:
+        try:
+            req = Request(url, headers={'User-Agent': UA})
+            with urlopen(req, timeout=20) as resp:
+                data = resp.read()
+            CACHE['real_drap_image'] = data
+            CACHE['real_drap_image_updated'] = time.time()
+            print(f'[{time.strftime("%H:%M:%S")}] DRAP updated ({len(data)} bytes)')
+            return
+        except Exception as e:
+            print(f'[{time.strftime("%H:%M:%S")}] DRAP fetch failed ({url}): {e}')
+
+
 def background_fetcher():
     """Background thread to periodically fetch data"""
     fetch_hamqsl()
@@ -300,6 +321,7 @@ def background_fetcher():
     fetch_muf()
     fetch_enlil()
     fetch_drap()
+    fetch_real_drap()
 
     # Fast retry if initial fetch failed (network might not be ready yet)
     for _ in range(6):
@@ -339,6 +361,7 @@ def background_fetcher():
             last_enlil = now
         if now - last_drap >= drap_interval:
             fetch_drap()
+            fetch_real_drap()
             last_drap = now
 
 
@@ -386,9 +409,14 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_binary(CACHE['enlil_image'], 'image/jpeg')
             else:
                 self.send_json({'error': 'not loaded'})
+        elif path.startswith('/api/real-drap'):
+            if CACHE.get('real_drap_image'):
+                self.send_binary(CACHE['real_drap_image'], 'image/png')
+            else:
+                self.send_json({'error': 'not loaded'})
         elif path.startswith('/api/drap'):
             if CACHE.get('drap_image'):
-                self.send_binary(CACHE['drap_image'], 'image/png')
+                self.send_binary(CACHE['drap_image'], 'image/jpeg')
             else:
                 self.send_json({'error': 'not loaded'})
         elif path.startswith('/api/callsign/'):

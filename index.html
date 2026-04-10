@@ -301,7 +301,11 @@ cursor:pointer;
 </div>
 <div class="panel" style="flex:0 0 auto">
 <div class="panel-title"><span>AURORA</span><span class="timer" id="tmDrap"></span></div>
-<div class="panel-body img-wrap" style="padding:2px"><img id="imgDrap" src="/api/drap" alt="Aurora" style="height:12vh;width:100%;object-fit:contain"></div>
+<div class="panel-body img-wrap" style="padding:2px"><img id="imgDrap" src="/api/drap" alt="Aurora" style="height:10vh;width:100%;object-fit:contain"></div>
+</div>
+<div class="panel" style="flex:0 0 auto">
+<div class="panel-title"><span>DRAP</span><span class="timer" id="tmRealDrap"></span></div>
+<div class="panel-body img-wrap" style="padding:2px"><img id="imgRealDrap" src="/api/real-drap" alt="DRAP" style="height:10vh;width:100%;object-fit:contain"></div>
 </div>
 </div>
 <div class="col">
@@ -524,6 +528,7 @@ var tmSolarImg=document.getElementById('tmSolarImg');
 var tmMuf=document.getElementById('tmMuf');
 var tmEnlil=document.getElementById('tmEnlil');
 var tmDrap=document.getElementById('tmDrap');
+var tmRealDrap=document.getElementById('tmRealDrap');
 
 // Clock — uses timezone setting if available
 setInterval(function(){
@@ -550,7 +555,7 @@ return remaining>=60?Math.ceil(remaining/60)+'m':remaining+'s';
 function updateCountdowns(){
 if(lastSolarFetch){var sc='next \u21BB '+formatCountdown(lastSolarFetch,SOLAR_INTERVAL);tmSolar.textContent=sc;tmBands.textContent=sc;}
 if(lastDxFetch){tmDx.textContent='next \u21BB '+formatCountdown(lastDxFetch,DX_INTERVAL);}
-if(lastImageFetch){var ic='next \u21BB '+formatCountdown(lastImageFetch,IMAGE_INTERVAL);tmSolarImg.textContent=ic;tmMuf.textContent=ic;tmEnlil.textContent=ic;tmDrap.textContent=ic;}
+if(lastImageFetch){var ic='next \u21BB '+formatCountdown(lastImageFetch,IMAGE_INTERVAL);tmSolarImg.textContent=ic;tmMuf.textContent=ic;tmEnlil.textContent=ic;tmDrap.textContent=ic;if(tmRealDrap)tmRealDrap.textContent=ic;}
 }
 
 // Color helpers
@@ -780,6 +785,7 @@ var elImgSolar=document.getElementById('imgSolar');
 var elImgMuf=document.getElementById('imgMuf');
 var elImgEnlil=document.getElementById('imgEnlil');
 var elImgDrap=document.getElementById('imgDrap');
+var elImgRealDrap=document.getElementById('imgRealDrap');
 
 function refreshImages(){
 var t=Date.now();
@@ -794,6 +800,9 @@ if(elImgEnlil)elImgEnlil.src='/api/enlil?t='+t;
 setTimeout(function(){
 if(elImgDrap)elImgDrap.src='/api/drap?t='+t;
 },9000);
+setTimeout(function(){
+if(elImgRealDrap)elImgRealDrap.src='/api/real-drap?t='+t;
+},12000);
 updateCountdowns();
 }
 
