@@ -265,7 +265,7 @@ cursor:pointer;
 </div>
 <div class="setup-field">
 <label class="setup-label">TIME SERVER (NTP)</label>
-<input type="text" id="inNtp" class="setup-input" placeholder="pool.ntp.org (default)">
+<input type="text" id="inNtp" class="setup-input" placeholder="(using host NTP)">
 </div>
 <button class="setup-btn" onclick="saveSetup()">START</button>
 </div>
@@ -416,6 +416,25 @@ if(kstateEl)kstateEl.style.display='';
 }
 }
 
+// Fetch the host's NTP server to use as the default placeholder
+(function(){
+  var xhr=new XMLHttpRequest();
+  xhr.open('GET','/api/ntp');
+  xhr.timeout=5000;
+  xhr.onload=function(){
+    if(xhr.status!==200)return;
+    try{
+      var d=JSON.parse(xhr.responseText);
+      if(d&&d.ntp){
+        var el=document.getElementById('inNtp');
+        if(el)el.placeholder=d.ntp+' (host)';
+        window.__hostNtp=d.ntp;
+      }
+    }catch(e){}
+  };
+  xhr.send();
+})();
+
 // Make saveSetup global
 window.saveSetup=function(){
 var s={
@@ -423,7 +442,7 @@ callsign:document.getElementById('inCallsign').value.toUpperCase().trim(),
 grid:document.getElementById('inGrid').value.toUpperCase().trim(),
 timezone:document.getElementById('inTimezone').value,
 theme:(document.querySelector('input[name="theme"]:checked')||{}).value||'classic',
-ntp:document.getElementById('inNtp').value.trim()||'pool.ntp.org'
+ntp:document.getElementById('inNtp').value.trim()||window.__hostNtp||'pool.ntp.org'
 };
 if(!s.callsign){alert('Please enter your callsign');return;}
 localStorage.setItem('hamclock-settings',JSON.stringify(s));

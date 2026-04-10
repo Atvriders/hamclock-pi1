@@ -46,6 +46,8 @@ sudo tee "$INSTALL_DIR/server.py" > /dev/null << 'SERVEREOF'
 import json
 import time
 import threading
+import subprocess
+import re
 from http.server import SimpleHTTPRequestHandler
 try:
     from http.server import ThreadingHTTPServer as HTTPServer
@@ -75,6 +77,7 @@ CACHE = {
     'drap_image_updated': 0,
     'real_drap_image': None,
     'real_drap_image_updated': 0,
+    'host_ntp': None,
 }
 
 UA = 'HamClockLite/1.0'
@@ -356,6 +359,92 @@ def fetch_real_drap():
             print(f'[{time.strftime("%H:%M:%S")}] DRAP fetch failed ({url}): {e}')
 
 
+_NTP_HOSTNAME_RE = re.compile(r'^[a-z0-9\-\.]+$', re.IGNORECASE)
+
+
+def _valid_ntp_hostname(s):
+    if not s:
+        return False
+    s = s.strip()
+    if not s:
+        return False
+    return ('.' in s) or bool(_NTP_HOSTNAME_RE.match(s))
+
+
+def _parse_ntp_conf_line(path, keywords):
+    """Parse a config file; return first token after any of `keywords` on a non-comment line."""
+    try:
+        with open(path, 'r') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith('#') or line.startswith(';'):
+                    continue
+                # strip inline comments
+                for c in ('#', ';'):
+                    idx = line.find(c)
+                    if idx >= 0:
+                        line = line[:idx].strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if not parts:
+                    continue
+                head = parts[0].lower()
+                for kw in keywords:
+                    if kw.endswith('='):
+                        # NTP= style — may be joined or split
+                        if parts[0].lower().startswith(kw.lower()):
+                            # e.g. "NTP=time.example.com foo"
+                            after = line.split('=', 1)[1].strip()
+                            toks = after.split()
+                            if toks and _valid_ntp_hostname(toks[0]):
+                                return toks[0]
+                    else:
+                        if head == kw.lower() and len(parts) >= 2:
+                            if _valid_ntp_hostname(parts[1]):
+                                return parts[1]
+    except Exception:
+        pass
+    return None
+
+
+def get_host_ntp():
+    """Return the host's active NTP server name, trying several sources."""
+    try:
+        # 1. timedatectl
+        try:
+            r = subprocess.run(
+                ['timedatectl', 'show-timesync', '--property=ServerName', '--value'],
+                capture_output=True, text=True, timeout=2
+            )
+            name = (r.stdout or '').strip()
+            if _valid_ntp_hostname(name):
+                return name
+        except Exception:
+            pass
+
+        # 2. /etc/systemd/timesyncd.conf — look for NTP=
+        val = _parse_ntp_conf_line('/etc/systemd/timesyncd.conf', ['NTP='])
+        if val:
+            return val
+
+        # 3. chrony
+        for p in ('/etc/chrony/chrony.conf', '/etc/chrony.conf'):
+            val = _parse_ntp_conf_line(p, ['server', 'pool'])
+            if val:
+                return val
+
+        # 4. ntpd
+        val = _parse_ntp_conf_line('/etc/ntp.conf', ['server', 'pool'])
+        if val:
+            return val
+    except Exception:
+        pass
+
+    # 5. Fallback
+    return 'pool.ntp.org'
+
+
 def background_fetcher():
     """Background thread to periodically fetch data"""
     fetch_hamqsl()
@@ -469,6 +558,10 @@ class Handler(SimpleHTTPRequestHandler):
             call = path.split('/')[-1].upper()
             result = lookup_callsign(call)
             self.send_json(result)
+        elif path == '/api/ntp':
+            if CACHE.get('host_ntp') is None:
+                CACHE['host_ntp'] = get_host_ntp()
+            self.send_json({'ntp': CACHE['host_ntp']})
         elif path == '/api/health':
             self.send_json({
                 'status': 'ok',
@@ -786,7 +879,7 @@ cursor:pointer;
 </div>
 <div class="setup-field">
 <label class="setup-label">TIME SERVER (NTP)</label>
-<input type="text" id="inNtp" class="setup-input" placeholder="pool.ntp.org (default)">
+<input type="text" id="inNtp" class="setup-input" placeholder="(using host NTP)">
 </div>
 <button class="setup-btn" onclick="saveSetup()">START</button>
 </div>
@@ -937,6 +1030,25 @@ if(kstateEl)kstateEl.style.display='';
 }
 }
 
+// Fetch the host's NTP server to use as the default placeholder
+(function(){
+  var xhr=new XMLHttpRequest();
+  xhr.open('GET','/api/ntp');
+  xhr.timeout=5000;
+  xhr.onload=function(){
+    if(xhr.status!==200)return;
+    try{
+      var d=JSON.parse(xhr.responseText);
+      if(d&&d.ntp){
+        var el=document.getElementById('inNtp');
+        if(el)el.placeholder=d.ntp+' (host)';
+        window.__hostNtp=d.ntp;
+      }
+    }catch(e){}
+  };
+  xhr.send();
+})();
+
 // Make saveSetup global
 window.saveSetup=function(){
 var s={
@@ -944,7 +1056,7 @@ callsign:document.getElementById('inCallsign').value.toUpperCase().trim(),
 grid:document.getElementById('inGrid').value.toUpperCase().trim(),
 timezone:document.getElementById('inTimezone').value,
 theme:(document.querySelector('input[name="theme"]:checked')||{}).value||'classic',
-ntp:document.getElementById('inNtp').value.trim()||'pool.ntp.org'
+ntp:document.getElementById('inNtp').value.trim()||window.__hostNtp||'pool.ntp.org'
 };
 if(!s.callsign){alert('Please enter your callsign');return;}
 localStorage.setItem('hamclock-settings',JSON.stringify(s));
