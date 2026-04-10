@@ -57,6 +57,7 @@ flex-shrink:0;
 .bands-flex{flex:0 0 auto}
 .mid-img{flex:0 0 auto;min-height:0;overflow:hidden}
 .dx-full{flex:1;min-height:0}
+.station-info-panel{flex:0 0 auto}
 .s-row{
 display:flex;justify-content:space-between;align-items:center;
 padding:clamp(1px,0.2vh,3px) 0;
@@ -255,7 +256,7 @@ cursor:pointer;
 </label>
 <label class="theme-opt" id="themeKstate" style="display:none">
 <input type="radio" name="theme" value="kstate">
-<span class="theme-swatch" style="background:#512888;border-bottom:3px solid #F4C55C"></span>
+<span class="theme-swatch" style="background:#120a20;border-bottom:3px solid #F4C55C"></span>
 <span class="theme-name">K-STATE</span>
 </label>
 </div>
@@ -306,10 +307,26 @@ cursor:pointer;
 </div>
 </div>
 <div class="col">
-<div class="panel dx-full">
+<!-- Right column: DX on top, station info + band activity below -->
+<div class="panel" style="flex:0 0 auto;max-height:25vh;min-height:0">
 <div class="panel-title"><span>DX CLUSTER</span><span class="timer" id="tmDx"></span></div>
-<div class="panel-body dx-body-wrap" style="padding:0">
+<div class="panel-body dx-body-wrap" style="padding:0;overflow-y:auto;max-height:calc(25vh - 22px)">
 <table class="dx-tbl"><thead><tr><th>FREQ</th><th>B</th><th>DX CALL</th><th>DE</th><th>UTC</th></tr></thead><tbody id="dxBody"><tr><td colspan="5" style="color:var(--muted);padding:8px">Loading...</td></tr></tbody></table>
+</div>
+</div>
+<div class="panel" style="flex:0 0 auto">
+<div class="panel-title"><span>STATION INFO</span></div>
+<div class="panel-body" id="stationInfo" style="padding:4px 6px">
+<div class="s-row"><span class="s-lbl">Call</span><span class="s-val" style="color:var(--cyan)">--</span></div>
+<div class="s-row"><span class="s-lbl">Grid</span><span class="s-val" style="color:var(--bright)">--</span></div>
+<div class="s-row"><span class="s-lbl">TZ</span><span class="s-val" style="color:var(--bright)">--</span></div>
+<div class="s-row"><span class="s-lbl">NTP</span><span class="s-val" style="color:var(--bright)">--</span></div>
+</div>
+</div>
+<div class="panel" style="flex:1;min-height:0">
+<div class="panel-title"><span>BAND ACTIVITY</span></div>
+<div class="panel-body" id="bandActivity" style="padding:4px 6px;overflow-y:auto">
+<span style="color:var(--muted);font-size:clamp(8px,1vh,11px)">Waiting for DX data...</span>
 </div>
 </div>
 </div>
@@ -348,7 +365,7 @@ classic:{cyan:'#06b6d4',green:'#22c55e',bg:'#0a0e14',card:'#111820',border:'#1a2
 amber:{cyan:'#f59e0b',green:'#f59e0b',bg:'#1a1000',card:'#1f1800',border:'#332800'},
 blue:{cyan:'#3b82f6',green:'#60a5fa',bg:'#0a0f1e',card:'#0f1628',border:'#1a2540'},
 red:{cyan:'#ef4444',green:'#f87171',bg:'#1a0a0a',card:'#201010',border:'#3a1a1a'},
-kstate:{cyan:'#F4C55C',green:'#CEA152',bg:'#1a0e2d',card:'#241540',border:'#3d2660',bright:'#E7DED0',text:'#E7DED0',label:'#9F694F',muted:'#6b5080'}
+kstate:{cyan:'#F4C55C',green:'#CEA152',bg:'#120a20',card:'#1e1230',border:'#2e1e45',bright:'#E7DED0',text:'#D1C8BA',label:'#9F8A70',muted:'#6b5080'}
 };
 
 function applySettings(s){
@@ -374,6 +391,7 @@ document.getElementById('dashboard').style.display='none';
 document.getElementById('setup').style.display='none';
 document.getElementById('dashboard').style.display='';
 applySettings(settings);
+renderStationInfo();
 if(settings&&settings.theme==='kstate'){
 var kstateEl=document.getElementById('themeKstate');
 if(kstateEl)kstateEl.style.display='';
@@ -395,6 +413,7 @@ settings=s;
 document.getElementById('setup').style.display='none';
 document.getElementById('dashboard').style.display='';
 applySettings(s);
+renderStationInfo();
 startFetching();
 };
 
@@ -586,6 +605,48 @@ h+='<tr><td class="dx-freq">'+esc(s.frequency)+'</td><td class="dx-band" style="
 elDxBody.innerHTML=h;
 }
 
+// Render station info from settings
+function renderStationInfo(){
+var el=document.getElementById('stationInfo');
+if(!el)return;
+var s=settings||{};
+var h='';
+h+='<div class="s-row"><span class="s-lbl">Call</span><span class="s-val" style="color:var(--cyan)">'+esc(s.callsign||'--')+'</span></div>';
+h+='<div class="s-row"><span class="s-lbl">Grid</span><span class="s-val" style="color:var(--bright)">'+esc(s.grid||'--')+'</span></div>';
+h+='<div class="s-row"><span class="s-lbl">TZ</span><span class="s-val" style="color:var(--bright)">'+esc(s.timezone||'auto')+'</span></div>';
+h+='<div class="s-row"><span class="s-lbl">NTP</span><span class="s-val" style="color:var(--bright)">'+esc(s.ntp||'pool.ntp.org')+'</span></div>';
+el.innerHTML=h;
+}
+
+// Render band activity bar chart from DX spots
+function renderBandActivity(spots){
+if(!spots||!spots.length)return;
+var counts={};
+spots.forEach(function(s){
+counts[s.band]=(counts[s.band]||0)+1;
+});
+var sorted=Object.keys(counts).sort(function(a,b){return counts[b]-counts[a];});
+var max=counts[sorted[0]]||1;
+var h='';
+var bandColors={
+'160m':'#ff6b6b','80m':'#f06595','60m':'#cc5de8','40m':'#845ef7',
+'30m':'#5c7cfa','20m':'#339af0','17m':'#22b8cf','15m':'#20c997',
+'12m':'#51cf66','10m':'#94d82d','6m':'#fcc419','2m':'#ff922b'
+};
+sorted.forEach(function(band){
+var pct=Math.round(counts[band]/max*100);
+var color=bandColors[band]||'#666';
+h+='<div style="display:flex;align-items:center;gap:6px;margin:2px 0">';
+h+='<span style="width:30px;text-align:right;color:var(--label);font-size:clamp(9px,1vw,11px)">'+esc(band)+'</span>';
+h+='<div style="flex:1;height:clamp(8px,1.2vh,14px);background:var(--bg)">';
+h+='<div style="width:'+pct+'%;height:100%;background:'+color+'"></div>';
+h+='</div>';
+h+='<span style="width:20px;color:var(--text);font-size:clamp(9px,1vw,11px)">'+counts[band]+'</span>';
+h+='</div>';
+});
+document.getElementById('bandActivity').innerHTML=h;
+}
+
 // Fetch queue — one request at a time, 1.5s gap between each
 var fetchQueue=[];
 var fetchBusy=false;
@@ -627,6 +688,7 @@ renderBands(data);
 });
 queueFetch('/api/dxspots',function(data){
 renderDX(data);
+renderBandActivity(data);
 lastDxFetch=Math.floor(Date.now()/1000);
 });
 queueFetch('/api/health',function(data){
@@ -675,7 +737,7 @@ fetchStarted=true;
 lastImageFetch=Math.floor(Date.now()/1000);
 setTimeout(function(){queueFetch('/api/solar',function(d){renderSolar(d);lastSolarFetch=Math.floor(Date.now()/1000);});},500);
 setTimeout(function(){queueFetch('/api/bands',function(d){renderBands(d);});},2000);
-setTimeout(function(){queueFetch('/api/dxspots',function(d){renderDX(d);lastDxFetch=Math.floor(Date.now()/1000);});},3500);
+setTimeout(function(){queueFetch('/api/dxspots',function(d){renderDX(d);renderBandActivity(d);lastDxFetch=Math.floor(Date.now()/1000);});},3500);
 setTimeout(refreshImages,5000);
 setInterval(fetchAll,POLL_INTERVAL);
 setInterval(refreshImages,IMAGE_INTERVAL*1000);
