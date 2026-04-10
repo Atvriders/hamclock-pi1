@@ -872,7 +872,7 @@ cursor:pointer;
 </label>
 <label class="theme-opt" id="themeKstate" style="display:none">
 <input type="radio" name="theme" value="kstate">
-<span class="theme-swatch" style="background:#2a1450;border-bottom:3px solid #F4C55C"></span>
+<span class="theme-swatch" style="background:#ffffff;border-bottom:3px solid #512888"></span>
 <span class="theme-name">K-STATE</span>
 </label>
 </div>
@@ -997,7 +997,7 @@ classic:{cyan:'#06b6d4',green:'#22c55e',callsign:'#f472b6',bg:'#0a0e14',card:'#1
 amber:{cyan:'#f59e0b',green:'#f59e0b',callsign:'#3b82f6',bg:'#1a1000',card:'#1f1800',border:'#332800',label:'#B88060',muted:'#8A6840'},
 blue:{cyan:'#3b82f6',green:'#60a5fa',callsign:'#f59e0b',bg:'#0a0f1e',card:'#0f1628',border:'#1a2540',label:'#7090b0',muted:'#506888'},
 red:{cyan:'#ef4444',green:'#f87171',callsign:'#fbbf24',bg:'#1a0a0a',card:'#201010',border:'#3a1a1a',label:'#b07070',muted:'#905858'},
-kstate:{cyan:'#F4C55C',green:'#F4C55C',callsign:'#F4C55C',bg:'#2a1450',card:'#3a1d65',border:'#512888',bright:'#FFFFFF',text:'#E8DDF5',label:'#B8A0D8',muted:'#8060A8'}
+kstate:{cyan:'#F4C55C',green:'#512888',callsign:'#F4C55C',bg:'#ffffff',card:'#f7f5fa',border:'#512888',bright:'#F4C55C',text:'#512888',label:'#694190',muted:'#927EB4'}
 };
 
 function applySettings(s){
