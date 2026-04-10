@@ -666,7 +666,8 @@ counts[s.band]=(counts[s.band]||0)+1;
 });
 var bandOrder=['160m','80m','60m','40m','30m','20m','17m','15m','12m','10m'];
 var sorted=bandOrder.filter(function(b){return counts[b];});
-var max=counts[sorted[0]]||1;
+var max=1;
+sorted.forEach(function(b){if(counts[b]>max)max=counts[b];});
 var h='';
 var bandColors={
 '160m':'#ff6b6b','80m':'#f06595','60m':'#cc5de8','40m':'#845ef7',
