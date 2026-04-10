@@ -529,7 +529,7 @@ sudo tee "$INSTALL_DIR/index.html" > /dev/null << 'HTMLEOF'
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
 --bg:#0a0e14;--card:#111820;--border:#1a2530;--text:#c8d0d8;--bright:#e8f0f0;
---green:#22c55e;--yellow:#eab308;--red:#ef4444;--cyan:#06b6d4;--muted:#4a5568;--label:#6b7b8d;
+--green:#22c55e;--yellow:#eab308;--red:#ef4444;--cyan:#06b6d4;--muted:#4a5568;--label:#6b7b8d;--callsign:#f472b6;
 }
 html,body{
 width:100%;height:100vh;overflow:hidden;
@@ -796,7 +796,7 @@ cursor:pointer;
 <div class="hdr">
 <span>
 <span class="hdr-title">HAMCLOCK LITE</span>
-<span id="hdrCallsign" style="color:var(--green);margin-left:12px;cursor:pointer"></span>
+<span id="hdrCallsign" style="color:var(--callsign);margin-left:12px;cursor:pointer"></span>
 </span>
 <span class="hdr-clocks">
 <span class="hdr-utc" id="utc">UTC --:--:--</span>
@@ -900,11 +900,11 @@ try{settings=JSON.parse(localStorage.getItem('hamclock-settings'));}catch(e){}
 
 // Theme definitions
 var themes={
-classic:{cyan:'#06b6d4',green:'#22c55e',bg:'#0a0e14',card:'#111820',border:'#1a2530',label:'#8899aa',muted:'#607080'},
-amber:{cyan:'#f59e0b',green:'#f59e0b',bg:'#1a1000',card:'#1f1800',border:'#332800',label:'#B88060',muted:'#8A6840'},
-blue:{cyan:'#3b82f6',green:'#60a5fa',bg:'#0a0f1e',card:'#0f1628',border:'#1a2540',label:'#7090b0',muted:'#506888'},
-red:{cyan:'#ef4444',green:'#f87171',bg:'#1a0a0a',card:'#201010',border:'#3a1a1a',label:'#b07070',muted:'#905858'},
-kstate:{cyan:'#F4C55C',green:'#F4C55C',bg:'#120a20',card:'#1e1230',border:'#3d2660',bright:'#FFFFFF',text:'#E7DED0',label:'#C8B8A0',muted:'#9080B0'}
+classic:{cyan:'#06b6d4',green:'#22c55e',callsign:'#f472b6',bg:'#0a0e14',card:'#111820',border:'#1a2530',label:'#8899aa',muted:'#607080'},
+amber:{cyan:'#f59e0b',green:'#f59e0b',callsign:'#3b82f6',bg:'#1a1000',card:'#1f1800',border:'#332800',label:'#B88060',muted:'#8A6840'},
+blue:{cyan:'#3b82f6',green:'#60a5fa',callsign:'#f59e0b',bg:'#0a0f1e',card:'#0f1628',border:'#1a2540',label:'#7090b0',muted:'#506888'},
+red:{cyan:'#ef4444',green:'#f87171',callsign:'#fbbf24',bg:'#1a0a0a',card:'#201010',border:'#3a1a1a',label:'#b07070',muted:'#905858'},
+kstate:{cyan:'#F4C55C',green:'#F4C55C',callsign:'#9333ea',bg:'#120a20',card:'#1e1230',border:'#3d2660',bright:'#FFFFFF',text:'#E7DED0',label:'#C8B8A0',muted:'#9080B0'}
 };
 
 function applySettings(s){
@@ -914,6 +914,7 @@ var root=document.documentElement;
 var t=themes[s.theme]||themes.classic;
 root.style.setProperty('--cyan',t.cyan);
 root.style.setProperty('--green',t.green);
+root.style.setProperty('--callsign',t.callsign||'#f472b6');
 root.style.setProperty('--bg',t.bg);
 root.style.setProperty('--card',t.card);
 root.style.setProperty('--border',t.border);
