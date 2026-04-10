@@ -27,8 +27,10 @@ CACHE = {
     'solar_image_updated': 0,
     'muf_image': None,
     'muf_image_updated': 0,
-    'hrdlog_image': None,
-    'hrdlog_image_updated': 0,
+    'enlil_image': None,
+    'enlil_image_updated': 0,
+    'drap_image': None,
+    'drap_image_updated': 0,
 }
 
 UA = 'HamClockLite/1.0'
@@ -244,17 +246,51 @@ def fetch_muf():
         print(f'[{time.strftime("%H:%M:%S")}] MUF map fetch failed: {e}')
 
 
-def fetch_hrdlog():
-    """Fetch HRDLog/HamQSL propagation image"""
-    try:
-        req = Request('https://www.hamqsl.com/solar101pic.php', headers={'User-Agent': UA})
-        with urlopen(req, timeout=20) as resp:
-            data = resp.read()
-        CACHE['hrdlog_image'] = data
-        CACHE['hrdlog_image_updated'] = time.time()
-        print(f'[{time.strftime("%H:%M:%S")}] HRDLog image updated ({len(data)} bytes)')
-    except Exception as e:
-        print(f'[{time.strftime("%H:%M:%S")}] HRDLog image fetch failed: {e}')
+def fetch_enlil():
+    """Fetch WSA-Enlil solar wind prediction image"""
+    urls = [
+        'https://services.swpc.noaa.gov/images/animations/enlil/latest.jpg',
+        'https://services.swpc.noaa.gov/products/animations/enlil.json',
+    ]
+    for url in urls:
+        try:
+            req = Request(url, headers={'User-Agent': UA})
+            with urlopen(req, timeout=20) as resp:
+                data = resp.read()
+            if url.endswith('.json'):
+                # JSON response — extract latest image URL
+                items = json.loads(data.decode('utf-8'))
+                if items:
+                    last = items[-1]
+                    img_url = 'https://services.swpc.noaa.gov' + last.get('url', '')
+                    req2 = Request(img_url, headers={'User-Agent': UA})
+                    with urlopen(req2, timeout=20) as resp2:
+                        data = resp2.read()
+            CACHE['enlil_image'] = data
+            CACHE['enlil_image_updated'] = time.time()
+            print(f'[{time.strftime("%H:%M:%S")}] Enlil updated ({len(data)} bytes)')
+            return
+        except Exception as e:
+            print(f'[{time.strftime("%H:%M:%S")}] Enlil fetch failed ({url}): {e}')
+
+
+def fetch_drap():
+    """Fetch Aurora forecast (Northern Hemisphere) image"""
+    urls = [
+        'https://services.swpc.noaa.gov/images/aurora-forecast-northern-hemisphere.jpg',
+        'https://services.swpc.noaa.gov/images/swx-overview-large.gif',
+    ]
+    for url in urls:
+        try:
+            req = Request(url, headers={'User-Agent': UA})
+            with urlopen(req, timeout=20) as resp:
+                data = resp.read()
+            CACHE['drap_image'] = data
+            CACHE['drap_image_updated'] = time.time()
+            print(f'[{time.strftime("%H:%M:%S")}] DRAP updated ({len(data)} bytes)')
+            return
+        except Exception as e:
+            print(f'[{time.strftime("%H:%M:%S")}] DRAP fetch failed ({url}): {e}')
 
 
 def background_fetcher():
@@ -262,7 +298,8 @@ def background_fetcher():
     fetch_hamqsl()
     fetch_dx()
     fetch_muf()
-    fetch_hrdlog()
+    fetch_enlil()
+    fetch_drap()
 
     # Fast retry if initial fetch failed (network might not be ready yet)
     for _ in range(6):
@@ -277,11 +314,13 @@ def background_fetcher():
     solar_interval = 300  # 5 minutes
     dx_interval = 120     # 2 minutes
     muf_interval = 900    # 15 minutes
-    hrdlog_interval = 900 # 15 minutes
+    enlil_interval = 900  # 15 minutes
+    drap_interval = 900   # 15 minutes
     last_solar = time.time()
     last_dx = time.time()
     last_muf = time.time()
-    last_hrdlog = time.time()
+    last_enlil = time.time()
+    last_drap = time.time()
 
     while True:
         time.sleep(10)
@@ -295,9 +334,12 @@ def background_fetcher():
         if now - last_muf >= muf_interval:
             fetch_muf()
             last_muf = now
-        if now - last_hrdlog >= hrdlog_interval:
-            fetch_hrdlog()
-            last_hrdlog = now
+        if now - last_enlil >= enlil_interval:
+            fetch_enlil()
+            last_enlil = now
+        if now - last_drap >= drap_interval:
+            fetch_drap()
+            last_drap = now
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -339,11 +381,16 @@ class Handler(SimpleHTTPRequestHandler):
                 self.wfile.write(body)
             else:
                 self.send_json({'error': 'MUF map not yet loaded'})
-        elif path.startswith('/api/hrdlog-image'):
-            if CACHE.get('hrdlog_image'):
-                self.send_binary(CACHE['hrdlog_image'], 'image/gif')
+        elif path.startswith('/api/enlil'):
+            if CACHE.get('enlil_image'):
+                self.send_binary(CACHE['enlil_image'], 'image/jpeg')
             else:
-                self.send_json({'error': 'HRDLog image not yet loaded'})
+                self.send_json({'error': 'not loaded'})
+        elif path.startswith('/api/drap'):
+            if CACHE.get('drap_image'):
+                self.send_binary(CACHE['drap_image'], 'image/png')
+            else:
+                self.send_json({'error': 'not loaded'})
         elif path.startswith('/api/callsign/'):
             call = path.split('/')[-1].upper()
             result = lookup_callsign(call)

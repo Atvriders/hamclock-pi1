@@ -69,8 +69,10 @@ CACHE = {
     'solar_image_updated': 0,
     'muf_image': None,
     'muf_image_updated': 0,
-    'hrdlog_image': None,
-    'hrdlog_image_updated': 0,
+    'enlil_image': None,
+    'enlil_image_updated': 0,
+    'drap_image': None,
+    'drap_image_updated': 0,
 }
 
 UA = 'HamClockLite/1.0'
@@ -286,17 +288,51 @@ def fetch_muf():
         print(f'[{time.strftime("%H:%M:%S")}] MUF map fetch failed: {e}')
 
 
-def fetch_hrdlog():
-    """Fetch HRDLog/HamQSL propagation image"""
-    try:
-        req = Request('https://www.hamqsl.com/solar101pic.php', headers={'User-Agent': UA})
-        with urlopen(req, timeout=20) as resp:
-            data = resp.read()
-        CACHE['hrdlog_image'] = data
-        CACHE['hrdlog_image_updated'] = time.time()
-        print(f'[{time.strftime("%H:%M:%S")}] HRDLog image updated ({len(data)} bytes)')
-    except Exception as e:
-        print(f'[{time.strftime("%H:%M:%S")}] HRDLog image fetch failed: {e}')
+def fetch_enlil():
+    """Fetch WSA-Enlil solar wind prediction image"""
+    urls = [
+        'https://services.swpc.noaa.gov/images/animations/enlil/latest.jpg',
+        'https://services.swpc.noaa.gov/products/animations/enlil.json',
+    ]
+    for url in urls:
+        try:
+            req = Request(url, headers={'User-Agent': UA})
+            with urlopen(req, timeout=20) as resp:
+                data = resp.read()
+            if url.endswith('.json'):
+                # JSON response — extract latest image URL
+                items = json.loads(data.decode('utf-8'))
+                if items:
+                    last = items[-1]
+                    img_url = 'https://services.swpc.noaa.gov' + last.get('url', '')
+                    req2 = Request(img_url, headers={'User-Agent': UA})
+                    with urlopen(req2, timeout=20) as resp2:
+                        data = resp2.read()
+            CACHE['enlil_image'] = data
+            CACHE['enlil_image_updated'] = time.time()
+            print(f'[{time.strftime("%H:%M:%S")}] Enlil updated ({len(data)} bytes)')
+            return
+        except Exception as e:
+            print(f'[{time.strftime("%H:%M:%S")}] Enlil fetch failed ({url}): {e}')
+
+
+def fetch_drap():
+    """Fetch Aurora forecast (Northern Hemisphere) image"""
+    urls = [
+        'https://services.swpc.noaa.gov/images/aurora-forecast-northern-hemisphere.jpg',
+        'https://services.swpc.noaa.gov/images/swx-overview-large.gif',
+    ]
+    for url in urls:
+        try:
+            req = Request(url, headers={'User-Agent': UA})
+            with urlopen(req, timeout=20) as resp:
+                data = resp.read()
+            CACHE['drap_image'] = data
+            CACHE['drap_image_updated'] = time.time()
+            print(f'[{time.strftime("%H:%M:%S")}] DRAP updated ({len(data)} bytes)')
+            return
+        except Exception as e:
+            print(f'[{time.strftime("%H:%M:%S")}] DRAP fetch failed ({url}): {e}')
 
 
 def background_fetcher():
@@ -304,7 +340,8 @@ def background_fetcher():
     fetch_hamqsl()
     fetch_dx()
     fetch_muf()
-    fetch_hrdlog()
+    fetch_enlil()
+    fetch_drap()
 
     # Fast retry if initial fetch failed (network might not be ready yet)
     for _ in range(6):
@@ -319,11 +356,13 @@ def background_fetcher():
     solar_interval = 300  # 5 minutes
     dx_interval = 120     # 2 minutes
     muf_interval = 900    # 15 minutes
-    hrdlog_interval = 900 # 15 minutes
+    enlil_interval = 900  # 15 minutes
+    drap_interval = 900   # 15 minutes
     last_solar = time.time()
     last_dx = time.time()
     last_muf = time.time()
-    last_hrdlog = time.time()
+    last_enlil = time.time()
+    last_drap = time.time()
 
     while True:
         time.sleep(10)
@@ -337,9 +376,12 @@ def background_fetcher():
         if now - last_muf >= muf_interval:
             fetch_muf()
             last_muf = now
-        if now - last_hrdlog >= hrdlog_interval:
-            fetch_hrdlog()
-            last_hrdlog = now
+        if now - last_enlil >= enlil_interval:
+            fetch_enlil()
+            last_enlil = now
+        if now - last_drap >= drap_interval:
+            fetch_drap()
+            last_drap = now
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -381,11 +423,16 @@ class Handler(SimpleHTTPRequestHandler):
                 self.wfile.write(body)
             else:
                 self.send_json({'error': 'MUF map not yet loaded'})
-        elif path.startswith('/api/hrdlog-image'):
-            if CACHE.get('hrdlog_image'):
-                self.send_binary(CACHE['hrdlog_image'], 'image/gif')
+        elif path.startswith('/api/enlil'):
+            if CACHE.get('enlil_image'):
+                self.send_binary(CACHE['enlil_image'], 'image/jpeg')
             else:
-                self.send_json({'error': 'HRDLog image not yet loaded'})
+                self.send_json({'error': 'not loaded'})
+        elif path.startswith('/api/drap'):
+            if CACHE.get('drap_image'):
+                self.send_binary(CACHE['drap_image'], 'image/png')
+            else:
+                self.send_json({'error': 'not loaded'})
         elif path.startswith('/api/callsign/'):
             call = path.split('/')[-1].upper()
             result = lookup_callsign(call)
@@ -525,7 +572,8 @@ padding:clamp(0px,0.1vh,1px) 0;
 .img-wrap img{object-fit:contain;max-width:100%;max-height:100%;display:block}
 #imgSolar{height:12vh;width:100%;object-fit:contain}
 #imgMuf{height:auto;width:100%;max-height:90vh;object-fit:contain}
-#imgHrd{height:12vh;width:100%;object-fit:contain}
+#imgEnlil{height:12vh;width:100%;object-fit:contain}
+#imgDrap{height:12vh;width:100%;object-fit:contain}
 .dx-tbl{width:100%;border-collapse:collapse}
 .dx-tbl th{
 font-size:clamp(9px,1vw,12px);color:var(--label);
@@ -732,8 +780,12 @@ cursor:pointer;
 <div class="img-wrap"><img id="imgSolar" src="/api/solar-image" alt="SDO"></div>
 </div>
 <div class="panel" style="flex:0 0 auto">
-<div class="panel-title"><span>HF PROP</span><span class="timer" id="tmHrd"></span></div>
-<div class="img-wrap"><img id="imgHrd" src="/api/hrdlog-image" alt="HRD"></div>
+<div class="panel-title"><span>WSA-ENLIL</span><span class="timer" id="tmEnlil"></span></div>
+<div class="panel-body img-wrap" style="padding:2px"><img id="imgEnlil" src="/api/enlil" alt="Enlil" style="height:12vh;width:100%;object-fit:contain"></div>
+</div>
+<div class="panel" style="flex:0 0 auto">
+<div class="panel-title"><span>AURORA</span><span class="timer" id="tmDrap"></span></div>
+<div class="panel-body img-wrap" style="padding:2px"><img id="imgDrap" src="/api/drap" alt="Aurora" style="height:12vh;width:100%;object-fit:contain"></div>
 </div>
 </div>
 <div class="col">
@@ -954,7 +1006,8 @@ var tmBands=document.getElementById('tmBands');
 var tmDx=document.getElementById('tmDx');
 var tmSolarImg=document.getElementById('tmSolarImg');
 var tmMuf=document.getElementById('tmMuf');
-var tmHrd=document.getElementById('tmHrd');
+var tmEnlil=document.getElementById('tmEnlil');
+var tmDrap=document.getElementById('tmDrap');
 
 // Clock — uses timezone setting if available
 setInterval(function(){
@@ -981,7 +1034,7 @@ return remaining>=60?Math.ceil(remaining/60)+'m':remaining+'s';
 function updateCountdowns(){
 if(lastSolarFetch){var sc='next \u21BB '+formatCountdown(lastSolarFetch,SOLAR_INTERVAL);tmSolar.textContent=sc;tmBands.textContent=sc;}
 if(lastDxFetch){tmDx.textContent='next \u21BB '+formatCountdown(lastDxFetch,DX_INTERVAL);}
-if(lastImageFetch){var ic='next \u21BB '+formatCountdown(lastImageFetch,IMAGE_INTERVAL);tmSolarImg.textContent=ic;tmMuf.textContent=ic;tmHrd.textContent=ic;}
+if(lastImageFetch){var ic='next \u21BB '+formatCountdown(lastImageFetch,IMAGE_INTERVAL);tmSolarImg.textContent=ic;tmMuf.textContent=ic;tmEnlil.textContent=ic;tmDrap.textContent=ic;}
 }
 
 // Color helpers
@@ -1209,7 +1262,8 @@ return' '+Math.floor(s/60)+'m';
 // Image refresh (separate, every 15 min) — staggered to spread CPU load
 var elImgSolar=document.getElementById('imgSolar');
 var elImgMuf=document.getElementById('imgMuf');
-var elImgHrd=document.getElementById('imgHrd');
+var elImgEnlil=document.getElementById('imgEnlil');
+var elImgDrap=document.getElementById('imgDrap');
 
 function refreshImages(){
 var t=Date.now();
@@ -1219,8 +1273,11 @@ setTimeout(function(){
 if(elImgMuf)elImgMuf.src='/api/muf-map?t='+t;
 },3000);
 setTimeout(function(){
-if(elImgHrd)elImgHrd.src='/api/hrdlog-image?t='+t;
+if(elImgEnlil)elImgEnlil.src='/api/enlil?t='+t;
 },6000);
+setTimeout(function(){
+if(elImgDrap)elImgDrap.src='/api/drap?t='+t;
+},9000);
 updateCountdowns();
 }
 

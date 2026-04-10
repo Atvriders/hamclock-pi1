@@ -88,7 +88,8 @@ padding:clamp(0px,0.1vh,1px) 0;
 .img-wrap img{object-fit:contain;max-width:100%;max-height:100%;display:block}
 #imgSolar{height:12vh;width:100%;object-fit:contain}
 #imgMuf{height:auto;width:100%;max-height:90vh;object-fit:contain}
-#imgHrd{height:12vh;width:100%;object-fit:contain}
+#imgEnlil{height:12vh;width:100%;object-fit:contain}
+#imgDrap{height:12vh;width:100%;object-fit:contain}
 .dx-tbl{width:100%;border-collapse:collapse}
 .dx-tbl th{
 font-size:clamp(9px,1vw,12px);color:var(--label);
@@ -295,8 +296,12 @@ cursor:pointer;
 <div class="img-wrap"><img id="imgSolar" src="/api/solar-image" alt="SDO"></div>
 </div>
 <div class="panel" style="flex:0 0 auto">
-<div class="panel-title"><span>HF PROP</span><span class="timer" id="tmHrd"></span></div>
-<div class="img-wrap"><img id="imgHrd" src="/api/hrdlog-image" alt="HRD"></div>
+<div class="panel-title"><span>WSA-ENLIL</span><span class="timer" id="tmEnlil"></span></div>
+<div class="panel-body img-wrap" style="padding:2px"><img id="imgEnlil" src="/api/enlil" alt="Enlil" style="height:12vh;width:100%;object-fit:contain"></div>
+</div>
+<div class="panel" style="flex:0 0 auto">
+<div class="panel-title"><span>AURORA</span><span class="timer" id="tmDrap"></span></div>
+<div class="panel-body img-wrap" style="padding:2px"><img id="imgDrap" src="/api/drap" alt="Aurora" style="height:12vh;width:100%;object-fit:contain"></div>
 </div>
 </div>
 <div class="col">
@@ -517,7 +522,8 @@ var tmBands=document.getElementById('tmBands');
 var tmDx=document.getElementById('tmDx');
 var tmSolarImg=document.getElementById('tmSolarImg');
 var tmMuf=document.getElementById('tmMuf');
-var tmHrd=document.getElementById('tmHrd');
+var tmEnlil=document.getElementById('tmEnlil');
+var tmDrap=document.getElementById('tmDrap');
 
 // Clock — uses timezone setting if available
 setInterval(function(){
@@ -544,7 +550,7 @@ return remaining>=60?Math.ceil(remaining/60)+'m':remaining+'s';
 function updateCountdowns(){
 if(lastSolarFetch){var sc='next \u21BB '+formatCountdown(lastSolarFetch,SOLAR_INTERVAL);tmSolar.textContent=sc;tmBands.textContent=sc;}
 if(lastDxFetch){tmDx.textContent='next \u21BB '+formatCountdown(lastDxFetch,DX_INTERVAL);}
-if(lastImageFetch){var ic='next \u21BB '+formatCountdown(lastImageFetch,IMAGE_INTERVAL);tmSolarImg.textContent=ic;tmMuf.textContent=ic;tmHrd.textContent=ic;}
+if(lastImageFetch){var ic='next \u21BB '+formatCountdown(lastImageFetch,IMAGE_INTERVAL);tmSolarImg.textContent=ic;tmMuf.textContent=ic;tmEnlil.textContent=ic;tmDrap.textContent=ic;}
 }
 
 // Color helpers
@@ -772,7 +778,8 @@ return' '+Math.floor(s/60)+'m';
 // Image refresh (separate, every 15 min) — staggered to spread CPU load
 var elImgSolar=document.getElementById('imgSolar');
 var elImgMuf=document.getElementById('imgMuf');
-var elImgHrd=document.getElementById('imgHrd');
+var elImgEnlil=document.getElementById('imgEnlil');
+var elImgDrap=document.getElementById('imgDrap');
 
 function refreshImages(){
 var t=Date.now();
@@ -782,8 +789,11 @@ setTimeout(function(){
 if(elImgMuf)elImgMuf.src='/api/muf-map?t='+t;
 },3000);
 setTimeout(function(){
-if(elImgHrd)elImgHrd.src='/api/hrdlog-image?t='+t;
+if(elImgEnlil)elImgEnlil.src='/api/enlil?t='+t;
 },6000);
+setTimeout(function(){
+if(elImgDrap)elImgDrap.src='/api/drap?t='+t;
+},9000);
 updateCountdowns();
 }
 
