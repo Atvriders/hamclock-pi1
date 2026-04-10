@@ -257,7 +257,9 @@ offline-install.sh — Self-contained bundle of all the above; safe for
 
 **Tab interaction**: Click **DRAP** / **AURORA** / **ENLIL** in the bottom-right propagation panel to switch between the three space-weather images. All three refresh on the same 15-minute cycle so switching tabs always shows fresh data.
 
-**Themes**: 4 built-in color themes (Classic, Amber, Blue, Red). Click your callsign in the header to reopen the setup wizard and switch themes anytime.
+**Themes**: 4 built-in color themes (Classic, Amber, Blue, Red). Each theme paints the header callsign in its own accent color so your callsign stands out from the rest of the UI. Click your callsign in the header to reopen the setup wizard and switch themes anytime.
+
+**NTP auto-detect**: Leave the "Time Server (NTP)" field blank in the setup wizard and the dashboard will auto-detect the Raspberry Pi's actual NTP server via `/api/ntp` (which probes `timedatectl`, `systemd-timesyncd.conf`, `chrony.conf`, and `ntp.conf` in order). The placeholder in the input shows the detected server so you know what you'll get.
 
 **Total memory usage: ~15MB**. Works on Pi 1 (700MHz, 512MB RAM) and up. Designed for 1440×900 monitors but auto-scales to any resolution via EDID.
 
