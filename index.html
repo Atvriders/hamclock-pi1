@@ -369,11 +369,11 @@ try{settings=JSON.parse(localStorage.getItem('hamclock-settings'));}catch(e){}
 
 // Theme definitions
 var themes={
-classic:{cyan:'#06b6d4',green:'#22c55e',bg:'#0a0e14',card:'#111820',border:'#1a2530'},
-amber:{cyan:'#f59e0b',green:'#f59e0b',bg:'#1a1000',card:'#1f1800',border:'#332800'},
-blue:{cyan:'#3b82f6',green:'#60a5fa',bg:'#0a0f1e',card:'#0f1628',border:'#1a2540'},
-red:{cyan:'#ef4444',green:'#f87171',bg:'#1a0a0a',card:'#201010',border:'#3a1a1a'},
-kstate:{cyan:'#F4C55C',green:'#CEA152',bg:'#120a20',card:'#1e1230',border:'#2e1e45',bright:'#E7DED0',text:'#D1C8BA',label:'#9F8A70',muted:'#6b5080'}
+classic:{cyan:'#06b6d4',green:'#22c55e',bg:'#0a0e14',card:'#111820',border:'#1a2530',label:'#8899aa',muted:'#607080'},
+amber:{cyan:'#f59e0b',green:'#f59e0b',bg:'#1a1000',card:'#1f1800',border:'#332800',label:'#B88060',muted:'#8A6840'},
+blue:{cyan:'#3b82f6',green:'#60a5fa',bg:'#0a0f1e',card:'#0f1628',border:'#1a2540',label:'#7090b0',muted:'#506888'},
+red:{cyan:'#ef4444',green:'#f87171',bg:'#1a0a0a',card:'#201010',border:'#3a1a1a',label:'#b07070',muted:'#905858'},
+kstate:{cyan:'#F4C55C',green:'#F4C55C',bg:'#120a20',card:'#1e1230',border:'#3d2660',bright:'#FFFFFF',text:'#E7DED0',label:'#C8B8A0',muted:'#9080B0'}
 };
 
 function applySettings(s){
