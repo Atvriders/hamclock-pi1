@@ -102,12 +102,39 @@ To find your Pi's IP address, type `hostname -I` on the Pi.
 
 ## What the Dashboard Shows
 
-| Section | Data | Updates |
-|---------|------|---------|
-| **Solar Conditions** | Solar Flux Index (SFI), Sunspot Number (SSN), A-Index, K-Index with color bar, X-Ray flux class, Solar Wind speed, Bz magnetic field, Geomagnetic storm level | Every 5 minutes |
-| **HF Band Conditions** | 80m through 10m bands, Day and Night conditions, color-coded (Green=Good, Yellow=Fair, Red=Poor) | Every 5 minutes |
-| **DX Cluster** | Last 30 DX spots from HamQTH, with frequency, band badge, DX callsign, spotter callsign, time, and comment | Every 2 minutes |
-| **Clocks** | UTC time and your local time, updating every second | Every second |
+The dashboard is a 3-column kiosk layout designed for 1440×900 monitors but scales to any resolution.
+
+### Left column
+
+| Panel | Data | Updates |
+|-------|------|---------|
+| **SOLAR** | Solar Flux Index (SFI), K-index with color bar, Sunspot Number (SSN), A-index, X-Ray flux class, Solar Wind speed, Bz magnetic field, Geomagnetic storm level, Signal-to-Noise, Aurora index, foF2 | Every 5 minutes |
+| **BANDS** | 80m–10m HF band conditions, Day and Night, color-coded (Green=Good, Yellow=Fair, Red=Poor) | Every 5 minutes |
+| **SDO IMAGE** | Live NASA SDO solar disk (HMI continuum), large enough to spot active regions | Every 15 minutes |
+| **GEOMAGNETIC** | Kp index gauge with color bar and storm-level label | Every 5 minutes |
+| **X-RAY FLUX** | GOES X-ray class (A/B/C/M/X) with intensity bar | Every 5 minutes |
+| **OPEN BANDS** | Quick summary of which HF bands are currently OPEN vs CLOSED | Every 5 minutes |
+
+### Center column
+
+| Panel | Data | Updates |
+|-------|------|---------|
+| **MUF MAP** | KC2G real-time global Maximum Usable Frequency map with terminator and propagation contours | Every 15 minutes |
+
+### Right column
+
+| Panel | Data | Updates |
+|-------|------|---------|
+| **DX SPOTS** | Last 5 HF DX spots from HamQTH with frequency, band badge, DX callsign, spotter, and UTC time | Every 2 minutes |
+| **BAND ACTIVITY** | HF-only horizontal bar chart of spot counts per band (160m–10m), auto-sized to fit all 10 HF bands | Every 2 minutes |
+| **PROPAGATION (tabbed)** | Click **DRAP** / **AURORA** / **ENLIL** to switch between three space-weather images: NOAA D-Region Absorption global map (default), Northern-Hemisphere Aurora forecast, and WSA-Enlil solar wind animation | Every 15 minutes |
+
+### Header & footer
+
+| Element | Content |
+|---------|---------|
+| **Header** | HAMCLOCK LITE title, your callsign (click to reopen settings), UTC clock, local clock (timezone-aware), connection status dot |
+| **Status bar** | Solar / Bands / DX data ages so you can see freshness at a glance |
 
 ---
 
@@ -210,19 +237,29 @@ All data comes from free public APIs — no API keys or accounts needed:
 ## How It Works
 
 ```
-server.py    — A tiny Python web server (no dependencies beyond Python 3)
-               Fetches data from ham radio APIs every 2-5 minutes
-               Serves the dashboard page and JSON data on port 8080
+server.py    — Tiny Python 3 stdlib web server (zero pip dependencies)
+               Background thread fetches ham radio APIs on staggered intervals
+               (solar 5min, DX 2min, images 15min) and caches results in memory.
+               Serves JSON + image proxies on port 8080.
 
-index.html   — The dashboard page (HTML + CSS + JavaScript in one file)
-               Fetches data from server.py every 30 seconds
-               Displays everything with color coding and auto-refresh
+index.html   — Single-file dashboard (HTML + CSS + vanilla JS, no build tools)
+               Polls /api/* every 60 seconds, fully fluid vw/vh/clamp() layout.
+               First-run setup wizard collects callsign + timezone + theme,
+               persisted to localStorage. Click your callsign to re-open it.
 
-install.sh       — Sets up the web server service (headless mode)
-kiosk-install.sh — Sets up the web server + fullscreen display on the Pi's monitor
+install.sh       — Sets up the web server service (headless mode, no display)
+kiosk-install.sh — Sets up server + fullscreen kiosk on the Pi's monitor
+                   (installs minimal X11 + lightest available browser:
+                   surf, midori, or chromium as fallback)
+offline-install.sh — Self-contained bundle of all the above; safe for
+                     `curl ... | bash` (everything runs inside main()).
 ```
 
-Total memory usage: ~15MB. Works on Pi 1 (700MHz, 512MB RAM) and up.
+**Tab interaction**: Click **DRAP** / **AURORA** / **ENLIL** in the bottom-right propagation panel to switch between the three space-weather images. All three refresh on the same 15-minute cycle so switching tabs always shows fresh data.
+
+**Themes**: 4 built-in color themes (Classic, Amber, Blue, Red). Click your callsign in the header to reopen the setup wizard and switch themes anytime.
+
+**Total memory usage: ~15MB**. Works on Pi 1 (700MHz, 512MB RAM) and up. Designed for 1440×900 monitors but auto-scales to any resolution via EDID.
 
 ---
 
