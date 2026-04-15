@@ -297,9 +297,9 @@ This skips the display server and kiosk setup. The dashboard runs as a web serve
 
 ## Alternative: Native Display Modes (Lower RAM/CPU than a Browser)
 
-The default kiosk install uses a browser (surf/midori/chromium) to render the dashboard. A browser on Pi 1 uses ~30–80 MB of RAM and takes 3–10 seconds to start. For even lighter operation, HamClock Lite ships **two optional native clients** that fetch data from the same `/api/*` endpoints and render the dashboard without any browser or HTML/CSS/JS engine.
+The default kiosk install runs a browser (surf/midori/chromium) fullscreen on the Pi's HDMI monitor at **1440×900**. A browser on Pi 1 uses ~30–80 MB of RAM and takes 3–10 seconds to start. For even lighter operation, HamClock Lite ships **two optional native clients** that render the dashboard directly on the HDMI display without any browser engine. They still render on the Pi's monitor — they replace surf/chromium, not the display itself.
 
-Both native clients talk to the same `server.py` (no server changes — they just replace the display layer). You can run the server in headless mode (`./install.sh`) and then launch a native client alongside it.
+Both native clients talk to the same `server.py` (no server changes — they just replace the display layer), and both target 1440×900 fullscreen matching the default kiosk resolution. You still run `./kiosk-install.sh` to set up the server + systemd service + boot config; then launch a native client in place of the browser.
 
 ### Option A — Pygame framebuffer client (`hamclock_pygame.py`)
 
