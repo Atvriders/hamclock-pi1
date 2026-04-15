@@ -116,9 +116,6 @@ xset s off
 xset -dpms
 xset s noblank
 
-# Hide mouse cursor after 3 seconds of inactivity
-unclutter -idle 3 -root &
-
 # Start matchbox window manager (auto-maximizes all windows)
 matchbox-window-manager -use_titlebar no -use_desktop_mode plain &
 sleep 1
@@ -144,7 +141,7 @@ StandardOutput=tty
 TTYPath=/dev/tty7
 TTYReset=yes
 TTYVHangup=yes
-ExecStart=/usr/bin/xinit /opt/hamclock-lite/kiosk.sh -- :0 vt7 -nocursor
+ExecStart=/usr/bin/xinit /opt/hamclock-lite/kiosk.sh -- :0 vt7
 Restart=on-failure
 RestartSec=10
 
