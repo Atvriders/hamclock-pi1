@@ -280,6 +280,21 @@ wget -qO- https://hamclock-reborn.org/downloads/pi1-install.sh | bash
 
 This downloads and runs a self-contained installer that has everything embedded — no git needed. The Pi still needs internet to fetch ham radio data (solar conditions, DX spots), just not GitHub specifically.
 
+The curl-pipe installer also accepts the same display-mode flags as `kiosk-install.sh` (see [Display Modes](#display-modes-browser-vs-native) below):
+
+```bash
+# Default (browser kiosk)
+curl -sL https://hamclock-reborn.org/downloads/pi1-install.sh | bash
+
+# Pygame framebuffer mode (no X11, lowest RAM)
+curl -sL https://hamclock-reborn.org/downloads/pi1-install.sh | bash -s -- --pygame
+
+# Tkinter native widget mode
+curl -sL https://hamclock-reborn.org/downloads/pi1-install.sh | bash -s -- --tkinter
+```
+
+Note the `bash -s -- --pygame` pattern: `-s` tells bash to read the script from stdin (the curl output), and `--` separates bash's own arguments from the arguments passed through to the script.
+
 ---
 
 ## Alternative: Headless Mode
@@ -295,33 +310,42 @@ This skips the display server and kiosk setup. The dashboard runs as a web serve
 
 ---
 
-## Alternative: Native Display Modes (Lower RAM/CPU than a Browser)
+## Display Modes: Browser vs Native
 
-The default kiosk install runs a browser (surf/midori/chromium) fullscreen on the Pi's HDMI monitor at **1440×900**. A browser on Pi 1 uses ~30–80 MB of RAM and takes 3–10 seconds to start. For even lighter operation, HamClock Lite ships **two optional native clients** that render the dashboard directly on the HDMI display without any browser engine. They still render on the Pi's monitor — they replace surf/chromium, not the display itself.
+The default kiosk installer runs a browser (surf/midori/chromium) fullscreen on the Pi's HDMI monitor at **1440×900**. That works great and gives you the full feature set (all 5 themes, setup wizard, MUF map), but a browser on Pi 1 uses 30–80 MB of RAM and takes 3–10 seconds to start.
 
-Both native clients talk to the same `server.py` (no server changes — they just replace the display layer), and both target 1440×900 fullscreen matching the default kiosk resolution. You still run `./kiosk-install.sh` to set up the server + systemd service + boot config; then launch a native client in place of the browser.
+For lower overhead, `kiosk-install.sh` supports two alternative **native display modes** that replace the browser entirely while still rendering on the same HDMI monitor at 1440×900. All three modes talk to the same `server.py` (no server changes) — they just swap out the display layer. Pick the mode at install time with a flag:
 
-### Option A — Pygame framebuffer client (`hamclock_pygame.py`)
+| Flag | Display layer | RAM | Needs X11 | Best for |
+|---|---|---|---|---|
+| `--browser` (default) | surf/midori/chromium | 30–80 MB | Yes | Full feature set |
+| `--tkinter` | Python Tkinter widgets | ~25–35 MB | Yes | Native widget feel |
+| `--pygame` | Pygame → /dev/fb0 | ~15–20 MB | **No** | Lowest RAM, no X11 overhead |
 
-The lowest-overhead option. Uses Pygame to draw directly to the Linux framebuffer — skips X11 entirely on the Pi 1. Target footprint: ~15–20 MB RAM, <1 second startup.
+Whichever mode you pick, the installer sets up the `hamclock-lite` and `hamclock-kiosk` systemd services so the Pi boots straight into the dashboard on its HDMI display — no manual launching after install.
 
-Install dependencies and run:
+### Option A — Pygame framebuffer client (`--pygame`)
 
-```bash
-sudo apt install -y python3-pygame
-python3 /opt/hamclock-lite/hamclock_pygame.py
-```
+The lowest-overhead option. Uses Pygame to draw directly to `/dev/fb0` via SDL's `fbcon` driver — skips X11 entirely on the Pi 1. Target footprint: ~15–20 MB RAM, <1 second startup.
 
-Or run from the repo:
+Install with the `--pygame` flag:
 
 ```bash
 cd ~/hamclock-pi1
-python3 hamclock_pygame.py
+./kiosk-install.sh --pygame
+```
+
+This installs `python3-pygame` (instead of the X11 + browser packages), copies the Python clients to `/opt/hamclock-lite/`, sets up the `hamclock-lite` and `hamclock-kiosk` systemd services, and configures the Pi to boot directly into the native Pygame client on the HDMI display. Reboot once and you're live.
+
+**Testing manually** (without systemd, e.g. to debug rendering):
+
+```bash
+python3 /opt/hamclock-lite/hamclock_pygame.py
 ```
 
 Behavior:
-- If `$DISPLAY` is set, renders in an X window (1440×900 or fullscreen)
-- If `$DISPLAY` is unset, renders directly to `/dev/fb0` via SDL's `fbcon` driver — no X needed
+- Renders directly to `/dev/fb0` via SDL's `fbcon` driver — no X needed
+- If `$DISPLAY` happens to be set, falls back to an X window (1440×900 or fullscreen)
 - Press **Esc** or **Q** to quit
 - Click the DRAP / AURORA / ENLIL tabs in the bottom-right panel to switch space-weather images
 - Ticks at 10 FPS to keep CPU usage low
@@ -331,22 +355,23 @@ Known limitations vs the browser version:
 - Only the K-State color theme is hardcoded. No theme switching.
 - No setup wizard — callsign is displayed from saved settings or left blank.
 
-### Option B — Tkinter native client (`hamclock_tkinter.py`)
+### Option B — Tkinter native client (`--tkinter`)
 
 A stdlib-based alternative using Tkinter widgets. Slightly heavier than Pygame (~25–35 MB RAM) but uses native GUI widgets — tables via `ttk.Treeview`, tab switcher via `ttk.Notebook`, image panels via `PIL.ImageTk`. Boot time is comparable to Pygame.
 
-Install dependencies and run:
-
-```bash
-sudo apt install -y python3-tk python3-pil python3-pil.imagetk
-python3 /opt/hamclock-lite/hamclock_tkinter.py
-```
-
-Or from the repo:
+Install with the `--tkinter` flag:
 
 ```bash
 cd ~/hamclock-pi1
-python3 hamclock_tkinter.py
+./kiosk-install.sh --tkinter
+```
+
+This installs `python3-tk` and `python3-pil.imagetk` (plus the minimal X11 stack — Tkinter needs an X server), sets up the same systemd services as the browser kiosk, and configures the Pi to boot directly into the native Tkinter client at 1440×900 fullscreen on the HDMI display.
+
+**Testing manually** (without systemd):
+
+```bash
+python3 /opt/hamclock-lite/hamclock_tkinter.py
 ```
 
 Behavior:
@@ -358,10 +383,23 @@ Behavior:
 
 Same MUF-map caveat as the Pygame client.
 
+### Option C — Browser kiosk (`--browser`, default)
+
+The original full-feature mode. If you don't pass any flag, this is what you get:
+
+```bash
+cd ~/hamclock-pi1
+./kiosk-install.sh           # default — same as --browser
+./kiosk-install.sh --browser  # explicit
+```
+
+Installs the minimal X11 stack (`xserver-xorg`, `xinit`, `matchbox-window-manager`) and the lightest available browser (`surf`, `midori`, or `chromium` as fallback) and boots the Pi straight into HamClock fullscreen at 1440×900.
+
 ### Which one should I use?
 
 | | Browser (default) | Pygame client | Tkinter client |
 |---|---|---|---|
+| Install flag | `./kiosk-install.sh` | `./kiosk-install.sh --pygame` | `./kiosk-install.sh --tkinter` |
 | RAM footprint | 30–80 MB | **~15–20 MB** | ~25–35 MB |
 | Start time | 3–10 sec | **< 1 sec** | ~1 sec |
 | X11 required | Yes | **No** (fbcon) | Yes |
@@ -369,11 +407,24 @@ Same MUF-map caveat as the Pygame client.
 | Theme switching | ✅ (5 themes) | ❌ (K-State only) | ❌ (K-State only) |
 | Setup wizard | ✅ | ❌ | ❌ |
 | Full interactivity | ✅ | ✅ (tab clicks) | ✅ (tab clicks) |
-| Extra apt packages | surf/midori/chromium | python3-pygame | python3-tk python3-pil.imagetk |
+| Packages installed | xserver-xorg xinit matchbox surf/midori/chromium | python3-pygame | python3-tk python3-pil.imagetk |
 
-**If you want the lowest-RAM Pi 1 kiosk**: Pygame client + headless server.
-**If you want the richest display**: keep the default browser kiosk.
-**If you're running on desktop Linux and want a lightweight native app**: Tkinter client.
+**If you want the lowest-RAM Pi 1 kiosk**: `./kiosk-install.sh --pygame`.
+**If you want the richest display**: `./kiosk-install.sh` (browser default).
+**If you want native GUI widgets on a Pi with X11 already running**: `./kiosk-install.sh --tkinter`.
+
+### Switching modes after install
+
+To switch display modes on an already-installed Pi, just re-run the installer with the new flag:
+
+```bash
+cd ~/hamclock-pi1
+./kiosk-install.sh --pygame   # or --tkinter or --browser
+```
+
+Re-running the installer is safe — it rewrites the `kiosk.sh` launcher and the `hamclock-kiosk.service` unit with the new mode, restarts the service, and picks up immediately on the next boot (or with `sudo systemctl restart hamclock-kiosk`). All three Python client files are always copied to `/opt/hamclock-lite/` regardless of which mode is active, so switching doesn't require re-pulling the repo or reinstalling anything from `apt` you already have.
+
+The `offline-install.sh` curl-pipe installer accepts the exact same flags — see the [Quick Install](#alternative-quick-install-no-github-needed) section above for the `bash -s -- --pygame` syntax.
 
 ### Shared data layer (`hamclock_data.py`)
 

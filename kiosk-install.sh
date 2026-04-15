@@ -6,6 +6,19 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Parse mode flag
+KIOSK_MODE="browser"  # default
+for arg in "$@"; do
+    case "$arg" in
+        --pygame)  KIOSK_MODE="pygame" ;;
+        --tkinter) KIOSK_MODE="tkinter" ;;
+        --browser) KIOSK_MODE="browser" ;;
+        --help|-h) echo "Usage: $0 [--browser|--pygame|--tkinter]"; exit 0 ;;
+        *) echo "Unknown arg: $arg (try --help)"; exit 1 ;;
+    esac
+done
+echo "Kiosk mode: $KIOSK_MODE"
+
 echo "=== HamClock Pi1 Kiosk Mode Installer ==="
 echo "This will set up your Pi to boot directly into HamClock on its monitor."
 echo ""
@@ -26,7 +39,21 @@ fi
 # Install minimal X server + lightweight browser
 echo "Installing display server and browser (this may take 15-30 minutes on a Pi 1)..."
 sudo apt update
-sudo apt install -y xserver-xorg xinit x11-xserver-utils unclutter curl matchbox-window-manager
+sudo apt install -y curl unclutter
+
+# X11 packages needed for browser and tkinter modes, not pygame
+if [ "$KIOSK_MODE" != "pygame" ]; then
+    sudo apt install -y xserver-xorg xinit x11-xserver-utils matchbox-window-manager
+fi
+
+# Mode-specific dependencies
+if [ "$KIOSK_MODE" = "pygame" ]; then
+    echo "Installing Pygame for native framebuffer display..."
+    sudo apt install -y python3-pygame
+elif [ "$KIOSK_MODE" = "tkinter" ]; then
+    echo "Installing Tkinter + PIL for native widget display..."
+    sudo apt install -y python3-tk python3-pil python3-pil.imagetk
+fi
 
 # Allow any user to start X (needed for systemd service)
 sudo mkdir -p /etc/X11
@@ -35,27 +62,29 @@ allowed_users=anybody
 needs_root_rights=yes
 XEOF
 
-# Try browsers in order of lightness
 BROWSER=""
 BROWSER_CMD=""
-for pkg in surf epiphany-browser midori chromium-browser chromium; do
-    if sudo apt install -y "$pkg" 2>&1 | tail -1; then
-        case "$pkg" in
-            surf) BROWSER="surf"; BROWSER_CMD="surf http://localhost:8080" ;;
-            epiphany-browser) BROWSER="epiphany"; BROWSER_CMD="epiphany-browser --application-mode http://localhost:8080" ;;
-            midori) BROWSER="midori"; BROWSER_CMD="midori -e Fullscreen -a http://localhost:8080" ;;
-            chromium-browser|chromium) BROWSER="chromium"; BROWSER_CMD="$pkg --kiosk --noerrdialogs --disable-translate --no-first-run --disable-features=TranslateUI --disk-cache-size=0 http://localhost:8080" ;;
-        esac
-        break
-    fi
-done
+if [ "$KIOSK_MODE" = "browser" ]; then
+    # Try browsers in order of lightness
+    for pkg in surf epiphany-browser midori chromium-browser chromium; do
+        if sudo apt install -y "$pkg" 2>&1 | tail -1; then
+            case "$pkg" in
+                surf) BROWSER="surf"; BROWSER_CMD="surf http://localhost:8080" ;;
+                epiphany-browser) BROWSER="epiphany"; BROWSER_CMD="epiphany-browser --application-mode http://localhost:8080" ;;
+                midori) BROWSER="midori"; BROWSER_CMD="midori -e Fullscreen -a http://localhost:8080" ;;
+                chromium-browser|chromium) BROWSER="chromium"; BROWSER_CMD="$pkg --kiosk --noerrdialogs --disable-translate --no-first-run --disable-features=TranslateUI --disk-cache-size=0 http://localhost:8080" ;;
+            esac
+            break
+        fi
+    done
 
-if [ -z "$BROWSER" ]; then
-    echo "ERROR: Could not install any browser (tried surf, epiphany, midori, chromium)."
-    echo "Please install a browser manually and re-run this script."
-    exit 1
+    if [ -z "$BROWSER" ]; then
+        echo "ERROR: Could not install any browser (tried surf, epiphany, midori, chromium)."
+        echo "Please install a browser manually and re-run this script."
+        exit 1
+    fi
+    echo "Browser installed: $BROWSER"
 fi
-echo "Browser installed: $BROWSER"
 
 # Install HamClock service if not already done
 INSTALL_DIR="/opt/hamclock-lite"
@@ -66,6 +95,12 @@ if [ ! -f "$INSTALL_DIR/server.py" ]; then
     sudo cp "$SCRIPT_DIR/index.html" "$INSTALL_DIR/"
     sudo chmod +x "$INSTALL_DIR/server.py"
 fi
+
+# Always copy the native Python clients so users can switch modes later
+sudo mkdir -p "$INSTALL_DIR"
+sudo cp "$SCRIPT_DIR/hamclock_data.py" "$INSTALL_DIR/"
+sudo cp "$SCRIPT_DIR/hamclock_pygame.py" "$INSTALL_DIR/"
+sudo cp "$SCRIPT_DIR/hamclock_tkinter.py" "$INSTALL_DIR/"
 
 # Copy X11 monitor config for auto-detect resolution (16-bit saves RAM on Pi 1)
 sudo cp "$SCRIPT_DIR/10-monitor.conf" /usr/share/X11/xorg.conf.d/10-monitor.conf 2>/dev/null || true
@@ -101,7 +136,8 @@ EOF
 fi
 
 # Create kiosk launch script
-sudo tee /opt/hamclock-lite/kiosk.sh > /dev/null <<KIOSKEOF
+if [ "$KIOSK_MODE" = "browser" ]; then
+    sudo tee /opt/hamclock-lite/kiosk.sh > /dev/null <<KIOSKEOF
 #!/bin/bash
 # Wait for HamClock server to be ready
 for i in \$(seq 1 30); do
@@ -123,10 +159,66 @@ sleep 1
 # Launch browser (matchbox will maximize it)
 exec $BROWSER_CMD
 KIOSKEOF
+elif [ "$KIOSK_MODE" = "tkinter" ]; then
+    sudo tee /opt/hamclock-lite/kiosk.sh > /dev/null <<'KIOSKEOF'
+#!/bin/bash
+# Wait for HamClock server to be ready
+for i in $(seq 1 30); do
+    if curl -s http://localhost:8080/api/health > /dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+# Disable screen blanking
+xset s off
+xset -dpms
+xset s noblank
+# Launch Tkinter native client (replaces browser; still needs X)
+exec python3 /opt/hamclock-lite/hamclock_tkinter.py
+KIOSKEOF
+elif [ "$KIOSK_MODE" = "pygame" ]; then
+    sudo tee /opt/hamclock-lite/kiosk.sh > /dev/null <<'KIOSKEOF'
+#!/bin/bash
+# Wait for HamClock server to be ready
+for i in $(seq 1 30); do
+    if curl -s http://localhost:8080/api/health > /dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+# Pygame framebuffer mode: no X server, SDL draws directly to /dev/fb0
+export SDL_VIDEODRIVER=fbcon
+export SDL_FBDEV=/dev/fb0
+exec python3 /opt/hamclock-lite/hamclock_pygame.py
+KIOSKEOF
+fi
 sudo chmod +x /opt/hamclock-lite/kiosk.sh
 
 # Create kiosk systemd service
-sudo tee /etc/systemd/system/hamclock-kiosk.service > /dev/null <<EOF
+if [ "$KIOSK_MODE" = "pygame" ]; then
+    sudo tee /etc/systemd/system/hamclock-kiosk.service > /dev/null <<EOF
+[Unit]
+Description=HamClock Kiosk Display (Pygame framebuffer)
+After=hamclock-lite.service
+Wants=hamclock-lite.service
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty7
+TTYReset=yes
+TTYVHangup=yes
+ExecStart=/opt/hamclock-lite/kiosk.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+else
+    sudo tee /etc/systemd/system/hamclock-kiosk.service > /dev/null <<EOF
 [Unit]
 Description=HamClock Kiosk Display
 After=hamclock-lite.service
@@ -148,6 +240,7 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
 
 sudo systemctl daemon-reload
 sudo systemctl enable hamclock-lite hamclock-kiosk
@@ -181,11 +274,17 @@ if [ -n "$BOOT_CONFIG" ]; then
 fi
 
 echo ""
-echo "=== Kiosk Mode Installed ==="
+echo "=== Kiosk Mode Installed ($KIOSK_MODE) ==="
 echo "HamClock will now display fullscreen on this Pi's monitor."
 echo "It will auto-start on every boot."
 echo ""
-echo "Browser: $BROWSER"
+if [ "$KIOSK_MODE" = "browser" ]; then
+    echo "Browser: $BROWSER"
+elif [ "$KIOSK_MODE" = "pygame" ]; then
+    echo "Display: Native Pygame (framebuffer, no X11)"
+elif [ "$KIOSK_MODE" = "tkinter" ]; then
+    echo "Display: Native Tkinter (xinit + X11)"
+fi
 echo ""
 echo "Commands:"
 echo "  sudo systemctl status hamclock-kiosk   — check kiosk status"

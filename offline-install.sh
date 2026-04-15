@@ -15,8 +15,20 @@
 main() {
 set -euo pipefail
 
+KIOSK_MODE="browser"
+for arg in "$@"; do
+    case "$arg" in
+        --pygame)  KIOSK_MODE="pygame" ;;
+        --tkinter) KIOSK_MODE="tkinter" ;;
+        --browser) KIOSK_MODE="browser" ;;
+        --help|-h) echo "Usage: curl ... | bash -s -- [--browser|--pygame|--tkinter]"; exit 0 ;;
+        *) echo "Unknown arg: $arg (try --help)"; exit 1 ;;
+    esac
+done
+echo "Kiosk mode: $KIOSK_MODE"
+
 INSTALL_DIR="/opt/hamclock-lite"
-SERVICE_USER="${SUDO_USER:-$USER}"
+SERVICE_USER="${SUDO_USER:-${USER:-root}}"
 
 echo "=== HamClock Pi1 — Full Installer ==="
 echo "This will install HamClock with kiosk mode (fullscreen on monitor)."
@@ -1480,6 +1492,1344 @@ startFetching();
 </html>
 HTMLEOF
 
+echo "Writing hamclock_data.py..."
+sudo tee "$INSTALL_DIR/hamclock_data.py" > /dev/null << 'HCDATAEOF'
+"""Shared data-fetching layer for HamClock Lite native GUI clients.
+
+Polls the same /api/* endpoints the browser uses, caching JSON dicts and
+raw image bytes for Pygame/Tkinter kiosks on Raspberry Pi 1.
+"""
+
+import json
+import threading
+import time
+import urllib.error
+import urllib.request
+
+
+class HamClockData:
+    """Thread-safe data-fetching layer for HamClock Lite native clients.
+
+    Polls /api/* JSON endpoints and binary image endpoints on configurable
+    intervals. Native GUI code reads the cached attributes directly
+    (they're updated in-place by the background thread).
+
+    Attribute usage is lock-free for single-reader GUI loops: the GIL
+    makes single-key dict reads atomic, and the background thread only
+    does whole-dict assignments. For multi-reader scenarios, use the
+    lock() context manager.
+    """
+
+    DEFAULT_SERVER = 'http://localhost:8080'
+    USER_AGENT = 'HamClockNative/1.0'
+    JSON_TIMEOUT = 10
+    IMAGE_TIMEOUT = 20
+
+    _JSON_ENDPOINTS = {
+        'solar': '/api/solar',
+        'bands': '/api/bands',
+        'dxspots': '/api/dxspots',
+        'health': '/api/health',
+    }
+    _IMAGE_ENDPOINTS = {
+        'solar-image': '/api/solar-image',
+        'muf-map': '/api/muf-map',
+        'enlil': '/api/enlil',
+        'drap': '/api/drap',
+        'real-drap': '/api/real-drap',
+    }
+
+    def __init__(self, server_url='http://localhost:8080'):
+        """Initialize with the HamClock server URL (default localhost:8080)."""
+        self.server_url = server_url.rstrip('/')
+        # JSON cache
+        self.solar = {}
+        self.bands = {}
+        self.dxspots = []
+        self.health = {}
+        # Binary image cache
+        self.images = {}
+        # Timestamps (Unix seconds; 0 means never)
+        self.last_data_refresh = 0
+        self.last_image_refresh = 0
+        # Errors (most recent error per key, None if last fetch succeeded)
+        self.errors = {}
+        # Internal
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread = None
+
+    def _request(self, path, timeout):
+        url = self.server_url + path
+        req = urllib.request.Request(url, headers={'User-Agent': self.USER_AGENT})
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    def _fetch_json(self, path):
+        """HTTP GET path and parse as JSON. Returns dict/list or None on failure."""
+        try:
+            with self._request(path, self.JSON_TIMEOUT) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            self.errors[path] = None
+            return data
+        except (urllib.error.URLError, urllib.error.HTTPError, ValueError, OSError) as e:
+            self.errors[path] = '{}: {}'.format(type(e).__name__, e)
+            return None
+
+    def _fetch_binary(self, path):
+        """HTTP GET path and return raw bytes. Returns bytes or None on failure."""
+        try:
+            with self._request(path, self.IMAGE_TIMEOUT) as resp:
+                data = resp.read()
+            self.errors[path] = None
+            return data
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+            self.errors[path] = '{}: {}'.format(type(e).__name__, e)
+            return None
+
+    def refresh_data(self):
+        """Fetch the 4 JSON endpoints synchronously."""
+        results = {}
+        fetched = {}
+        for key, path in self._JSON_ENDPOINTS.items():
+            data = self._fetch_json(path)
+            results[key] = data is not None
+            if data is not None:
+                fetched[key] = data
+        with self._lock:
+            if 'solar' in fetched:
+                self.solar = fetched['solar'] if isinstance(fetched['solar'], dict) else {}
+            if 'bands' in fetched:
+                self.bands = fetched['bands'] if isinstance(fetched['bands'], dict) else {}
+            if 'dxspots' in fetched:
+                self.dxspots = fetched['dxspots'] if isinstance(fetched['dxspots'], list) else []
+            if 'health' in fetched:
+                self.health = fetched['health'] if isinstance(fetched['health'], dict) else {}
+            self.last_data_refresh = time.time()
+        return results
+
+    def refresh_images(self):
+        """Fetch the 5 image endpoints synchronously."""
+        results = {}
+        fetched = {}
+        for key, path in self._IMAGE_ENDPOINTS.items():
+            data = self._fetch_binary(path)
+            results[key] = data is not None
+            if data is not None:
+                fetched[key] = data
+        with self._lock:
+            new_images = dict(self.images)
+            new_images.update(fetched)
+            self.images = new_images
+            self.last_image_refresh = time.time()
+        return results
+
+    def start_background(self, data_interval=60, image_interval=900):
+        """Start a daemon thread that refreshes data/images on their intervals."""
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._run, args=(data_interval, image_interval), daemon=True
+        )
+        self._thread.start()
+
+    def _run(self, data_interval, image_interval):
+        # Immediate initial fetch
+        try:
+            self.refresh_data()
+        except Exception as e:
+            self.errors['_run_data'] = '{}: {}'.format(type(e).__name__, e)
+        try:
+            self.refresh_images()
+        except Exception as e:
+            self.errors['_run_images'] = '{}: {}'.format(type(e).__name__, e)
+        # Sleep-and-check loop
+        while self._running:
+            for _ in range(5):
+                if not self._running:
+                    return
+                time.sleep(1)
+            now = time.time()
+            if now - self.last_data_refresh >= data_interval:
+                try:
+                    self.refresh_data()
+                except Exception as e:
+                    self.errors['_run_data'] = '{}: {}'.format(type(e).__name__, e)
+            if now - self.last_image_refresh >= image_interval:
+                try:
+                    self.refresh_images()
+                except Exception as e:
+                    self.errors['_run_images'] = '{}: {}'.format(type(e).__name__, e)
+
+    def stop(self):
+        """Signal the background thread to exit."""
+        self._running = False
+
+    def lock(self):
+        """Return the internal threading.Lock for use as a context manager."""
+        return self._lock
+HCDATAEOF
+
+echo "Writing hamclock_pygame.py..."
+sudo tee "$INSTALL_DIR/hamclock_pygame.py" > /dev/null << 'HCPYEOF'
+"""Native Pygame client for HamClock Lite.
+
+Replaces the browser on a Raspberry Pi 1 Model B, fetching data from
+the same /api/* endpoints as the web UI but rendering directly with
+Pygame/SDL for a ~50 MB RAM and ~10% CPU win over the browser stack.
+"""
+
+import io
+import os
+import sys
+import time
+
+import pygame
+
+from hamclock_data import HamClockData
+
+
+# ---- K-State theme colors ----
+BG = (42, 20, 80)
+CARD = (58, 29, 101)
+BORDER = (81, 40, 136)
+TEXT = (232, 221, 245)
+LABEL = (184, 160, 216)
+BRIGHT = (255, 255, 255)
+ACCENT_GOLD = (244, 197, 92)
+STATUS_GREEN = (34, 197, 94)
+STATUS_YELLOW = (234, 179, 8)
+STATUS_RED = (239, 68, 68)
+
+COND_COLORS = {
+    'Good': (34, 197, 94),
+    'Fair': (234, 179, 8),
+    'Poor': (239, 68, 68),
+    'N/A': (74, 85, 104),
+}
+
+BAND_COLORS = {
+    '160m': (255, 107, 107), '80m': (240, 101, 149), '60m': (204, 93, 232),
+    '40m': (132, 94, 247), '30m': (92, 124, 250), '20m': (51, 154, 240),
+    '17m': (34, 184, 207), '15m': (32, 201, 151), '12m': (81, 207, 102),
+    '10m': (148, 216, 45),
+}
+
+HF_BANDS = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m', '12m', '10m']
+
+SCREEN_W = 1440
+SCREEN_H = 900
+
+
+def _make_fonts():
+    """Build the fonts dict. Falls back to default font if SysFont fails."""
+    def mk(size):
+        try:
+            f = pygame.font.SysFont('monospace', size)
+            if f is None:
+                raise RuntimeError('no monospace')
+            return f
+        except Exception:
+            return pygame.font.Font(None, size + 4)
+    return {
+        'title': mk(22),
+        'panel': mk(14),
+        'body': mk(14),
+        'label': mk(12),
+        'small': mk(11),
+    }
+
+
+def _safe(d, key, default='--'):
+    try:
+        v = d.get(key)
+        if v is None or v == '':
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def _blit_text(screen, font, text, color, x, y):
+    try:
+        surf = font.render(str(text), True, color)
+        screen.blit(surf, (x, y))
+        return surf.get_width()
+    except Exception:
+        return 0
+
+
+def _load_image(data_bytes):
+    """Decode JPEG/PNG bytes into a Pygame surface, or None on failure."""
+    if not data_bytes:
+        return None
+    for hint in ('x.jpg', 'x.png'):
+        try:
+            return pygame.image.load_extended(io.BytesIO(data_bytes), hint).convert()
+        except Exception:
+            continue
+    try:
+        return pygame.image.load(io.BytesIO(data_bytes)).convert()
+    except Exception:
+        return None
+
+
+def draw_panel(screen, rect, title, fonts):
+    pygame.draw.rect(screen, CARD, rect)
+    pygame.draw.rect(screen, BORDER, rect, 1)
+    bar = pygame.Rect(rect.x, rect.y, rect.w, 18)
+    pygame.draw.rect(screen, BORDER, bar)
+    _blit_text(screen, fonts['panel'], title, BRIGHT, rect.x + 6, rect.y + 2)
+    return pygame.Rect(rect.x + 6, rect.y + 22, rect.w - 12, rect.h - 26)
+
+
+def draw_header(screen, rect, callsign, fonts):
+    pygame.draw.rect(screen, CARD, rect)
+    pygame.draw.rect(screen, BORDER, rect, 1)
+    _blit_text(screen, fonts['title'], 'HAMCLOCK LITE', ACCENT_GOLD, rect.x + 8, rect.y + 4)
+    _blit_text(screen, fonts['body'], str(callsign or '--'), BRIGHT, rect.x + 220, rect.y + 8)
+    try:
+        utc = time.strftime('%H:%M:%S', time.gmtime())
+        local = time.strftime('%H:%M:%S')
+    except Exception:
+        utc = local = '--:--:--'
+    _blit_text(screen, fonts['body'], 'UTC ' + utc, TEXT, rect.x + rect.w - 340, rect.y + 8)
+    _blit_text(screen, fonts['body'], 'LOC ' + local, TEXT, rect.x + rect.w - 180, rect.y + 8)
+    dot_color = STATUS_GREEN if (int(time.time()) % 2 == 0) else STATUS_YELLOW
+    pygame.draw.circle(screen, dot_color, (rect.x + rect.w - 18, rect.y + 14), 5)
+
+
+def draw_solar(screen, rect, solar, fonts):
+    rows = [
+        ('SFI', _safe(solar, 'sfi')),
+        ('Kp', _safe(solar, 'kIndex')),
+        ('SSN', _safe(solar, 'ssn')),
+        ('A', _safe(solar, 'aIndex')),
+        ('X-Ray', _safe(solar, 'xray')),
+        ('Wind', _safe(solar, 'solarWind')),
+        ('Bz', _safe(solar, 'bz')),
+        ('Geo', _safe(solar, 'geomagField')),
+        ('S/N', _safe(solar, 'signalNoise')),
+        ('foF2', _safe(solar, 'fof2')),
+    ]
+    y = rect.y
+    for label, value in rows:
+        _blit_text(screen, fonts['label'], label, LABEL, rect.x, y)
+        _blit_text(screen, fonts['body'], str(value), BRIGHT, rect.x + 70, y - 1)
+        y += 16
+
+
+def draw_bands(screen, rect, bands, fonts):
+    groups = [
+        ('80m-40m', ['80m-40m']),
+        ('30m-20m', ['30m-20m']),
+        ('17m-15m', ['17m-15m']),
+        ('12m-10m', ['12m-10m']),
+    ]
+    _blit_text(screen, fonts['label'], 'BAND', LABEL, rect.x, rect.y)
+    _blit_text(screen, fonts['label'], 'DAY', LABEL, rect.x + 100, rect.y)
+    _blit_text(screen, fonts['label'], 'NIGHT', LABEL, rect.x + 160, rect.y)
+    y = rect.y + 16
+    for name, keys in groups:
+        entry = bands.get(keys[0], {}) if isinstance(bands, dict) else {}
+        day = entry.get('day', 'N/A') if isinstance(entry, dict) else 'N/A'
+        night = entry.get('night', 'N/A') if isinstance(entry, dict) else 'N/A'
+        _blit_text(screen, fonts['body'], name, TEXT, rect.x, y)
+        _blit_text(screen, fonts['body'], str(day), COND_COLORS.get(day, TEXT), rect.x + 100, y)
+        _blit_text(screen, fonts['body'], str(night), COND_COLORS.get(night, TEXT), rect.x + 160, y)
+        y += 16
+
+
+def draw_image(screen, rect, surface):
+    if surface is None:
+        _blit_text(screen, pygame.font.Font(None, 18), 'image loading...', LABEL, rect.x + 6, rect.y + 6)
+        return
+    try:
+        iw, ih = surface.get_size()
+        if iw == 0 or ih == 0:
+            return
+        scale = min(rect.w / iw, rect.h / ih)
+        nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+        scaled = pygame.transform.smoothscale(surface, (nw, nh)) if scale < 1.0 else surface
+        x = rect.x + (rect.w - nw) // 2
+        y = rect.y + (rect.h - nh) // 2
+        screen.blit(scaled, (x, y))
+    except Exception:
+        pass
+
+
+def draw_bar(screen, rect, value, vmax, color):
+    pygame.draw.rect(screen, BG, rect)
+    pygame.draw.rect(screen, BORDER, rect, 1)
+    try:
+        frac = 0.0 if vmax <= 0 else max(0.0, min(1.0, float(value) / float(vmax)))
+    except Exception:
+        frac = 0.0
+    inner = pygame.Rect(rect.x + 1, rect.y + 1, int((rect.w - 2) * frac), rect.h - 2)
+    if inner.w > 0:
+        pygame.draw.rect(screen, color, inner)
+
+
+def draw_muf_text(screen, rect, solar, fonts):
+    rows = [
+        ('FOF2', '{} MHz'.format(_safe(solar, 'fof2'))),
+        ('GEOMAG', _safe(solar, 'geomagField')),
+        ('KP', _safe(solar, 'kIndex')),
+        ('SFI', _safe(solar, 'sfi')),
+        ('SSN', _safe(solar, 'ssn')),
+    ]
+    y = rect.y + 20
+    for label, value in rows:
+        _blit_text(screen, fonts['panel'], label, LABEL, rect.x + 20, y)
+        _blit_text(screen, fonts['title'], str(value), BRIGHT, rect.x + 140, y - 4)
+        y += 44
+    _blit_text(screen, fonts['small'], '(Map available in web UI)', LABEL,
+               rect.x + 20, rect.y + rect.h - 20)
+
+
+def draw_dx_spots(screen, rect, dxspots, fonts):
+    if not isinstance(dxspots, list):
+        dxspots = []
+    _blit_text(screen, fonts['label'], 'FREQ', LABEL, rect.x, rect.y)
+    _blit_text(screen, fonts['label'], 'BND', LABEL, rect.x + 90, rect.y)
+    _blit_text(screen, fonts['label'], 'DX', LABEL, rect.x + 140, rect.y)
+    _blit_text(screen, fonts['label'], 'SPOTTER', LABEL, rect.x + 230, rect.y)
+    _blit_text(screen, fonts['label'], 'TIME', LABEL, rect.x + 340, rect.y)
+    y = rect.y + 16
+    for spot in dxspots[:5]:
+        if not isinstance(spot, dict):
+            continue
+        freq = _safe(spot, 'frequency')
+        band = _safe(spot, 'band')
+        dx = _safe(spot, 'dxCall')
+        spotter = _safe(spot, 'spotter')
+        tm = _safe(spot, 'time')
+        _blit_text(screen, fonts['body'], str(freq), ACCENT_GOLD, rect.x, y)
+        _blit_text(screen, fonts['body'], str(band), BAND_COLORS.get(str(band), TEXT), rect.x + 90, y)
+        _blit_text(screen, fonts['body'], str(dx), BRIGHT, rect.x + 140, y)
+        _blit_text(screen, fonts['body'], str(spotter)[:10], TEXT, rect.x + 230, y)
+        _blit_text(screen, fonts['body'], str(tm), LABEL, rect.x + 340, y)
+        y += 16
+
+
+def draw_band_activity(screen, rect, dxspots, fonts):
+    counts = {b: 0 for b in HF_BANDS}
+    if isinstance(dxspots, list):
+        for spot in dxspots:
+            if isinstance(spot, dict):
+                b = spot.get('band')
+                if b in counts:
+                    counts[b] += 1
+    vmax = max(counts.values()) if any(counts.values()) else 1
+    label_w = 40
+    count_w = 36
+    row_h = max(14, (rect.h - 4) // len(HF_BANDS))
+    y = rect.y + 2
+    for band in HF_BANDS:
+        c = counts[band]
+        _blit_text(screen, fonts['label'], band, LABEL, rect.x, y + 1)
+        bar_rect = pygame.Rect(rect.x + label_w, y + 2,
+                               max(1, rect.w - label_w - count_w), row_h - 4)
+        draw_bar(screen, bar_rect, c, vmax, BAND_COLORS.get(band, TEXT))
+        _blit_text(screen, fonts['label'], str(c), BRIGHT,
+                   rect.x + rect.w - count_w + 4, y + 1)
+        y += row_h
+
+
+def draw_tabs(screen, rect, tabs, active, fonts):
+    """Draw a tab bar across rect.y (height 20). Returns {name: Rect}."""
+    regions = {}
+    if not tabs:
+        return regions
+    tw = rect.w // len(tabs)
+    for i, name in enumerate(tabs):
+        tab_rect = pygame.Rect(rect.x + i * tw, rect.y, tw - 2, 20)
+        color = BORDER if name == active else CARD
+        pygame.draw.rect(screen, color, tab_rect)
+        pygame.draw.rect(screen, BORDER, tab_rect, 1)
+        text_color = ACCENT_GOLD if name == active else LABEL
+        _blit_text(screen, fonts['panel'], name.upper(), text_color,
+                   tab_rect.x + 8, tab_rect.y + 2)
+        regions[name] = tab_rect
+    return regions
+
+
+def draw_geomag(screen, rect, solar, fonts):
+    kp = _safe(solar, 'kIndex', 0)
+    try:
+        kp_val = float(kp)
+    except Exception:
+        kp_val = 0.0
+    color = STATUS_GREEN if kp_val < 4 else STATUS_YELLOW if kp_val < 6 else STATUS_RED
+    _blit_text(screen, fonts['body'], 'Kp {}'.format(kp), BRIGHT, rect.x, rect.y + 2)
+    bar_rect = pygame.Rect(rect.x, rect.y + 20, rect.w, 10)
+    draw_bar(screen, bar_rect, kp_val, 9.0, color)
+
+
+def draw_xray(screen, rect, solar, fonts):
+    xray = _safe(solar, 'xray', 'A0.0')
+    s = str(xray)
+    try:
+        letter = s[0]
+        mag = float(s[1:]) if len(s) > 1 else 0.0
+        scale = {'A': 0, 'B': 1, 'C': 2, 'M': 3, 'X': 4}.get(letter.upper(), 0)
+        value = scale + (mag / 10.0)
+    except Exception:
+        value = 0.0
+    color = STATUS_GREEN if value < 2 else STATUS_YELLOW if value < 3 else STATUS_RED
+    _blit_text(screen, fonts['body'], s, BRIGHT, rect.x, rect.y + 2)
+    bar_rect = pygame.Rect(rect.x, rect.y + 20, rect.w, 10)
+    draw_bar(screen, bar_rect, value, 5.0, color)
+
+
+def draw_open_bands(screen, rect, bands, fonts):
+    opens, closes = [], []
+    if isinstance(bands, dict):
+        for key, entry in bands.items():
+            if not isinstance(entry, dict):
+                continue
+            day = entry.get('day', 'N/A')
+            if day in ('Good', 'Fair'):
+                opens.append(key)
+            elif day == 'Poor':
+                closes.append(key)
+    _blit_text(screen, fonts['label'], 'OPEN: ' + (', '.join(opens) or '--'),
+               STATUS_GREEN, rect.x, rect.y)
+    _blit_text(screen, fonts['label'], 'CLOSED: ' + (', '.join(closes) or '--'),
+               STATUS_RED, rect.x, rect.y + 16)
+
+
+def draw_status_bar(screen, rect, data, fonts):
+    pygame.draw.rect(screen, CARD, rect)
+    pygame.draw.rect(screen, BORDER, rect, 1)
+    now = time.time()
+    dage = int(now - data.last_data_refresh) if data.last_data_refresh else -1
+    iage = int(now - data.last_image_refresh) if data.last_image_refresh else -1
+    text = 'Data:{}s  Img:{}s  Solar:{}  Bands:{}  DX:{}'.format(
+        dage if dage >= 0 else '--',
+        iage if iage >= 0 else '--',
+        'OK' if data.solar else '--',
+        'OK' if data.bands else '--',
+        len(data.dxspots) if isinstance(data.dxspots, list) else 0,
+    )
+    _blit_text(screen, fonts['small'], text, LABEL, rect.x + 6, rect.y + 4)
+    _blit_text(screen, fonts['small'], 'ESC/Q to quit', LABEL,
+               rect.x + rect.w - 110, rect.y + 4)
+
+
+def _get_cached_image(data, key, image_cache, image_cache_ts):
+    """Return a pygame Surface for data.images[key], rebuilt when refresh ts changes."""
+    raw = data.images.get(key) if isinstance(data.images, dict) else None
+    if raw is None:
+        return None
+    ts = data.last_image_refresh
+    if image_cache_ts.get(key) != ts or key not in image_cache:
+        surf = _load_image(raw)
+        if surf is not None:
+            image_cache[key] = surf
+            image_cache_ts[key] = ts
+    return image_cache.get(key)
+
+
+def main():
+    if 'DISPLAY' not in os.environ:
+        os.environ.setdefault('SDL_VIDEODRIVER', 'fbcon')
+        os.environ.setdefault('SDL_FBDEV', '/dev/fb0')
+
+    pygame.init()
+    try:
+        pygame.mouse.set_visible(True)
+    except Exception:
+        pass
+
+    try:
+        screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.FULLSCREEN)
+    except pygame.error:
+        try:
+            screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+        except pygame.error:
+            screen = pygame.display.set_mode((800, 600))
+    pygame.display.set_caption('HamClock Lite')
+
+    fonts = _make_fonts()
+
+    data = HamClockData()
+    try:
+        data.start_background(data_interval=60, image_interval=900)
+    except Exception as e:
+        print('data start error:', e, file=sys.stderr)
+
+    active_tab = 'drap'
+    image_cache = {}
+    image_cache_ts = {}
+    tab_regions = {}
+    tab_image_key = {'drap': 'real-drap', 'aurora': 'drap', 'enlil': 'enlil'}
+
+    clock = pygame.time.Clock()
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                    running = False
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                pos = event.pos
+                for name, r in tab_regions.items():
+                    if r.collidepoint(pos):
+                        active_tab = name
+                        break
+
+        sw, sh = screen.get_size()
+        screen.fill(BG)
+
+        header = pygame.Rect(0, 0, sw, 30)
+        callsign = _safe(data.health or {}, 'callsign', 'HAMCLOCK')
+        draw_header(screen, header, callsign, fonts)
+
+        status = pygame.Rect(0, sh - 20, sw, 20)
+        draw_status_bar(screen, status, data, fonts)
+
+        content_top = 32
+        content_bot = sh - 22
+        content_h = content_bot - content_top
+
+        left_w = int(sw * 288 / 1440)
+        mid_w = int(sw * (936 - 288) / 1440)
+        right_w = sw - left_w - mid_w
+
+        # ---- LEFT COLUMN ----
+        lx = 2
+        ly = content_top
+        panel_gap = 4
+        # allocate heights (percent of content_h)
+        heights = [
+            int(content_h * 0.20),  # solar
+            int(content_h * 0.12),  # bands
+            int(content_h * 0.28),  # sdo
+            int(content_h * 0.10),  # geomag
+            int(content_h * 0.10),  # xray
+        ]
+        heights.append(content_h - sum(heights) - panel_gap * 5)  # open bands
+        titles = ['SOLAR', 'BANDS', 'SDO IMAGE', 'GEOMAGNETIC', 'X-RAY FLUX', 'OPEN BANDS']
+        cy = ly
+        panel_rects = []
+        for h, t in zip(heights, titles):
+            r = pygame.Rect(lx, cy, left_w - 4, h)
+            inner = draw_panel(screen, r, t, fonts)
+            panel_rects.append(inner)
+            cy += h + panel_gap
+
+        try:
+            draw_solar(screen, panel_rects[0], data.solar or {}, fonts)
+        except Exception:
+            pass
+        try:
+            draw_bands(screen, panel_rects[1], data.bands or {}, fonts)
+        except Exception:
+            pass
+        try:
+            sdo_surf = _get_cached_image(data, 'solar-image', image_cache, image_cache_ts)
+            draw_image(screen, panel_rects[2], sdo_surf)
+        except Exception:
+            pass
+        try:
+            draw_geomag(screen, panel_rects[3], data.solar or {}, fonts)
+        except Exception:
+            pass
+        try:
+            draw_xray(screen, panel_rects[4], data.solar or {}, fonts)
+        except Exception:
+            pass
+        try:
+            draw_open_bands(screen, panel_rects[5], data.bands or {}, fonts)
+        except Exception:
+            pass
+
+        # ---- MIDDLE COLUMN ----
+        mx = lx + left_w
+        mid_rect = pygame.Rect(mx, content_top, mid_w - 4, content_h)
+        mid_inner = draw_panel(screen, mid_rect, 'MUF STATUS', fonts)
+        try:
+            draw_muf_text(screen, mid_inner, data.solar or {}, fonts)
+        except Exception:
+            pass
+
+        # ---- RIGHT COLUMN ----
+        rx = mx + mid_w
+        rh_dx = int(content_h * 0.28)
+        rh_ba = int(content_h * 0.32)
+        rh_prop = content_h - rh_dx - rh_ba - panel_gap * 2
+
+        dx_r = pygame.Rect(rx, content_top, right_w - 4, rh_dx)
+        dx_inner = draw_panel(screen, dx_r, 'DX SPOTS', fonts)
+        try:
+            draw_dx_spots(screen, dx_inner, data.dxspots or [], fonts)
+        except Exception:
+            pass
+
+        ba_r = pygame.Rect(rx, content_top + rh_dx + panel_gap, right_w - 4, rh_ba)
+        ba_inner = draw_panel(screen, ba_r, 'BAND ACTIVITY', fonts)
+        try:
+            draw_band_activity(screen, ba_inner, data.dxspots or [], fonts)
+        except Exception:
+            pass
+
+        prop_r = pygame.Rect(rx, content_top + rh_dx + rh_ba + panel_gap * 2,
+                             right_w - 4, rh_prop)
+        prop_inner = draw_panel(screen, prop_r, 'PROPAGATION', fonts)
+        tab_bar = pygame.Rect(prop_inner.x, prop_inner.y, prop_inner.w, 20)
+        tab_regions = draw_tabs(screen, tab_bar, ['drap', 'aurora', 'enlil'],
+                                active_tab, fonts)
+        img_rect = pygame.Rect(prop_inner.x, prop_inner.y + 24,
+                               prop_inner.w, prop_inner.h - 24)
+        try:
+            key = tab_image_key.get(active_tab, 'real-drap')
+            surf = _get_cached_image(data, key, image_cache, image_cache_ts)
+            draw_image(screen, img_rect, surf)
+        except Exception:
+            pass
+
+        pygame.display.flip()
+        clock.tick(10)
+
+    try:
+        data.stop()
+    except Exception:
+        pass
+    pygame.quit()
+
+
+if __name__ == '__main__':
+    main()
+HCPYEOF
+
+echo "Writing hamclock_tkinter.py..."
+sudo tee "$INSTALL_DIR/hamclock_tkinter.py" > /dev/null << 'HCTKEOF'
+"""HamClock Lite native Tkinter client.
+
+A minimal-dependency native GUI that replaces the browser-based HamClock Lite
+dashboard on Raspberry Pi 1 Model B (700 MHz ARMv6, 512 MB RAM). Fetches data
+from the existing HamClock server at http://localhost:8080/api/* via the
+shared hamclock_data.HamClockData class and renders the dashboard using
+native Tkinter widgets, saving significant RAM/CPU vs. a browser stack.
+
+Apt dependencies (Raspberry Pi OS):
+    sudo apt install python3-tk python3-pil python3-pil.imagetk
+
+Tkinter's built-in PhotoImage handles GIF/PGM/PNG but NOT JPEG, so Pillow
+(PIL) is used for image decoding. If Pillow is unavailable, the image panels
+are hidden gracefully and the rest of the dashboard still works.
+
+Usage:
+    python3 hamclock_tkinter.py
+
+Press Escape to exit fullscreen.
+
+Target viewport: 1440x900 fullscreen (scales gracefully on smaller screens).
+"""
+
+import io
+import time
+import tkinter as tk
+from tkinter import ttk
+
+from hamclock_data import HamClockData
+
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL = True
+except ImportError:  # Pillow missing — degrade image panels gracefully
+    HAS_PIL = False
+
+
+# ---------- Theme (K-State royal purple + gold) ----------
+BG = '#2a1450'
+CARD = '#3a1d65'
+BORDER = '#512888'
+TEXT = '#e8ddf5'
+LABEL = '#b8a0d8'
+BRIGHT = '#ffffff'
+ACCENT_GOLD = '#f4c55c'
+
+COND_COLORS = {
+    'Good': '#22c55e',
+    'Fair': '#eab308',
+    'Poor': '#ef4444',
+    'N/A': '#4a5568',
+}
+
+BAND_COLORS = {
+    '160m': '#ff6b6b', '80m': '#f06595', '60m': '#cc5de8', '40m': '#845ef7',
+    '30m': '#5c7cfa', '20m': '#339af0', '17m': '#22b8cf', '15m': '#20c997',
+    '12m': '#51cf66', '10m': '#94d82d',
+}
+BAND_ORDER = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m', '12m', '10m']
+
+# Fonts — DejaVu Sans Mono is standard on Raspberry Pi OS.
+FONT_TITLE = ('DejaVu Sans Mono', 12, 'bold')
+FONT_BODY = ('DejaVu Sans Mono', 11)
+FONT_VALUE = ('DejaVu Sans Mono', 11, 'bold')
+FONT_LABEL = ('DejaVu Sans Mono', 9)
+FONT_HEADER = ('DejaVu Sans Mono', 18, 'bold')
+FONT_CLOCK = ('DejaVu Sans Mono', 13, 'bold')
+
+
+def _safe(v, default='—'):
+    """Return str(v) or placeholder if v is empty/None/'N/A'."""
+    if v is None:
+        return default
+    s = str(v).strip()
+    if not s or s.upper() == 'N/A':
+        return default
+    return s
+
+
+def _make_panel(parent, title):
+    """Create a titled card Frame; return (outer, body) where body holds content."""
+    outer = tk.Frame(
+        parent, bg=CARD, bd=1, relief='solid',
+        highlightbackground=BORDER, highlightthickness=1,
+    )
+    header = tk.Label(
+        outer, text=title, bg=BORDER, fg=ACCENT_GOLD,
+        font=FONT_TITLE, anchor='w', padx=8, pady=3,
+    )
+    header.pack(side='top', fill='x')
+    body = tk.Frame(outer, bg=CARD, padx=8, pady=6)
+    body.pack(side='top', fill='both', expand=True)
+    return outer, body
+
+
+def _kv_row(body, row, label, initial='—'):
+    """Place a label/value pair in a 2-column grid row. Returns the value Label."""
+    tk.Label(
+        body, text=label, bg=CARD, fg=LABEL, font=FONT_LABEL,
+        anchor='w',
+    ).grid(row=row, column=0, sticky='w', padx=(0, 6))
+    val = tk.Label(
+        body, text=initial, bg=CARD, fg=BRIGHT, font=FONT_VALUE,
+        anchor='e',
+    )
+    val.grid(row=row, column=1, sticky='e')
+    body.grid_columnconfigure(0, weight=1)
+    body.grid_columnconfigure(1, weight=0)
+    return val
+
+
+class HamClockTkApp:
+    """Native Tkinter HamClock Lite dashboard."""
+
+    def __init__(self, root):
+        self.root = root
+        self.data = HamClockData()
+        self.data.start_background()
+
+        root.configure(bg=BG)
+        root.title('HamClock Lite')
+        root.geometry('1440x900')
+        try:
+            root.attributes('-fullscreen', True)
+        except Exception:
+            pass
+        root.bind('<Escape>', lambda _e: root.destroy())
+        root.bind('<F11>', self._toggle_fullscreen)
+
+        # ttk theme for Treeview / Notebook
+        style = ttk.Style()
+        try:
+            style.theme_use('clam')
+        except tk.TclError:
+            pass
+        style.configure(
+            'HC.Treeview',
+            background=CARD, foreground=TEXT, fieldbackground=CARD,
+            rowheight=18, borderwidth=0, font=FONT_LABEL,
+        )
+        style.configure(
+            'HC.Treeview.Heading',
+            background=BORDER, foreground=ACCENT_GOLD, font=FONT_LABEL,
+        )
+        style.map('HC.Treeview', background=[('selected', BORDER)])
+        style.configure('HC.TNotebook', background=CARD, borderwidth=0)
+        style.configure(
+            'HC.TNotebook.Tab',
+            background=CARD, foreground=LABEL,
+            padding=[8, 3], font=FONT_LABEL,
+        )
+        style.map(
+            'HC.TNotebook.Tab',
+            background=[('selected', BORDER)],
+            foreground=[('selected', ACCENT_GOLD)],
+        )
+
+        self._value_labels = {}
+        self._last_image_ts = 0
+        self._image_refs = {}  # hold refs to prevent GC
+
+        self._build_ui()
+        self._update_ui()
+
+    def _toggle_fullscreen(self, _e=None):
+        try:
+            cur = bool(self.root.attributes('-fullscreen'))
+            self.root.attributes('-fullscreen', not cur)
+        except Exception:
+            pass
+
+    # ----- UI construction -----
+    def _build_ui(self):
+        self.root.grid_rowconfigure(0, weight=0)
+        self.root.grid_rowconfigure(1, weight=1)
+        self.root.grid_rowconfigure(2, weight=0)
+        for c in range(3):
+            self.root.grid_columnconfigure(c, weight=1, uniform='col')
+
+        # --- Header bar ---
+        header = tk.Frame(self.root, bg=BORDER, bd=0)
+        header.grid(row=0, column=0, columnspan=3, sticky='ew', padx=4, pady=(4, 2))
+        tk.Label(
+            header, text='HAMCLOCK LITE', bg=BORDER, fg=ACCENT_GOLD,
+            font=FONT_HEADER, padx=10, pady=6,
+        ).pack(side='left')
+        tk.Label(
+            header, text='W0QQQ', bg=BORDER, fg=TEXT, font=FONT_BODY,
+        ).pack(side='left', padx=(4, 10))
+        self.status_dot = tk.Label(
+            header, text='\u25cf', bg=BORDER, fg='#ef4444',
+            font=FONT_HEADER,
+        )
+        self.status_dot.pack(side='right', padx=8)
+        self.local_lbl = tk.Label(
+            header, text='LOCAL --:--:--', bg=BORDER, fg=TEXT, font=FONT_CLOCK,
+        )
+        self.local_lbl.pack(side='right', padx=10)
+        self.utc_lbl = tk.Label(
+            header, text='UTC --:--:--', bg=BORDER, fg=BRIGHT, font=FONT_CLOCK,
+        )
+        self.utc_lbl.pack(side='right', padx=10)
+
+        # --- Columns ---
+        col_left = tk.Frame(self.root, bg=BG)
+        col_mid = tk.Frame(self.root, bg=BG)
+        col_right = tk.Frame(self.root, bg=BG)
+        col_left.grid(row=1, column=0, sticky='nsew', padx=4, pady=2)
+        col_mid.grid(row=1, column=1, sticky='nsew', padx=4, pady=2)
+        col_right.grid(row=1, column=2, sticky='nsew', padx=4, pady=2)
+
+        self._build_left_column(col_left)
+        self._build_middle_column(col_mid)
+        self._build_right_column(col_right)
+
+        # --- Status bar ---
+        self.status_bar = tk.Label(
+            self.root, text='Solar:— Bands:— DX:—',
+            bg=BORDER, fg=LABEL, font=FONT_LABEL, anchor='w', padx=8, pady=2,
+        )
+        self.status_bar.grid(row=2, column=0, columnspan=3, sticky='ew', padx=4, pady=(2, 4))
+
+    def _build_left_column(self, col):
+        # SOLAR
+        solar_p, solar_b = _make_panel(col, 'SOLAR')
+        solar_p.pack(fill='x', pady=(0, 4))
+        for i, (k, lbl) in enumerate([
+            ('sfi', 'SFI'), ('ssn', 'SSN'), ('aIndex', 'A-Index'),
+            ('kIndex', 'K-Index'), ('xray', 'X-Ray'), ('solarWind', 'Solar Wind'),
+            ('protonFlux', 'Proton Flux'), ('aurora', 'Aurora'),
+        ]):
+            self._value_labels['solar_' + k] = _kv_row(solar_b, i, lbl)
+
+        # BANDS
+        bands_p, bands_b = _make_panel(col, 'BANDS')
+        bands_p.pack(fill='x', pady=4)
+        tk.Label(bands_b, text='BAND', bg=CARD, fg=LABEL, font=FONT_LABEL,
+                 anchor='w').grid(row=0, column=0, sticky='w', padx=(0, 8))
+        tk.Label(bands_b, text='DAY', bg=CARD, fg=LABEL, font=FONT_LABEL,
+                 anchor='center').grid(row=0, column=1, sticky='ew', padx=4)
+        tk.Label(bands_b, text='NIGHT', bg=CARD, fg=LABEL, font=FONT_LABEL,
+                 anchor='center').grid(row=0, column=2, sticky='ew', padx=4)
+        bands_b.grid_columnconfigure(0, weight=1)
+        bands_b.grid_columnconfigure(1, weight=0, minsize=60)
+        bands_b.grid_columnconfigure(2, weight=0, minsize=60)
+        self._band_rows = {}
+        for i, band in enumerate(['80m-40m', '30m-20m', '17m-15m', '12m-10m'], start=1):
+            tk.Label(bands_b, text=band, bg=CARD, fg=TEXT, font=FONT_BODY,
+                     anchor='w').grid(row=i, column=0, sticky='w', padx=(0, 8), pady=1)
+            day = tk.Label(bands_b, text='—', bg=COND_COLORS['N/A'], fg=BRIGHT,
+                           font=FONT_LABEL, width=7)
+            day.grid(row=i, column=1, sticky='ew', padx=2, pady=1)
+            night = tk.Label(bands_b, text='—', bg=COND_COLORS['N/A'], fg=BRIGHT,
+                             font=FONT_LABEL, width=7)
+            night.grid(row=i, column=2, sticky='ew', padx=2, pady=1)
+            self._band_rows[band] = (day, night)
+
+        # SDO IMAGE
+        sdo_p, sdo_b = _make_panel(col, 'SDO IMAGE')
+        sdo_p.pack(fill='x', pady=4)
+        self.sdo_label = tk.Label(
+            sdo_b, text='(image unavailable)' if not HAS_PIL else '(loading...)',
+            bg=CARD, fg=LABEL, font=FONT_LABEL,
+        )
+        self.sdo_label.pack()
+
+        # GEOMAGNETIC (Kp bar)
+        geo_p, geo_b = _make_panel(col, 'GEOMAGNETIC')
+        geo_p.pack(fill='x', pady=4)
+        self.kp_value = tk.Label(geo_b, text='Kp —', bg=CARD, fg=BRIGHT,
+                                 font=FONT_VALUE)
+        self.kp_value.pack(anchor='w')
+        self.kp_canvas = tk.Canvas(geo_b, height=14, bg=CARD, bd=0,
+                                   highlightthickness=0)
+        self.kp_canvas.pack(fill='x', pady=(2, 0))
+
+        # X-RAY bar
+        xray_p, xray_b = _make_panel(col, 'X-RAY')
+        xray_p.pack(fill='x', pady=4)
+        self.xray_value = tk.Label(xray_b, text='—', bg=CARD, fg=BRIGHT,
+                                   font=FONT_VALUE)
+        self.xray_value.pack(anchor='w')
+        self.xray_canvas = tk.Canvas(xray_b, height=14, bg=CARD, bd=0,
+                                     highlightthickness=0)
+        self.xray_canvas.pack(fill='x', pady=(2, 0))
+
+        # OPEN BANDS
+        open_p, open_b = _make_panel(col, 'OPEN BANDS')
+        open_p.pack(fill='x', pady=(4, 0))
+        self.open_lbl = tk.Label(
+            open_b, text='OPEN: —', bg=CARD, fg='#22c55e', font=FONT_BODY,
+            anchor='w', justify='left', wraplength=360,
+        )
+        self.open_lbl.pack(anchor='w', fill='x')
+        self.closed_lbl = tk.Label(
+            open_b, text='CLOSED: —', bg=CARD, fg='#ef4444', font=FONT_BODY,
+            anchor='w', justify='left', wraplength=360,
+        )
+        self.closed_lbl.pack(anchor='w', fill='x')
+
+    def _build_middle_column(self, col):
+        muf_p, muf_b = _make_panel(col, 'MUF STATUS')
+        muf_p.pack(fill='x', pady=(0, 4))
+        for i, (k, lbl) in enumerate([
+            ('fof2', 'foF2 (MHz)'),
+            ('geomagField', 'Geomag Field'),
+            ('kIndex', 'K-Index'),
+            ('sfi', 'SFI'),
+            ('ssn', 'SSN'),
+            ('heliumLine', 'Helium Line'),
+            ('signalNoise', 'Signal/Noise'),
+            ('magneticField', 'Magnetic Field'),
+        ]):
+            self._value_labels['muf_' + k] = _kv_row(muf_b, i, lbl)
+
+        # Info / update panel
+        info_p, info_b = _make_panel(col, 'STATION')
+        info_p.pack(fill='both', expand=True, pady=4)
+        self.updated_lbl = tk.Label(
+            info_b, text='Updated: —', bg=CARD, fg=LABEL, font=FONT_LABEL,
+            anchor='w', justify='left', wraplength=360,
+        )
+        self.updated_lbl.pack(anchor='w', fill='x', pady=(0, 4))
+        self.server_lbl = tk.Label(
+            info_b, text='Server: ' + self.data.server_url, bg=CARD, fg=LABEL,
+            font=FONT_LABEL, anchor='w',
+        )
+        self.server_lbl.pack(anchor='w', fill='x')
+        self.errors_lbl = tk.Label(
+            info_b, text='', bg=CARD, fg='#ef4444', font=FONT_LABEL,
+            anchor='nw', justify='left', wraplength=360,
+        )
+        self.errors_lbl.pack(anchor='w', fill='x', pady=(6, 0))
+
+    def _build_right_column(self, col):
+        # DX SPOTS (Treeview)
+        dx_p, dx_b = _make_panel(col, 'DX SPOTS')
+        dx_p.pack(fill='x', pady=(0, 4))
+        cols = ('freq', 'band', 'dx', 'de', 'utc')
+        self.dx_tree = ttk.Treeview(
+            dx_b, columns=cols, show='headings', height=8, style='HC.Treeview',
+        )
+        widths = {'freq': 70, 'band': 50, 'dx': 90, 'de': 90, 'utc': 50}
+        for c in cols:
+            self.dx_tree.heading(c, text=c.upper())
+            self.dx_tree.column(c, width=widths[c], anchor='w', stretch=True)
+        self.dx_tree.pack(fill='both', expand=True)
+
+        # BAND ACTIVITY — Canvas bars
+        act_p, act_b = _make_panel(col, 'BAND ACTIVITY')
+        act_p.pack(fill='x', pady=4)
+        self.activity_canvas = tk.Canvas(
+            act_b, height=180, bg=CARD, bd=0, highlightthickness=0,
+        )
+        self.activity_canvas.pack(fill='x')
+
+        # PROPAGATION — ttk.Notebook with tabs for DRAP/AURORA/ENLIL
+        prop_p, prop_b = _make_panel(col, 'PROPAGATION')
+        prop_p.pack(fill='both', expand=True, pady=(4, 0))
+        self.prop_nb = ttk.Notebook(prop_b, style='HC.TNotebook')
+        self.prop_nb.pack(fill='both', expand=True)
+        self.prop_tabs = {}
+        for key, title in [('real-drap', 'DRAP'), ('drap', 'AURORA'),
+                           ('enlil', 'ENLIL')]:
+            frame = tk.Frame(self.prop_nb, bg=CARD)
+            lbl = tk.Label(
+                frame, text='(loading...)' if HAS_PIL else '(PIL missing)',
+                bg=CARD, fg=LABEL, font=FONT_LABEL,
+            )
+            lbl.pack(expand=True)
+            self.prop_nb.add(frame, text=title)
+            self.prop_tabs[key] = lbl
+
+    # ----- Image helpers -----
+    def _load_image(self, data_bytes, max_w, max_h):
+        if not data_bytes or not HAS_PIL:
+            return None
+        try:
+            img = Image.open(io.BytesIO(data_bytes))
+            img.thumbnail((max_w, max_h), Image.LANCZOS)
+            return ImageTk.PhotoImage(img)
+        except Exception:
+            return None
+
+    def _set_image(self, label, key, photo):
+        """Assign photo to label; hold ref to prevent GC."""
+        if photo is None:
+            return
+        self._image_refs[key] = photo
+        label.configure(image=photo, text='')
+        label.image_ref = photo  # belt and suspenders
+
+    # ----- Update loop -----
+    def _update_ui(self):
+        try:
+            self._update_clocks()
+            self._update_solar()
+            self._update_muf()
+            self._update_bands()
+            self._update_dxspots()
+            self._update_band_activity()
+            self._update_open_closed()
+            self._update_images()
+            self._update_status()
+        except Exception as e:
+            try:
+                self.status_bar.configure(text='update error: {}'.format(e))
+            except Exception:
+                pass
+        self.root.after(1000, self._update_ui)
+
+    def _update_clocks(self):
+        now = time.time()
+        self.utc_lbl.configure(text='UTC ' + time.strftime('%H:%M:%S', time.gmtime(now)))
+        self.local_lbl.configure(text='LOCAL ' + time.strftime('%H:%M:%S', time.localtime(now)))
+        ok = bool(self.data.last_data_refresh) and (now - self.data.last_data_refresh) < 180
+        self.status_dot.configure(fg='#22c55e' if ok else '#ef4444')
+
+    def _update_solar(self):
+        s = self.data.solar or {}
+        for key in ['sfi', 'ssn', 'aIndex', 'kIndex', 'xray', 'solarWind',
+                    'protonFlux', 'aurora']:
+            self._value_labels['solar_' + key].configure(text=_safe(s.get(key)))
+
+        # Kp bar (0-9 scale)
+        kp_raw = s.get('kIndex')
+        try:
+            kp = float(kp_raw)
+        except (TypeError, ValueError):
+            kp = None
+        self.kp_value.configure(text='Kp ' + (_safe(kp_raw)))
+        self._draw_bar(self.kp_canvas, kp, 9.0,
+                       ['#22c55e', '#22c55e', '#22c55e', '#22c55e',
+                        '#eab308', '#eab308', '#ef4444', '#ef4444',
+                        '#ef4444', '#ef4444'])
+
+        # X-Ray bar
+        xray_raw = s.get('xray') or ''
+        self.xray_value.configure(text=_safe(xray_raw))
+        xv = self._xray_to_scalar(xray_raw)
+        self._draw_bar(self.xray_canvas, xv, 5.0,
+                       ['#22c55e', '#84cc16', '#eab308', '#f97316', '#ef4444'])
+
+    def _xray_to_scalar(self, xray):
+        """Convert NOAA xray class (e.g. 'B4.0', 'M1.5', 'X2.0') to 0..5 scalar."""
+        if not xray or len(xray) < 2:
+            return None
+        cls = xray[0].upper()
+        try:
+            mag = float(xray[1:])
+        except ValueError:
+            mag = 1.0
+        # Normalize within class: 1-9 → 0..1
+        frac = max(0.0, min(1.0, (mag - 1.0) / 8.0))
+        base = {'A': 0, 'B': 1, 'C': 2, 'M': 3, 'X': 4}.get(cls, 0)
+        return base + frac
+
+    def _draw_bar(self, canvas, value, max_val, gradient_colors):
+        canvas.delete('all')
+        w = int(canvas.winfo_width()) or 360
+        h = int(canvas.winfo_height()) or 14
+        canvas.create_rectangle(0, 0, w, h, fill='#1a0a30', outline=BORDER)
+        if value is None or max_val <= 0:
+            return
+        frac = max(0.0, min(1.0, value / max_val))
+        fill_w = int(w * frac)
+        if fill_w < 1:
+            return
+        idx = min(len(gradient_colors) - 1, int(frac * len(gradient_colors)))
+        canvas.create_rectangle(0, 0, fill_w, h,
+                                fill=gradient_colors[idx], outline='')
+
+    def _update_muf(self):
+        s = self.data.solar or {}
+        for key in ['fof2', 'geomagField', 'kIndex', 'sfi', 'ssn',
+                    'heliumLine', 'signalNoise', 'magneticField']:
+            self._value_labels['muf_' + key].configure(text=_safe(s.get(key)))
+        self.updated_lbl.configure(text='Updated: ' + _safe(s.get('updated')))
+
+    def _update_bands(self):
+        b = self.data.bands or {}
+        for band, (day_lbl, night_lbl) in self._band_rows.items():
+            entry = b.get(band) or {}
+            day = entry.get('day') or 'N/A'
+            night = entry.get('night') or 'N/A'
+            day_lbl.configure(text=day, bg=COND_COLORS.get(day, COND_COLORS['N/A']))
+            night_lbl.configure(text=night, bg=COND_COLORS.get(night, COND_COLORS['N/A']))
+
+    def _update_dxspots(self):
+        spots = self.data.dxspots or []
+        existing = self.dx_tree.get_children()
+        if len(existing) != min(len(spots), 12):
+            self.dx_tree.delete(*existing)
+            existing = ()
+        rows = spots[:12]
+        if not existing:
+            for sp in rows:
+                utc = (sp.get('time') or '')[:4]
+                self.dx_tree.insert('', 'end', values=(
+                    _safe(sp.get('frequency')),
+                    _safe(sp.get('band')),
+                    _safe(sp.get('dx')),
+                    _safe(sp.get('spotter')),
+                    utc,
+                ))
+        else:
+            for iid, sp in zip(existing, rows):
+                utc = (sp.get('time') or '')[:4]
+                self.dx_tree.item(iid, values=(
+                    _safe(sp.get('frequency')),
+                    _safe(sp.get('band')),
+                    _safe(sp.get('dx')),
+                    _safe(sp.get('spotter')),
+                    utc,
+                ))
+
+    def _update_band_activity(self):
+        canvas = self.activity_canvas
+        canvas.delete('all')
+        spots = self.data.dxspots or []
+        counts = {}
+        for sp in spots:
+            band = sp.get('band')
+            if band in BAND_COLORS:
+                counts[band] = counts.get(band, 0) + 1
+        max_count = max(counts.values()) if counts else 1
+
+        w = int(canvas.winfo_width()) or 380
+        h = int(canvas.winfo_height()) or 180
+        rows = len(BAND_ORDER)
+        row_h = max(12, h // rows)
+        label_w = 44
+        bar_x0 = label_w + 4
+        bar_max = max(40, w - bar_x0 - 40)
+        for i, band in enumerate(BAND_ORDER):
+            y = i * row_h + 2
+            canvas.create_text(
+                4, y + row_h / 2 - 2, text=band, anchor='w',
+                fill=LABEL, font=FONT_LABEL,
+            )
+            count = counts.get(band, 0)
+            frac = count / max_count if max_count else 0
+            bar_w = int(bar_max * frac)
+            if bar_w > 0:
+                canvas.create_rectangle(
+                    bar_x0, y, bar_x0 + bar_w, y + row_h - 4,
+                    fill=BAND_COLORS[band], outline='',
+                )
+            canvas.create_text(
+                bar_x0 + bar_w + 4, y + row_h / 2 - 2,
+                text=str(count), anchor='w', fill=TEXT, font=FONT_LABEL,
+            )
+
+    def _update_open_closed(self):
+        b = self.data.bands or {}
+        open_list = []
+        closed_list = []
+        for band, entry in b.items():
+            if not isinstance(entry, dict):
+                continue
+            day = entry.get('day') or 'N/A'
+            night = entry.get('night') or 'N/A'
+            if day == 'Good' or night == 'Good':
+                open_list.append(band)
+            elif day == 'Poor' and night == 'Poor':
+                closed_list.append(band)
+        self.open_lbl.configure(
+            text='OPEN: ' + (', '.join(open_list) if open_list else '—'),
+        )
+        self.closed_lbl.configure(
+            text='CLOSED: ' + (', '.join(closed_list) if closed_list else '—'),
+        )
+
+    def _update_images(self):
+        ts = self.data.last_image_refresh
+        if ts == self._last_image_ts:
+            return
+        self._last_image_ts = ts
+        imgs = self.data.images or {}
+
+        sdo = self._load_image(imgs.get('solar-image'), 360, 220)
+        if sdo is not None:
+            self._set_image(self.sdo_label, 'sdo', sdo)
+        elif not HAS_PIL:
+            self.sdo_label.configure(text='(PIL missing)')
+
+        for key, label in self.prop_tabs.items():
+            photo = self._load_image(imgs.get(key), 380, 260)
+            if photo is not None:
+                self._set_image(label, 'prop_' + key, photo)
+            elif not HAS_PIL:
+                label.configure(text='(PIL missing)')
+            else:
+                label.configure(text='(no image)')
+
+    def _update_status(self):
+        now = time.time()
+        d_age = int(now - self.data.last_data_refresh) if self.data.last_data_refresh else -1
+        i_age = int(now - self.data.last_image_refresh) if self.data.last_image_refresh else -1
+        def fmt(a):
+            return '{}s'.format(a) if a >= 0 else '—'
+        errs = [k for k, v in (self.data.errors or {}).items() if v]
+        status = 'Data:{}  Images:{}  Spots:{}  Errors:{}'.format(
+            fmt(d_age), fmt(i_age),
+            len(self.data.dxspots or []), len(errs),
+        )
+        self.status_bar.configure(text=status)
+        if errs:
+            self.errors_lbl.configure(text='Errors: ' + ', '.join(errs[:3]))
+        else:
+            self.errors_lbl.configure(text='')
+
+
+def main():
+    root = tk.Tk()
+    HamClockTkApp(root)
+    root.mainloop()
+
+
+if __name__ == '__main__':
+    main()
+HCTKEOF
+
 # ── Step 5: Create hamclock-lite systemd service ────────────────────
 echo "Creating HamClock server service..."
 if ! systemctl is-enabled hamclock-lite &>/dev/null; then
@@ -1506,32 +2856,45 @@ EOF
     sudo systemctl start hamclock-lite
 fi
 
-# ── Step 6: Install X server packages ───────────────────────────────
-echo "Installing display server and browser (this may take 15-30 minutes on a Pi 1)..."
+# ── Step 6: Install X server packages (browser/tkinter modes) ──────
+echo "Installing display server packages (this may take 15-30 minutes on a Pi 1)..."
 sudo apt update
-sudo apt install -y xserver-xorg xinit x11-xserver-utils unclutter curl matchbox-window-manager
+if [ "$KIOSK_MODE" = "browser" ] || [ "$KIOSK_MODE" = "tkinter" ]; then
+    sudo apt install -y xserver-xorg xinit x11-xserver-utils unclutter curl matchbox-window-manager
+else
+    sudo apt install -y curl
+fi
 
-# ── Step 7: Try browser fallback chain ──────────────────────────────
+# Mode-specific Python packages
+if [ "$KIOSK_MODE" = "pygame" ]; then
+    sudo apt install -y python3-pygame
+elif [ "$KIOSK_MODE" = "tkinter" ]; then
+    sudo apt install -y python3-tk python3-pil python3-pil.imagetk
+fi
+
+# ── Step 7: Try browser fallback chain (browser mode only) ─────────
 BROWSER=""
 BROWSER_CMD=""
-for pkg in surf epiphany-browser midori chromium-browser chromium; do
-    if sudo apt install -y "$pkg" 2>&1 | tail -1; then
-        case "$pkg" in
-            surf) BROWSER="surf"; BROWSER_CMD="surf http://localhost:8080" ;;
-            epiphany-browser) BROWSER="epiphany"; BROWSER_CMD="epiphany-browser --application-mode http://localhost:8080" ;;
-            midori) BROWSER="midori"; BROWSER_CMD="midori -e Fullscreen -a http://localhost:8080" ;;
-            chromium-browser|chromium) BROWSER="chromium"; BROWSER_CMD="$pkg --kiosk --noerrdialogs --disable-translate --no-first-run --disable-features=TranslateUI --disk-cache-size=0 http://localhost:8080" ;;
-        esac
-        break
-    fi
-done
+if [ "$KIOSK_MODE" = "browser" ]; then
+    for pkg in surf epiphany-browser midori chromium-browser chromium; do
+        if sudo apt install -y "$pkg" 2>&1 | tail -1; then
+            case "$pkg" in
+                surf) BROWSER="surf"; BROWSER_CMD="surf http://localhost:8080" ;;
+                epiphany-browser) BROWSER="epiphany"; BROWSER_CMD="epiphany-browser --application-mode http://localhost:8080" ;;
+                midori) BROWSER="midori"; BROWSER_CMD="midori -e Fullscreen -a http://localhost:8080" ;;
+                chromium-browser|chromium) BROWSER="chromium"; BROWSER_CMD="$pkg --kiosk --noerrdialogs --disable-translate --no-first-run --disable-features=TranslateUI --disk-cache-size=0 http://localhost:8080" ;;
+            esac
+            break
+        fi
+    done
 
-if [ -z "$BROWSER" ]; then
-    echo "ERROR: Could not install any browser (tried surf, epiphany, midori, chromium)."
-    echo "Please install a browser manually and re-run this script."
-    exit 1
+    if [ -z "$BROWSER" ]; then
+        echo "ERROR: Could not install any browser (tried surf, epiphany, midori, chromium)."
+        echo "Please install a browser manually and re-run this script."
+        exit 1
+    fi
+    echo "Browser installed: $BROWSER"
 fi
-echo "Browser installed: $BROWSER"
 
 # ── Step 8: Set Xwrapper.config ─────────────────────────────────────
 sudo mkdir -p /etc/X11
@@ -1567,8 +2930,9 @@ Section "Monitor"
 EndSection
 MONEOF
 
-# ── Step 9: Create kiosk.sh launch script ───────────────────────────
-sudo tee /opt/hamclock-lite/kiosk.sh > /dev/null <<KIOSKEOF
+# ── Step 9: Create kiosk.sh launch script (mode-specific) ──────────
+if [ "$KIOSK_MODE" = "browser" ]; then
+    sudo tee /opt/hamclock-lite/kiosk.sh > /dev/null <<KIOSKEOF
 #!/bin/bash
 # Wait for HamClock server to be ready
 for i in \$(seq 1 30); do
@@ -1590,10 +2954,61 @@ sleep 1
 # Launch browser (matchbox will maximize it)
 exec $BROWSER_CMD
 KIOSKEOF
+elif [ "$KIOSK_MODE" = "tkinter" ]; then
+    sudo tee /opt/hamclock-lite/kiosk.sh > /dev/null <<'KIOSKEOF'
+#!/bin/bash
+for i in $(seq 1 30); do
+    if curl -s http://localhost:8080/api/health > /dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+xset s off
+xset -dpms
+xset s noblank
+exec python3 /opt/hamclock-lite/hamclock_tkinter.py
+KIOSKEOF
+elif [ "$KIOSK_MODE" = "pygame" ]; then
+    sudo tee /opt/hamclock-lite/kiosk.sh > /dev/null <<'KIOSKEOF'
+#!/bin/bash
+for i in $(seq 1 30); do
+    if curl -s http://localhost:8080/api/health > /dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+export SDL_VIDEODRIVER=fbcon
+export SDL_FBDEV=/dev/fb0
+exec python3 /opt/hamclock-lite/hamclock_pygame.py
+KIOSKEOF
+fi
 sudo chmod +x /opt/hamclock-lite/kiosk.sh
 
-# ── Step 10: Create hamclock-kiosk systemd service ──────────────────
-sudo tee /etc/systemd/system/hamclock-kiosk.service > /dev/null <<EOF
+# ── Step 10: Create hamclock-kiosk systemd service (mode-specific) ──
+if [ "$KIOSK_MODE" = "pygame" ]; then
+    sudo tee /etc/systemd/system/hamclock-kiosk.service > /dev/null <<EOF
+[Unit]
+Description=HamClock Kiosk Display (pygame framebuffer)
+After=hamclock-lite.service
+Wants=hamclock-lite.service
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty7
+TTYReset=yes
+TTYVHangup=yes
+ExecStart=/opt/hamclock-lite/kiosk.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+else
+    sudo tee /etc/systemd/system/hamclock-kiosk.service > /dev/null <<EOF
 [Unit]
 Description=HamClock Kiosk Display
 After=hamclock-lite.service
@@ -1615,6 +3030,7 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
 
 # ── Step 11: Fix consoleblank in cmdline.txt ────────────────────────
 CMDLINE=""
@@ -1652,11 +3068,17 @@ sudo systemctl restart hamclock-kiosk
 PI_IP=$(hostname -I | awk '{print $1}')
 
 echo ""
-echo "=== Installation Complete — Kiosk Mode Installed ==="
+echo "=== Installation Complete — Kiosk Mode Installed ($KIOSK_MODE) ==="
 echo "HamClock will now display fullscreen on this Pi's monitor."
 echo "It will auto-start on every boot."
 echo ""
-echo "Browser: $BROWSER"
+if [ "$KIOSK_MODE" = "browser" ]; then
+    echo "Display: browser ($BROWSER)"
+elif [ "$KIOSK_MODE" = "tkinter" ]; then
+    echo "Display: native tkinter client (Python/X11)"
+elif [ "$KIOSK_MODE" = "pygame" ]; then
+    echo "Display: native pygame client (framebuffer, no X)"
+fi
 echo ""
 echo "Commands:"
 echo "  sudo systemctl status hamclock-kiosk   — check kiosk status"
