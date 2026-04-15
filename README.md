@@ -295,4 +295,99 @@ This skips the display server and kiosk setup. The dashboard runs as a web serve
 
 ---
 
+## Alternative: Native Display Modes (Lower RAM/CPU than a Browser)
+
+The default kiosk install uses a browser (surf/midori/chromium) to render the dashboard. A browser on Pi 1 uses ~30–80 MB of RAM and takes 3–10 seconds to start. For even lighter operation, HamClock Lite ships **two optional native clients** that fetch data from the same `/api/*` endpoints and render the dashboard without any browser or HTML/CSS/JS engine.
+
+Both native clients talk to the same `server.py` (no server changes — they just replace the display layer). You can run the server in headless mode (`./install.sh`) and then launch a native client alongside it.
+
+### Option A — Pygame framebuffer client (`hamclock_pygame.py`)
+
+The lowest-overhead option. Uses Pygame to draw directly to the Linux framebuffer — skips X11 entirely on the Pi 1. Target footprint: ~15–20 MB RAM, <1 second startup.
+
+Install dependencies and run:
+
+```bash
+sudo apt install -y python3-pygame
+python3 /opt/hamclock-lite/hamclock_pygame.py
+```
+
+Or run from the repo:
+
+```bash
+cd ~/hamclock-pi1
+python3 hamclock_pygame.py
+```
+
+Behavior:
+- If `$DISPLAY` is set, renders in an X window (1440×900 or fullscreen)
+- If `$DISPLAY` is unset, renders directly to `/dev/fb0` via SDL's `fbcon` driver — no X needed
+- Press **Esc** or **Q** to quit
+- Click the DRAP / AURORA / ENLIL tabs in the bottom-right panel to switch space-weather images
+- Ticks at 10 FPS to keep CPU usage low
+
+Known limitations vs the browser version:
+- **No MUF map** (it's an SVG, and Pygame doesn't render SVG without extra dependencies). A text-based "MUF STATUS" panel showing FOF2, KP, SFI, SSN, and geomag is rendered in its place.
+- Only the K-State color theme is hardcoded. No theme switching.
+- No setup wizard — callsign is displayed from saved settings or left blank.
+
+### Option B — Tkinter native client (`hamclock_tkinter.py`)
+
+A stdlib-based alternative using Tkinter widgets. Slightly heavier than Pygame (~25–35 MB RAM) but uses native GUI widgets — tables via `ttk.Treeview`, tab switcher via `ttk.Notebook`, image panels via `PIL.ImageTk`. Boot time is comparable to Pygame.
+
+Install dependencies and run:
+
+```bash
+sudo apt install -y python3-tk python3-pil python3-pil.imagetk
+python3 /opt/hamclock-lite/hamclock_tkinter.py
+```
+
+Or from the repo:
+
+```bash
+cd ~/hamclock-pi1
+python3 hamclock_tkinter.py
+```
+
+Behavior:
+- Fullscreen at 1440×900 (press **F11** to toggle, **Esc** to quit)
+- Three-column layout with SOLAR/BANDS/SDO/GEO/X-Ray/OPEN BANDS on the left, MUF STATUS in the middle, DX SPOTS/BAND ACTIVITY/PROPAGATION on the right
+- Tab switching for DRAP/AURORA/ENLIL via `ttk.Notebook`
+- BAND ACTIVITY drawn on a Canvas with per-band colored bars proportional to spot count
+- If Pillow (`python3-pil`) isn't installed, text panels still work; image panels show "(PIL missing)"
+
+Same MUF-map caveat as the Pygame client.
+
+### Which one should I use?
+
+| | Browser (default) | Pygame client | Tkinter client |
+|---|---|---|---|
+| RAM footprint | 30–80 MB | **~15–20 MB** | ~25–35 MB |
+| Start time | 3–10 sec | **< 1 sec** | ~1 sec |
+| X11 required | Yes | **No** (fbcon) | Yes |
+| MUF map | ✅ (SVG) | ❌ (text replacement) | ❌ (text replacement) |
+| Theme switching | ✅ (5 themes) | ❌ (K-State only) | ❌ (K-State only) |
+| Setup wizard | ✅ | ❌ | ❌ |
+| Full interactivity | ✅ | ✅ (tab clicks) | ✅ (tab clicks) |
+| Extra apt packages | surf/midori/chromium | python3-pygame | python3-tk python3-pil.imagetk |
+
+**If you want the lowest-RAM Pi 1 kiosk**: Pygame client + headless server.
+**If you want the richest display**: keep the default browser kiosk.
+**If you're running on desktop Linux and want a lightweight native app**: Tkinter client.
+
+### Shared data layer (`hamclock_data.py`)
+
+Both native clients use a shared module `hamclock_data.py` that provides the `HamClockData` class. It polls the server's `/api/*` endpoints on a background thread (60-second data cadence, 15-minute image cadence) and caches results in memory. Third-party tools can use it directly:
+
+```python
+from hamclock_data import HamClockData
+d = HamClockData('http://localhost:8080')
+d.start_background()
+# Read from d.solar, d.bands, d.dxspots, d.health, d.images
+```
+
+Python 3.9+ stdlib only — no dependencies beyond the standard library for the data layer itself.
+
+---
+
 *Part of [HamClock Reborn](https://github.com/Atvriders/hamclock-reborn) — the full version for Pi 2 and newer.*
