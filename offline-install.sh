@@ -681,10 +681,12 @@ border-bottom:1px solid var(--border);
 flex-shrink:0;
 }
 .panel-body{padding:4px 6px;flex:1;overflow:hidden}
+.solar-flex .panel-body{overflow-y:auto}
+.solar-flex .panel-body::-webkit-scrollbar{width:0;background:transparent}
 .timer{color:var(--muted);font-size:clamp(11px,0.9vh,11px)}
 .tab{cursor:pointer;padding:0 8px;color:var(--label);user-select:none}
 .tab-active{color:var(--cyan);font-weight:bold}
-.solar-flex{flex:1}
+.solar-flex{flex:1;min-height:0}
 .bands-flex{flex:0 0 auto}
 .mid-img{flex:0 0 auto;min-height:0;overflow:hidden}
 .dx-full{flex:1;min-height:0}
