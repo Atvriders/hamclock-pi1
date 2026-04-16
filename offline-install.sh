@@ -2086,7 +2086,7 @@ def main():
         screen.fill(BG)
 
         header = pygame.Rect(0, 0, sw, 30)
-        callsign = os.environ.get('HAMCLOCK_CALLSIGN', '')
+        callsign = os.environ.get('HAMCLOCK_CALLSIGN', 'N0CALL')
         draw_header(screen, header, callsign, fonts)
 
         status = pygame.Rect(0, sh - 20, sw, 20)
