@@ -113,7 +113,8 @@ def draw_header(screen, rect, callsign, fonts):
     pygame.draw.rect(screen, CARD, rect)
     pygame.draw.rect(screen, BORDER, rect, 1)
     _blit_text(screen, fonts['title'], 'HAMCLOCK LITE', ACCENT_GOLD, rect.x + 8, rect.y + 4)
-    _blit_text(screen, fonts['body'], str(callsign or '--'), BRIGHT, rect.x + 220, rect.y + 8)
+    if callsign:
+        _blit_text(screen, fonts['body'], str(callsign), BRIGHT, rect.x + 220, rect.y + 8)
     try:
         utc = time.strftime('%H:%M:%S', time.gmtime())
         local = time.strftime('%H:%M:%S')
@@ -411,7 +412,7 @@ def main():
         screen.fill(BG)
 
         header = pygame.Rect(0, 0, sw, 30)
-        callsign = _safe(data.health or {}, 'callsign', 'HAMCLOCK')
+        callsign = os.environ.get('HAMCLOCK_CALLSIGN', '')
         draw_header(screen, header, callsign, fonts)
 
         status = pygame.Rect(0, sh - 20, sw, 20)
