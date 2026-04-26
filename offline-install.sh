@@ -2950,6 +2950,11 @@ xset s off
 xset -dpms
 xset s noblank
 
+# Show a real cursor (fbdev has no HW cursor; without this nothing is drawn)
+# then auto-hide it after 3s idle.
+xsetroot -cursor_name left_ptr
+unclutter -idle 3 -root &
+
 # Start matchbox window manager (auto-maximizes all windows)
 matchbox-window-manager -use_titlebar no -use_desktop_mode plain &
 sleep 1
