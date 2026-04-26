@@ -692,7 +692,7 @@ flex-shrink:0;
 .dx-full{flex:1;min-height:0}
 .s-row{
 display:flex;justify-content:space-between;align-items:center;
-padding:clamp(1px,0.2vh,3px) 0;
+padding:clamp(0px,0.12vh,2px) 0;
 border-bottom:1px solid var(--border);
 }
 .s-lbl{color:var(--label);font-size:clamp(12px,1vh,12px);flex:0 0 clamp(40px,5vw,70px)}
@@ -719,7 +719,7 @@ padding:clamp(0px,0.1vh,1px) 0;
 .cG{background:#22c55e;color:#000}.cF{background:#eab308;color:#000}.cP{background:#ef4444;color:#fff}.cN{background:var(--muted);color:#fff}
 .img-wrap{flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;min-height:0}
 .img-wrap img{object-fit:contain;max-width:100%;max-height:100%;display:block}
-#imgSolar{height:26vh;width:100%;object-fit:contain}
+#imgSolar{height:22vh;width:100%;object-fit:contain}
 #imgMuf{height:auto;width:100%;max-height:90vh;object-fit:contain}
 #imgEnlil{width:100%;object-fit:contain}
 #imgDrap{width:100%;object-fit:contain}
