@@ -2863,7 +2863,7 @@ fi
 echo "Installing display server packages (this may take 15-30 minutes on a Pi 1)..."
 sudo apt update
 if [ "$KIOSK_MODE" = "browser" ] || [ "$KIOSK_MODE" = "tkinter" ]; then
-    sudo apt install -y xserver-xorg xinit x11-xserver-utils unclutter curl matchbox-window-manager
+    sudo apt install -y xserver-xorg xinit x11-xserver-utils unclutter curl matchbox-window-manager xfonts-base dmz-cursor-theme
 else
     sudo apt install -y curl
 fi
@@ -2915,6 +2915,7 @@ sudo tee /usr/share/X11/xorg.conf.d/10-monitor.conf > /dev/null << 'MONEOF'
 Section "Device"
     Identifier "default"
     Driver "fbdev"
+    Option "SWcursor" "true"
 EndSection
 
 Section "Screen"

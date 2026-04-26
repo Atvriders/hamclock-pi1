@@ -43,7 +43,7 @@ sudo apt install -y curl unclutter
 
 # X11 packages needed for browser and tkinter modes, not pygame
 if [ "$KIOSK_MODE" != "pygame" ]; then
-    sudo apt install -y xserver-xorg xinit x11-xserver-utils matchbox-window-manager
+    sudo apt install -y xserver-xorg xinit x11-xserver-utils matchbox-window-manager xfonts-base dmz-cursor-theme
 fi
 
 # Mode-specific dependencies
