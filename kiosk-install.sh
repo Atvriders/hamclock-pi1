@@ -105,6 +105,26 @@ sudo cp "$SCRIPT_DIR/hamclock_tkinter.py" "$INSTALL_DIR/"
 # Copy X11 monitor config for auto-detect resolution (16-bit saves RAM on Pi 1)
 sudo cp "$SCRIPT_DIR/10-monitor.conf" /usr/share/X11/xorg.conf.d/10-monitor.conf 2>/dev/null || true
 
+# Ensure adequate swap — a 512MB Pi 1 running X + a browser has no RAM
+# headroom, and an OOM kill is a common cause of the kiosk dropping to the CLI.
+CUR_SWAP=$(free -m 2>/dev/null | awk '/Swap:/{print $2}')
+if [ "${CUR_SWAP:-0}" -lt 512 ]; then
+    echo "Configuring 512MB of swap (current: ${CUR_SWAP:-0}MB)..."
+    if [ -f /etc/dphys-swapfile ]; then
+        sudo sed -i 's/^#\?CONF_SWAPSIZE=.*/CONF_SWAPSIZE=512/' /etc/dphys-swapfile
+        grep -q '^CONF_SWAPSIZE=' /etc/dphys-swapfile || \
+            echo 'CONF_SWAPSIZE=512' | sudo tee -a /etc/dphys-swapfile > /dev/null
+        sudo dphys-swapfile setup && sudo dphys-swapfile swapon || true
+    elif [ ! -f /swapfile ]; then
+        sudo fallocate -l 512M /swapfile 2>/dev/null || \
+            sudo dd if=/dev/zero of=/swapfile bs=1M count=512
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile && sudo swapon /swapfile || true
+        grep -q '/swapfile' /etc/fstab 2>/dev/null || \
+            echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab > /dev/null
+    fi
+fi
+
 # Detect the user
 SERVICE_USER="${SUDO_USER:-$USER}"
 
@@ -139,8 +159,8 @@ fi
 if [ "$KIOSK_MODE" = "browser" ]; then
     sudo tee /opt/hamclock-lite/kiosk.sh > /dev/null <<KIOSKEOF
 #!/bin/bash
-# Wait for HamClock server to be ready
-for i in \$(seq 1 30); do
+# Wait for HamClock server to be ready (Pi 1 boots slowly — allow 2 min)
+for i in \$(seq 1 120); do
     if curl -s http://localhost:8080/api/health > /dev/null 2>&1; then
         break
     fi
@@ -161,14 +181,20 @@ unclutter -idle 3 -root &
 matchbox-window-manager -use_titlebar no -use_desktop_mode plain &
 sleep 1
 
-# Launch browser (matchbox will maximize it)
-exec $BROWSER_CMD
+# Launch browser (matchbox will maximize it). Relaunch it if it ever exits —
+# crashed, OOM-killed, or closed cleanly — so the kiosk never falls back to the
+# bare console. This loop keeps the X server alive across browser restarts.
+while true; do
+    $BROWSER_CMD
+    echo "kiosk: browser exited (\$?), relaunching in 2s..." >&2
+    sleep 2
+done
 KIOSKEOF
 elif [ "$KIOSK_MODE" = "tkinter" ]; then
     sudo tee /opt/hamclock-lite/kiosk.sh > /dev/null <<'KIOSKEOF'
 #!/bin/bash
-# Wait for HamClock server to be ready
-for i in $(seq 1 30); do
+# Wait for HamClock server to be ready (Pi 1 boots slowly — allow 2 min)
+for i in $(seq 1 120); do
     if curl -s http://localhost:8080/api/health > /dev/null 2>&1; then
         break
     fi
@@ -178,14 +204,20 @@ done
 xset s off
 xset -dpms
 xset s noblank
-# Launch Tkinter native client (replaces browser; still needs X)
-exec python3 /opt/hamclock-lite/hamclock_tkinter.py
+# Launch Tkinter native client (replaces browser; still needs X). Relaunch it
+# if it ever exits so the kiosk never falls back to the bare console; the loop
+# keeps the X server alive across client restarts.
+while true; do
+    python3 /opt/hamclock-lite/hamclock_tkinter.py
+    echo "kiosk: tkinter client exited ($?), relaunching in 2s..." >&2
+    sleep 2
+done
 KIOSKEOF
 elif [ "$KIOSK_MODE" = "pygame" ]; then
     sudo tee /opt/hamclock-lite/kiosk.sh > /dev/null <<'KIOSKEOF'
 #!/bin/bash
-# Wait for HamClock server to be ready
-for i in $(seq 1 30); do
+# Wait for HamClock server to be ready (Pi 1 boots slowly — allow 2 min)
+for i in $(seq 1 120); do
     if curl -s http://localhost:8080/api/health > /dev/null 2>&1; then
         break
     fi
@@ -194,7 +226,13 @@ done
 # Pygame framebuffer mode: no X server, SDL draws directly to /dev/fb0
 export SDL_VIDEODRIVER=fbcon
 export SDL_FBDEV=/dev/fb0
-exec python3 /opt/hamclock-lite/hamclock_pygame.py
+# Relaunch the client if it ever exits so the kiosk never falls back to the
+# bare console (e.g. an SDL/framebuffer error after an HDMI hotplug).
+while true; do
+    python3 /opt/hamclock-lite/hamclock_pygame.py
+    echo "kiosk: pygame client exited ($?), relaunching in 2s..." >&2
+    sleep 2
+done
 KIOSKEOF
 fi
 sudo chmod +x /opt/hamclock-lite/kiosk.sh
@@ -206,6 +244,8 @@ if [ "$KIOSK_MODE" = "pygame" ]; then
 Description=HamClock Kiosk Display (Pygame framebuffer)
 After=hamclock-lite.service
 Wants=hamclock-lite.service
+# Never stop retrying — a fast-failing display must not leave the bare console.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -216,8 +256,11 @@ TTYPath=/dev/tty7
 TTYReset=yes
 TTYVHangup=yes
 ExecStart=/opt/hamclock-lite/kiosk.sh
-Restart=on-failure
+# Restart on ANY exit (including clean exit 0), not just failures.
+Restart=always
 RestartSec=10
+# Prefer to OOM-kill other processes before this display service.
+OOMScoreAdjust=-250
 
 [Install]
 WantedBy=multi-user.target
@@ -228,6 +271,9 @@ else
 Description=HamClock Kiosk Display
 After=hamclock-lite.service
 Wants=hamclock-lite.service
+# Never stop retrying — this also lets X recover once a flaky HDMI/EDID
+# handshake finally succeeds, instead of giving up to the bare console.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -239,8 +285,11 @@ TTYPath=/dev/tty7
 TTYReset=yes
 TTYVHangup=yes
 ExecStart=/usr/bin/xinit /opt/hamclock-lite/kiosk.sh -- :0 vt7
-Restart=on-failure
+# Restart on ANY exit (including clean exit 0), not just failures.
+Restart=always
 RestartSec=10
+# Prefer to OOM-kill other processes before this display service.
+OOMScoreAdjust=-250
 
 [Install]
 WantedBy=multi-user.target

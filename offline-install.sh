@@ -476,39 +476,54 @@ def background_fetcher():
         if not CACHE['dxspots']:
             fetch_dx()
 
-    solar_interval = 300  # 5 minutes
-    dx_interval = 120     # 2 minutes
-    muf_interval = 900    # 15 minutes
-    enlil_interval = 900  # 15 minutes
-    drap_interval = 900   # 15 minutes
-    last_solar = time.time()
-    last_dx = time.time()
-    last_muf = time.time()
-    last_enlil = time.time()
-    last_drap = time.time()
+    solar_interval = 300   # 5 minutes
+    dx_interval = 120      # 2 minutes
+    image_interval = 900   # 15 minutes
+    # Stagger the four 15-min image fetches so they never all run on the same
+    # tick — a simultaneous refresh transiently doubles image memory and can
+    # tip a 512MB Pi into an OOM kill.
+    now0 = time.time()
+    last_solar = now0
+    last_dx = now0
+    last_muf = now0
+    last_enlil = now0 - 225
+    last_drap = now0 - 450
+    last_real_drap = now0 - 675
 
     while True:
-        time.sleep(10)
-        now = time.time()
-        if now - last_solar >= solar_interval:
-            fetch_hamqsl()
-            last_solar = now
-        if now - last_dx >= dx_interval:
-            fetch_dx()
-            last_dx = now
-        if now - last_muf >= muf_interval:
-            fetch_muf()
-            last_muf = now
-        if now - last_enlil >= enlil_interval:
-            fetch_enlil()
-            last_enlil = now
-        if now - last_drap >= drap_interval:
-            fetch_drap()
-            fetch_real_drap()
-            last_drap = now
+        try:
+            time.sleep(10)
+            now = time.time()
+            if now - last_solar >= solar_interval:
+                fetch_hamqsl()
+                last_solar = now
+            if now - last_dx >= dx_interval:
+                fetch_dx()
+                last_dx = now
+            if now - last_muf >= image_interval:
+                fetch_muf()
+                last_muf = now
+            if now - last_enlil >= image_interval:
+                fetch_enlil()
+                last_enlil = now
+            if now - last_drap >= image_interval:
+                fetch_drap()
+                last_drap = now
+            if now - last_real_drap >= image_interval:
+                fetch_real_drap()
+                last_real_drap = now
+        except Exception as e:
+            # Never let the loop die silently — that would freeze the
+            # dashboard on stale data forever. Log and keep going.
+            print(f'[{time.strftime("%H:%M:%S")}] background loop error: {e}')
+            time.sleep(10)
 
 
 class Handler(SimpleHTTPRequestHandler):
+    # Socket timeout so a stalled client can't pin a thread (and its buffered
+    # response) forever — unbounded stuck threads are a memory-pressure source.
+    timeout = 30
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=os.path.dirname(os.path.abspath(__file__)), **kwargs)
 
@@ -545,7 +560,9 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_header('Content-Type', 'image/svg+xml')
                 self.send_header('Content-Length', len(body))
                 self.send_header('Access-Control-Allow-Origin', '*')
-                self.send_header('Cache-Control', 'public, max-age=300')
+                # no-store: the dashboard fetches a fresh URL each cycle; if the
+                # browser cached these it would accumulate entries until OOM.
+                self.send_header('Cache-Control', 'no-store')
                 self.end_headers()
                 if self.command != 'HEAD':
                     self.wfile.write(body)
@@ -602,7 +619,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', len(data))
         self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Cache-Control', 'public, max-age=900')
+        # no-store: prevents the browser image cache from growing unbounded.
+        self.send_header('Cache-Control', 'no-store')
         self.end_headers()
         if self.command != 'HEAD':
             self.wfile.write(data)
@@ -1409,6 +1427,9 @@ xhr.send();
 
 function fetchAll(){
 updateCountdowns();
+// If the previous cycle's requests haven't drained, skip this cycle so the
+// queue can't grow without bound when the backend is slow or hung.
+if(fetchQueue.length>0)return;
 queueFetch('/api/solar',function(data){
 renderSolar(data);
 renderXray(data);
@@ -1452,8 +1473,14 @@ var elImgDrap=document.getElementById('imgDrap');
 var elImgRealDrap=document.getElementById('imgRealDrap');
 
 function refreshImages(){
-var t=Date.now();
-lastImageFetch=Math.floor(t/1000);
+// Cache-bust with the 15-min refresh slot index, NOT Date.now(). A unique
+// timestamp every cycle made the browser cache thousands of distinct image
+// URLs per day and never evict them — a slow OOM on a 512MB Pi. The slot
+// index changes once per refresh (enough to force a reload) but repeats
+// rarely, and the server sends Cache-Control: no-store so nothing piles up.
+var now=Date.now();
+var t=Math.floor(now/(IMAGE_INTERVAL*1000));
+lastImageFetch=Math.floor(now/1000);
 if(elImgSolar)elImgSolar.src='/api/solar-image?t='+t;
 setTimeout(function(){
 if(elImgMuf)elImgMuf.src='/api/muf-map?t='+t;
@@ -2070,132 +2097,149 @@ def main():
 
     clock = pygame.time.Clock()
     running = True
+    # A transient SDL/framebuffer error (e.g. an HDMI hotplug or VT switch)
+    # raising out of the loop would crash the client to the bare console.
+    # Absorb such errors; if they persist, exit cleanly so the kiosk wrapper
+    # restarts us with a fresh SDL context.
+    consecutive_errors = 0
     while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_ESCAPE, pygame.K_q):
+        try:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
                     running = False
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-                pos = event.pos
-                for name, r in tab_regions.items():
-                    if r.collidepoint(pos):
-                        active_tab = name
-                        break
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                        running = False
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    pos = event.pos
+                    for name, r in tab_regions.items():
+                        if r.collidepoint(pos):
+                            active_tab = name
+                            break
 
-        sw, sh = screen.get_size()
-        screen.fill(BG)
+            sw, sh = screen.get_size()
+            screen.fill(BG)
 
-        header = pygame.Rect(0, 0, sw, 30)
-        callsign = os.environ.get('HAMCLOCK_CALLSIGN', 'N0CALL')
-        draw_header(screen, header, callsign, fonts)
+            header = pygame.Rect(0, 0, sw, 30)
+            callsign = os.environ.get('HAMCLOCK_CALLSIGN', 'N0CALL')
+            draw_header(screen, header, callsign, fonts)
 
-        status = pygame.Rect(0, sh - 20, sw, 20)
-        draw_status_bar(screen, status, data, fonts)
+            status = pygame.Rect(0, sh - 20, sw, 20)
+            draw_status_bar(screen, status, data, fonts)
 
-        content_top = 32
-        content_bot = sh - 22
-        content_h = content_bot - content_top
+            content_top = 32
+            content_bot = sh - 22
+            content_h = content_bot - content_top
 
-        left_w = int(sw * 288 / 1440)
-        mid_w = int(sw * (936 - 288) / 1440)
-        right_w = sw - left_w - mid_w
+            left_w = int(sw * 288 / 1440)
+            mid_w = int(sw * (936 - 288) / 1440)
+            right_w = sw - left_w - mid_w
 
-        # ---- LEFT COLUMN ----
-        lx = 2
-        ly = content_top
-        panel_gap = 4
-        # allocate heights (percent of content_h)
-        heights = [
-            int(content_h * 0.20),  # solar
-            int(content_h * 0.12),  # bands
-            int(content_h * 0.28),  # sdo
-            int(content_h * 0.10),  # geomag
-            int(content_h * 0.10),  # xray
-        ]
-        heights.append(content_h - sum(heights) - panel_gap * 5)  # open bands
-        titles = ['SOLAR', 'BANDS', 'SDO IMAGE', 'GEOMAGNETIC', 'X-RAY FLUX', 'OPEN BANDS']
-        cy = ly
-        panel_rects = []
-        for h, t in zip(heights, titles):
-            r = pygame.Rect(lx, cy, left_w - 4, h)
-            inner = draw_panel(screen, r, t, fonts)
-            panel_rects.append(inner)
-            cy += h + panel_gap
+            # ---- LEFT COLUMN ----
+            lx = 2
+            ly = content_top
+            panel_gap = 4
+            # allocate heights (percent of content_h)
+            heights = [
+                int(content_h * 0.20),  # solar
+                int(content_h * 0.12),  # bands
+                int(content_h * 0.28),  # sdo
+                int(content_h * 0.10),  # geomag
+                int(content_h * 0.10),  # xray
+            ]
+            heights.append(content_h - sum(heights) - panel_gap * 5)  # open bands
+            titles = ['SOLAR', 'BANDS', 'SDO IMAGE', 'GEOMAGNETIC', 'X-RAY FLUX', 'OPEN BANDS']
+            cy = ly
+            panel_rects = []
+            for h, t in zip(heights, titles):
+                r = pygame.Rect(lx, cy, left_w - 4, h)
+                inner = draw_panel(screen, r, t, fonts)
+                panel_rects.append(inner)
+                cy += h + panel_gap
 
-        try:
-            draw_solar(screen, panel_rects[0], data.solar or {}, fonts)
-        except Exception:
-            pass
-        try:
-            draw_bands(screen, panel_rects[1], data.bands or {}, fonts)
-        except Exception:
-            pass
-        try:
-            sdo_surf = _get_cached_image(data, 'solar-image', image_cache, image_cache_ts)
-            draw_image(screen, panel_rects[2], sdo_surf)
-        except Exception:
-            pass
-        try:
-            draw_geomag(screen, panel_rects[3], data.solar or {}, fonts)
-        except Exception:
-            pass
-        try:
-            draw_xray(screen, panel_rects[4], data.solar or {}, fonts)
-        except Exception:
-            pass
-        try:
-            draw_open_bands(screen, panel_rects[5], data.bands or {}, fonts)
-        except Exception:
-            pass
+            try:
+                draw_solar(screen, panel_rects[0], data.solar or {}, fonts)
+            except Exception:
+                pass
+            try:
+                draw_bands(screen, panel_rects[1], data.bands or {}, fonts)
+            except Exception:
+                pass
+            try:
+                sdo_surf = _get_cached_image(data, 'solar-image', image_cache, image_cache_ts)
+                draw_image(screen, panel_rects[2], sdo_surf)
+            except Exception:
+                pass
+            try:
+                draw_geomag(screen, panel_rects[3], data.solar or {}, fonts)
+            except Exception:
+                pass
+            try:
+                draw_xray(screen, panel_rects[4], data.solar or {}, fonts)
+            except Exception:
+                pass
+            try:
+                draw_open_bands(screen, panel_rects[5], data.bands or {}, fonts)
+            except Exception:
+                pass
 
-        # ---- MIDDLE COLUMN ----
-        mx = lx + left_w
-        mid_rect = pygame.Rect(mx, content_top, mid_w - 4, content_h)
-        mid_inner = draw_panel(screen, mid_rect, 'MUF STATUS', fonts)
-        try:
-            draw_muf_text(screen, mid_inner, data.solar or {}, fonts)
-        except Exception:
-            pass
+            # ---- MIDDLE COLUMN ----
+            mx = lx + left_w
+            mid_rect = pygame.Rect(mx, content_top, mid_w - 4, content_h)
+            mid_inner = draw_panel(screen, mid_rect, 'MUF STATUS', fonts)
+            try:
+                draw_muf_text(screen, mid_inner, data.solar or {}, fonts)
+            except Exception:
+                pass
 
-        # ---- RIGHT COLUMN ----
-        rx = mx + mid_w
-        rh_dx = int(content_h * 0.28)
-        rh_ba = int(content_h * 0.32)
-        rh_prop = content_h - rh_dx - rh_ba - panel_gap * 2
+            # ---- RIGHT COLUMN ----
+            rx = mx + mid_w
+            rh_dx = int(content_h * 0.28)
+            rh_ba = int(content_h * 0.32)
+            rh_prop = content_h - rh_dx - rh_ba - panel_gap * 2
 
-        dx_r = pygame.Rect(rx, content_top, right_w - 4, rh_dx)
-        dx_inner = draw_panel(screen, dx_r, 'DX SPOTS', fonts)
-        try:
-            draw_dx_spots(screen, dx_inner, data.dxspots or [], fonts)
-        except Exception:
-            pass
+            dx_r = pygame.Rect(rx, content_top, right_w - 4, rh_dx)
+            dx_inner = draw_panel(screen, dx_r, 'DX SPOTS', fonts)
+            try:
+                draw_dx_spots(screen, dx_inner, data.dxspots or [], fonts)
+            except Exception:
+                pass
 
-        ba_r = pygame.Rect(rx, content_top + rh_dx + panel_gap, right_w - 4, rh_ba)
-        ba_inner = draw_panel(screen, ba_r, 'BAND ACTIVITY', fonts)
-        try:
-            draw_band_activity(screen, ba_inner, data.dxspots or [], fonts)
-        except Exception:
-            pass
+            ba_r = pygame.Rect(rx, content_top + rh_dx + panel_gap, right_w - 4, rh_ba)
+            ba_inner = draw_panel(screen, ba_r, 'BAND ACTIVITY', fonts)
+            try:
+                draw_band_activity(screen, ba_inner, data.dxspots or [], fonts)
+            except Exception:
+                pass
 
-        prop_r = pygame.Rect(rx, content_top + rh_dx + rh_ba + panel_gap * 2,
-                             right_w - 4, rh_prop)
-        prop_inner = draw_panel(screen, prop_r, 'PROPAGATION', fonts)
-        tab_bar = pygame.Rect(prop_inner.x, prop_inner.y, prop_inner.w, 20)
-        tab_regions = draw_tabs(screen, tab_bar, ['drap', 'aurora', 'enlil'],
-                                active_tab, fonts)
-        img_rect = pygame.Rect(prop_inner.x, prop_inner.y + 24,
-                               prop_inner.w, prop_inner.h - 24)
-        try:
-            key = tab_image_key.get(active_tab, 'real-drap')
-            surf = _get_cached_image(data, key, image_cache, image_cache_ts)
-            draw_image(screen, img_rect, surf)
-        except Exception:
-            pass
+            prop_r = pygame.Rect(rx, content_top + rh_dx + rh_ba + panel_gap * 2,
+                                 right_w - 4, rh_prop)
+            prop_inner = draw_panel(screen, prop_r, 'PROPAGATION', fonts)
+            tab_bar = pygame.Rect(prop_inner.x, prop_inner.y, prop_inner.w, 20)
+            tab_regions = draw_tabs(screen, tab_bar, ['drap', 'aurora', 'enlil'],
+                                    active_tab, fonts)
+            img_rect = pygame.Rect(prop_inner.x, prop_inner.y + 24,
+                                   prop_inner.w, prop_inner.h - 24)
+            try:
+                key = tab_image_key.get(active_tab, 'real-drap')
+                surf = _get_cached_image(data, key, image_cache, image_cache_ts)
+                draw_image(screen, img_rect, surf)
+            except Exception:
+                pass
 
-        pygame.display.flip()
-        clock.tick(10)
+            pygame.display.flip()
+            clock.tick(10)
+            consecutive_errors = 0
+        except Exception as e:
+            consecutive_errors += 1
+            print('render loop error (%d): %s' % (consecutive_errors, e),
+                  file=sys.stderr)
+            if consecutive_errors > 15:
+                print('too many render errors — exiting for a clean restart',
+                      file=sys.stderr)
+                running = False
+            else:
+                time.sleep(1)
 
     try:
         data.stop()
@@ -2619,7 +2663,12 @@ class HamClockTkApp:
                 self.status_bar.configure(text='update error: {}'.format(e))
             except Exception:
                 pass
-        self.root.after(1000, self._update_ui)
+        # Reschedule. Guard against the root being destroyed (e.g. Escape
+        # pressed mid-tick) — an uncaught TclError here would crash the client.
+        try:
+            self.root.after(1000, self._update_ui)
+        except Exception:
+            pass
 
     def _update_clocks(self):
         now = time.time()
@@ -2934,12 +2983,33 @@ Section "Monitor"
 EndSection
 MONEOF
 
+# ── Step 8b: Ensure adequate swap ──────────────────────────────────
+# A 512MB Pi 1 running X + a browser has no RAM headroom, and an OOM kill
+# is a common cause of the kiosk dropping to the bare CLI.
+CUR_SWAP=$(free -m 2>/dev/null | awk '/Swap:/{print $2}')
+if [ "${CUR_SWAP:-0}" -lt 512 ]; then
+    echo "Configuring 512MB of swap (current: ${CUR_SWAP:-0}MB)..."
+    if [ -f /etc/dphys-swapfile ]; then
+        sudo sed -i 's/^#\?CONF_SWAPSIZE=.*/CONF_SWAPSIZE=512/' /etc/dphys-swapfile
+        grep -q '^CONF_SWAPSIZE=' /etc/dphys-swapfile || \
+            echo 'CONF_SWAPSIZE=512' | sudo tee -a /etc/dphys-swapfile > /dev/null
+        sudo dphys-swapfile setup && sudo dphys-swapfile swapon || true
+    elif [ ! -f /swapfile ]; then
+        sudo fallocate -l 512M /swapfile 2>/dev/null || \
+            sudo dd if=/dev/zero of=/swapfile bs=1M count=512
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile && sudo swapon /swapfile || true
+        grep -q '/swapfile' /etc/fstab 2>/dev/null || \
+            echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab > /dev/null
+    fi
+fi
+
 # ── Step 9: Create kiosk.sh launch script (mode-specific) ──────────
 if [ "$KIOSK_MODE" = "browser" ]; then
     sudo tee /opt/hamclock-lite/kiosk.sh > /dev/null <<KIOSKEOF
 #!/bin/bash
-# Wait for HamClock server to be ready
-for i in \$(seq 1 30); do
+# Wait for HamClock server to be ready (Pi 1 boots slowly — allow 2 min)
+for i in \$(seq 1 120); do
     if curl -s http://localhost:8080/api/health > /dev/null 2>&1; then
         break
     fi
@@ -2960,13 +3030,20 @@ unclutter -idle 3 -root &
 matchbox-window-manager -use_titlebar no -use_desktop_mode plain &
 sleep 1
 
-# Launch browser (matchbox will maximize it)
-exec $BROWSER_CMD
+# Launch browser (matchbox will maximize it). Relaunch it if it ever exits —
+# crashed, OOM-killed, or closed cleanly — so the kiosk never falls back to the
+# bare console. This loop keeps the X server alive across browser restarts.
+while true; do
+    $BROWSER_CMD
+    echo "kiosk: browser exited (\$?), relaunching in 2s..." >&2
+    sleep 2
+done
 KIOSKEOF
 elif [ "$KIOSK_MODE" = "tkinter" ]; then
     sudo tee /opt/hamclock-lite/kiosk.sh > /dev/null <<'KIOSKEOF'
 #!/bin/bash
-for i in $(seq 1 30); do
+# Wait for HamClock server to be ready (Pi 1 boots slowly — allow 2 min)
+for i in $(seq 1 120); do
     if curl -s http://localhost:8080/api/health > /dev/null 2>&1; then
         break
     fi
@@ -2975,12 +3052,19 @@ done
 xset s off
 xset -dpms
 xset s noblank
-exec python3 /opt/hamclock-lite/hamclock_tkinter.py
+# Relaunch the client if it ever exits so the kiosk never falls back to the
+# bare console; the loop keeps the X server alive across client restarts.
+while true; do
+    python3 /opt/hamclock-lite/hamclock_tkinter.py
+    echo "kiosk: tkinter client exited ($?), relaunching in 2s..." >&2
+    sleep 2
+done
 KIOSKEOF
 elif [ "$KIOSK_MODE" = "pygame" ]; then
     sudo tee /opt/hamclock-lite/kiosk.sh > /dev/null <<'KIOSKEOF'
 #!/bin/bash
-for i in $(seq 1 30); do
+# Wait for HamClock server to be ready (Pi 1 boots slowly — allow 2 min)
+for i in $(seq 1 120); do
     if curl -s http://localhost:8080/api/health > /dev/null 2>&1; then
         break
     fi
@@ -2988,7 +3072,13 @@ for i in $(seq 1 30); do
 done
 export SDL_VIDEODRIVER=fbcon
 export SDL_FBDEV=/dev/fb0
-exec python3 /opt/hamclock-lite/hamclock_pygame.py
+# Relaunch the client if it ever exits so the kiosk never falls back to the
+# bare console (e.g. an SDL/framebuffer error after an HDMI hotplug).
+while true; do
+    python3 /opt/hamclock-lite/hamclock_pygame.py
+    echo "kiosk: pygame client exited ($?), relaunching in 2s..." >&2
+    sleep 2
+done
 KIOSKEOF
 fi
 sudo chmod +x /opt/hamclock-lite/kiosk.sh
@@ -3000,6 +3090,8 @@ if [ "$KIOSK_MODE" = "pygame" ]; then
 Description=HamClock Kiosk Display (pygame framebuffer)
 After=hamclock-lite.service
 Wants=hamclock-lite.service
+# Never stop retrying — a fast-failing display must not leave the bare console.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -3010,8 +3102,11 @@ TTYPath=/dev/tty7
 TTYReset=yes
 TTYVHangup=yes
 ExecStart=/opt/hamclock-lite/kiosk.sh
-Restart=on-failure
+# Restart on ANY exit (including clean exit 0), not just failures.
+Restart=always
 RestartSec=10
+# Prefer to OOM-kill other processes before this display service.
+OOMScoreAdjust=-250
 
 [Install]
 WantedBy=multi-user.target
@@ -3022,6 +3117,9 @@ else
 Description=HamClock Kiosk Display
 After=hamclock-lite.service
 Wants=hamclock-lite.service
+# Never stop retrying — this also lets X recover once a flaky HDMI/EDID
+# handshake finally succeeds, instead of giving up to the bare console.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -3033,8 +3131,11 @@ TTYPath=/dev/tty7
 TTYReset=yes
 TTYVHangup=yes
 ExecStart=/usr/bin/xinit /opt/hamclock-lite/kiosk.sh -- :0 vt7
-Restart=on-failure
+# Restart on ANY exit (including clean exit 0), not just failures.
+Restart=always
 RestartSec=10
+# Prefer to OOM-kill other processes before this display service.
+OOMScoreAdjust=-250
 
 [Install]
 WantedBy=multi-user.target

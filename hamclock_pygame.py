@@ -394,132 +394,149 @@ def main():
 
     clock = pygame.time.Clock()
     running = True
+    # A transient SDL/framebuffer error (e.g. an HDMI hotplug or VT switch)
+    # raising out of the loop would crash the client to the bare console.
+    # Absorb such errors; if they persist, exit cleanly so the kiosk wrapper
+    # restarts us with a fresh SDL context.
+    consecutive_errors = 0
     while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_ESCAPE, pygame.K_q):
+        try:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
                     running = False
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-                pos = event.pos
-                for name, r in tab_regions.items():
-                    if r.collidepoint(pos):
-                        active_tab = name
-                        break
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                        running = False
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    pos = event.pos
+                    for name, r in tab_regions.items():
+                        if r.collidepoint(pos):
+                            active_tab = name
+                            break
 
-        sw, sh = screen.get_size()
-        screen.fill(BG)
+            sw, sh = screen.get_size()
+            screen.fill(BG)
 
-        header = pygame.Rect(0, 0, sw, 30)
-        callsign = os.environ.get('HAMCLOCK_CALLSIGN', 'N0CALL')
-        draw_header(screen, header, callsign, fonts)
+            header = pygame.Rect(0, 0, sw, 30)
+            callsign = os.environ.get('HAMCLOCK_CALLSIGN', 'N0CALL')
+            draw_header(screen, header, callsign, fonts)
 
-        status = pygame.Rect(0, sh - 20, sw, 20)
-        draw_status_bar(screen, status, data, fonts)
+            status = pygame.Rect(0, sh - 20, sw, 20)
+            draw_status_bar(screen, status, data, fonts)
 
-        content_top = 32
-        content_bot = sh - 22
-        content_h = content_bot - content_top
+            content_top = 32
+            content_bot = sh - 22
+            content_h = content_bot - content_top
 
-        left_w = int(sw * 288 / 1440)
-        mid_w = int(sw * (936 - 288) / 1440)
-        right_w = sw - left_w - mid_w
+            left_w = int(sw * 288 / 1440)
+            mid_w = int(sw * (936 - 288) / 1440)
+            right_w = sw - left_w - mid_w
 
-        # ---- LEFT COLUMN ----
-        lx = 2
-        ly = content_top
-        panel_gap = 4
-        # allocate heights (percent of content_h)
-        heights = [
-            int(content_h * 0.20),  # solar
-            int(content_h * 0.12),  # bands
-            int(content_h * 0.28),  # sdo
-            int(content_h * 0.10),  # geomag
-            int(content_h * 0.10),  # xray
-        ]
-        heights.append(content_h - sum(heights) - panel_gap * 5)  # open bands
-        titles = ['SOLAR', 'BANDS', 'SDO IMAGE', 'GEOMAGNETIC', 'X-RAY FLUX', 'OPEN BANDS']
-        cy = ly
-        panel_rects = []
-        for h, t in zip(heights, titles):
-            r = pygame.Rect(lx, cy, left_w - 4, h)
-            inner = draw_panel(screen, r, t, fonts)
-            panel_rects.append(inner)
-            cy += h + panel_gap
+            # ---- LEFT COLUMN ----
+            lx = 2
+            ly = content_top
+            panel_gap = 4
+            # allocate heights (percent of content_h)
+            heights = [
+                int(content_h * 0.20),  # solar
+                int(content_h * 0.12),  # bands
+                int(content_h * 0.28),  # sdo
+                int(content_h * 0.10),  # geomag
+                int(content_h * 0.10),  # xray
+            ]
+            heights.append(content_h - sum(heights) - panel_gap * 5)  # open bands
+            titles = ['SOLAR', 'BANDS', 'SDO IMAGE', 'GEOMAGNETIC', 'X-RAY FLUX', 'OPEN BANDS']
+            cy = ly
+            panel_rects = []
+            for h, t in zip(heights, titles):
+                r = pygame.Rect(lx, cy, left_w - 4, h)
+                inner = draw_panel(screen, r, t, fonts)
+                panel_rects.append(inner)
+                cy += h + panel_gap
 
-        try:
-            draw_solar(screen, panel_rects[0], data.solar or {}, fonts)
-        except Exception:
-            pass
-        try:
-            draw_bands(screen, panel_rects[1], data.bands or {}, fonts)
-        except Exception:
-            pass
-        try:
-            sdo_surf = _get_cached_image(data, 'solar-image', image_cache, image_cache_ts)
-            draw_image(screen, panel_rects[2], sdo_surf)
-        except Exception:
-            pass
-        try:
-            draw_geomag(screen, panel_rects[3], data.solar or {}, fonts)
-        except Exception:
-            pass
-        try:
-            draw_xray(screen, panel_rects[4], data.solar or {}, fonts)
-        except Exception:
-            pass
-        try:
-            draw_open_bands(screen, panel_rects[5], data.bands or {}, fonts)
-        except Exception:
-            pass
+            try:
+                draw_solar(screen, panel_rects[0], data.solar or {}, fonts)
+            except Exception:
+                pass
+            try:
+                draw_bands(screen, panel_rects[1], data.bands or {}, fonts)
+            except Exception:
+                pass
+            try:
+                sdo_surf = _get_cached_image(data, 'solar-image', image_cache, image_cache_ts)
+                draw_image(screen, panel_rects[2], sdo_surf)
+            except Exception:
+                pass
+            try:
+                draw_geomag(screen, panel_rects[3], data.solar or {}, fonts)
+            except Exception:
+                pass
+            try:
+                draw_xray(screen, panel_rects[4], data.solar or {}, fonts)
+            except Exception:
+                pass
+            try:
+                draw_open_bands(screen, panel_rects[5], data.bands or {}, fonts)
+            except Exception:
+                pass
 
-        # ---- MIDDLE COLUMN ----
-        mx = lx + left_w
-        mid_rect = pygame.Rect(mx, content_top, mid_w - 4, content_h)
-        mid_inner = draw_panel(screen, mid_rect, 'MUF STATUS', fonts)
-        try:
-            draw_muf_text(screen, mid_inner, data.solar or {}, fonts)
-        except Exception:
-            pass
+            # ---- MIDDLE COLUMN ----
+            mx = lx + left_w
+            mid_rect = pygame.Rect(mx, content_top, mid_w - 4, content_h)
+            mid_inner = draw_panel(screen, mid_rect, 'MUF STATUS', fonts)
+            try:
+                draw_muf_text(screen, mid_inner, data.solar or {}, fonts)
+            except Exception:
+                pass
 
-        # ---- RIGHT COLUMN ----
-        rx = mx + mid_w
-        rh_dx = int(content_h * 0.28)
-        rh_ba = int(content_h * 0.32)
-        rh_prop = content_h - rh_dx - rh_ba - panel_gap * 2
+            # ---- RIGHT COLUMN ----
+            rx = mx + mid_w
+            rh_dx = int(content_h * 0.28)
+            rh_ba = int(content_h * 0.32)
+            rh_prop = content_h - rh_dx - rh_ba - panel_gap * 2
 
-        dx_r = pygame.Rect(rx, content_top, right_w - 4, rh_dx)
-        dx_inner = draw_panel(screen, dx_r, 'DX SPOTS', fonts)
-        try:
-            draw_dx_spots(screen, dx_inner, data.dxspots or [], fonts)
-        except Exception:
-            pass
+            dx_r = pygame.Rect(rx, content_top, right_w - 4, rh_dx)
+            dx_inner = draw_panel(screen, dx_r, 'DX SPOTS', fonts)
+            try:
+                draw_dx_spots(screen, dx_inner, data.dxspots or [], fonts)
+            except Exception:
+                pass
 
-        ba_r = pygame.Rect(rx, content_top + rh_dx + panel_gap, right_w - 4, rh_ba)
-        ba_inner = draw_panel(screen, ba_r, 'BAND ACTIVITY', fonts)
-        try:
-            draw_band_activity(screen, ba_inner, data.dxspots or [], fonts)
-        except Exception:
-            pass
+            ba_r = pygame.Rect(rx, content_top + rh_dx + panel_gap, right_w - 4, rh_ba)
+            ba_inner = draw_panel(screen, ba_r, 'BAND ACTIVITY', fonts)
+            try:
+                draw_band_activity(screen, ba_inner, data.dxspots or [], fonts)
+            except Exception:
+                pass
 
-        prop_r = pygame.Rect(rx, content_top + rh_dx + rh_ba + panel_gap * 2,
-                             right_w - 4, rh_prop)
-        prop_inner = draw_panel(screen, prop_r, 'PROPAGATION', fonts)
-        tab_bar = pygame.Rect(prop_inner.x, prop_inner.y, prop_inner.w, 20)
-        tab_regions = draw_tabs(screen, tab_bar, ['drap', 'aurora', 'enlil'],
-                                active_tab, fonts)
-        img_rect = pygame.Rect(prop_inner.x, prop_inner.y + 24,
-                               prop_inner.w, prop_inner.h - 24)
-        try:
-            key = tab_image_key.get(active_tab, 'real-drap')
-            surf = _get_cached_image(data, key, image_cache, image_cache_ts)
-            draw_image(screen, img_rect, surf)
-        except Exception:
-            pass
+            prop_r = pygame.Rect(rx, content_top + rh_dx + rh_ba + panel_gap * 2,
+                                 right_w - 4, rh_prop)
+            prop_inner = draw_panel(screen, prop_r, 'PROPAGATION', fonts)
+            tab_bar = pygame.Rect(prop_inner.x, prop_inner.y, prop_inner.w, 20)
+            tab_regions = draw_tabs(screen, tab_bar, ['drap', 'aurora', 'enlil'],
+                                    active_tab, fonts)
+            img_rect = pygame.Rect(prop_inner.x, prop_inner.y + 24,
+                                   prop_inner.w, prop_inner.h - 24)
+            try:
+                key = tab_image_key.get(active_tab, 'real-drap')
+                surf = _get_cached_image(data, key, image_cache, image_cache_ts)
+                draw_image(screen, img_rect, surf)
+            except Exception:
+                pass
 
-        pygame.display.flip()
-        clock.tick(10)
+            pygame.display.flip()
+            clock.tick(10)
+            consecutive_errors = 0
+        except Exception as e:
+            consecutive_errors += 1
+            print('render loop error (%d): %s' % (consecutive_errors, e),
+                  file=sys.stderr)
+            if consecutive_errors > 15:
+                print('too many render errors — exiting for a clean restart',
+                      file=sys.stderr)
+                running = False
+            else:
+                time.sleep(1)
 
     try:
         data.stop()

@@ -422,39 +422,54 @@ def background_fetcher():
         if not CACHE['dxspots']:
             fetch_dx()
 
-    solar_interval = 300  # 5 minutes
-    dx_interval = 120     # 2 minutes
-    muf_interval = 900    # 15 minutes
-    enlil_interval = 900  # 15 minutes
-    drap_interval = 900   # 15 minutes
-    last_solar = time.time()
-    last_dx = time.time()
-    last_muf = time.time()
-    last_enlil = time.time()
-    last_drap = time.time()
+    solar_interval = 300   # 5 minutes
+    dx_interval = 120      # 2 minutes
+    image_interval = 900   # 15 minutes
+    # Stagger the four 15-min image fetches so they never all run on the same
+    # tick — a simultaneous refresh transiently doubles image memory and can
+    # tip a 512MB Pi into an OOM kill.
+    now0 = time.time()
+    last_solar = now0
+    last_dx = now0
+    last_muf = now0
+    last_enlil = now0 - 225
+    last_drap = now0 - 450
+    last_real_drap = now0 - 675
 
     while True:
-        time.sleep(10)
-        now = time.time()
-        if now - last_solar >= solar_interval:
-            fetch_hamqsl()
-            last_solar = now
-        if now - last_dx >= dx_interval:
-            fetch_dx()
-            last_dx = now
-        if now - last_muf >= muf_interval:
-            fetch_muf()
-            last_muf = now
-        if now - last_enlil >= enlil_interval:
-            fetch_enlil()
-            last_enlil = now
-        if now - last_drap >= drap_interval:
-            fetch_drap()
-            fetch_real_drap()
-            last_drap = now
+        try:
+            time.sleep(10)
+            now = time.time()
+            if now - last_solar >= solar_interval:
+                fetch_hamqsl()
+                last_solar = now
+            if now - last_dx >= dx_interval:
+                fetch_dx()
+                last_dx = now
+            if now - last_muf >= image_interval:
+                fetch_muf()
+                last_muf = now
+            if now - last_enlil >= image_interval:
+                fetch_enlil()
+                last_enlil = now
+            if now - last_drap >= image_interval:
+                fetch_drap()
+                last_drap = now
+            if now - last_real_drap >= image_interval:
+                fetch_real_drap()
+                last_real_drap = now
+        except Exception as e:
+            # Never let the loop die silently — that would freeze the
+            # dashboard on stale data forever. Log and keep going.
+            print(f'[{time.strftime("%H:%M:%S")}] background loop error: {e}')
+            time.sleep(10)
 
 
 class Handler(SimpleHTTPRequestHandler):
+    # Socket timeout so a stalled client can't pin a thread (and its buffered
+    # response) forever — unbounded stuck threads are a memory-pressure source.
+    timeout = 30
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=os.path.dirname(os.path.abspath(__file__)), **kwargs)
 
@@ -491,7 +506,9 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_header('Content-Type', 'image/svg+xml')
                 self.send_header('Content-Length', len(body))
                 self.send_header('Access-Control-Allow-Origin', '*')
-                self.send_header('Cache-Control', 'public, max-age=300')
+                # no-store: the dashboard fetches a fresh URL each cycle; if the
+                # browser cached these it would accumulate entries until OOM.
+                self.send_header('Cache-Control', 'no-store')
                 self.end_headers()
                 if self.command != 'HEAD':
                     self.wfile.write(body)
@@ -548,7 +565,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', len(data))
         self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Cache-Control', 'public, max-age=900')
+        # no-store: prevents the browser image cache from growing unbounded.
+        self.send_header('Cache-Control', 'no-store')
         self.end_headers()
         if self.command != 'HEAD':
             self.wfile.write(data)

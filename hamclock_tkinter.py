@@ -407,7 +407,12 @@ class HamClockTkApp:
                 self.status_bar.configure(text='update error: {}'.format(e))
             except Exception:
                 pass
-        self.root.after(1000, self._update_ui)
+        # Reschedule. Guard against the root being destroyed (e.g. Escape
+        # pressed mid-tick) — an uncaught TclError here would crash the client.
+        try:
+            self.root.after(1000, self._update_ui)
+        except Exception:
+            pass
 
     def _update_clocks(self):
         now = time.time()

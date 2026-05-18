@@ -783,6 +783,9 @@ xhr.send();
 
 function fetchAll(){
 updateCountdowns();
+// If the previous cycle's requests haven't drained, skip this cycle so the
+// queue can't grow without bound when the backend is slow or hung.
+if(fetchQueue.length>0)return;
 queueFetch('/api/solar',function(data){
 renderSolar(data);
 renderXray(data);
@@ -826,8 +829,14 @@ var elImgDrap=document.getElementById('imgDrap');
 var elImgRealDrap=document.getElementById('imgRealDrap');
 
 function refreshImages(){
-var t=Date.now();
-lastImageFetch=Math.floor(t/1000);
+// Cache-bust with the 15-min refresh slot index, NOT Date.now(). A unique
+// timestamp every cycle made the browser cache thousands of distinct image
+// URLs per day and never evict them — a slow OOM on a 512MB Pi. The slot
+// index changes once per refresh (enough to force a reload) but repeats
+// rarely, and the server sends Cache-Control: no-store so nothing piles up.
+var now=Date.now();
+var t=Math.floor(now/(IMAGE_INTERVAL*1000));
+lastImageFetch=Math.floor(now/1000);
 if(elImgSolar)elImgSolar.src='/api/solar-image?t='+t;
 setTimeout(function(){
 if(elImgMuf)elImgMuf.src='/api/muf-map?t='+t;
