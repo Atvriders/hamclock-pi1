@@ -4145,6 +4145,26 @@ if [ "$KIOSK_MODE" = "pygame" ]; then
     fi
     echo "Pygame reinstall decision: $REINSTALL_DECISION"
 
+    # Detect a pre-existing BROWSER-mode kiosk service so we can warn that
+    # localStorage doesn't migrate. We look for the browser-mode ExecStart
+    # signature in the existing unit file.
+    PRIOR_MODE_HINT=""
+    if [ -f "$SERVICE_UNIT" ]; then
+        if grep -q "surf\|midori\|chromium" "$SERVICE_UNIT" 2>/dev/null; then
+            PRIOR_MODE_HINT="browser"
+        elif grep -q "hamclock_pygame.py" "$SERVICE_UNIT" 2>/dev/null; then
+            PRIOR_MODE_HINT="pygame"
+        fi
+    fi
+
+    if [ "$REINSTALL_DECISION" != "fresh-install" ] \
+        && [ "$PRIOR_MODE_HINT" = "browser" ]; then
+        echo ""
+        echo "NOTICE: Browser localStorage (theme, callsign) is not migrated to pygame mode."
+        echo "Run 'sudo hamclock-setup' to re-enter your settings."
+        echo ""
+    fi
+
     if [ "$REINSTALL_DECISION" = "seed-defaults" ]; then
         sudo install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 /etc/hamclock-lite
         sudo -u "$SERVICE_USER" tee "$SETTINGS_FILE" >/dev/null <<'JSON'
