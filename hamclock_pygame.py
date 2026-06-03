@@ -115,6 +115,36 @@ def write_settings(d: dict, path: str = SETTINGS_PATH) -> None:
             print("[settings] chown failed: %s" % e, file=sys.stderr)
 
 
+_CALLSIGN_RE = re.compile(r"^[A-Z0-9/]{3,10}$")
+
+
+def validate_callsign(s: str) -> tuple:
+    """Validate amateur callsign per Phase 4 spec rules.
+
+    Required:
+      - regex ^[A-Z0-9/]{3,10}$ after uppercasing
+      - stripped of '/', length 3-9
+      - at least one letter and at least one digit (in stripped form)
+    Returns (ok, error_msg). On success error_msg is ''."""
+    if s is None:
+        return (False, "callsign required")
+    up = s.upper()
+    if not up:
+        return (False, "callsign required")
+    if not _CALLSIGN_RE.match(up):
+        return (False, "use A-Z, 0-9, / (3-10 chars)")
+    stripped = up.replace("/", "")
+    if not (3 <= len(stripped) <= 9):
+        return (False, "must be 3-9 letters/digits (excluding /)")
+    has_letter = any("A" <= c <= "Z" for c in stripped)
+    has_digit = any("0" <= c <= "9" for c in stripped)
+    if not has_letter:
+        return (False, "must contain at least one letter")
+    if not has_digit:
+        return (False, "must contain at least one digit")
+    return (True, "")
+
+
 # ---- THEMES (Phase 3) ----
 # Palettes are extracted from the browser dashboard at index.html L387-392
 # (the `var themes={...}` literal). kstate values match the existing pygame
