@@ -47,31 +47,38 @@ def test_make_fonts_includes_tiny():
         pygame.quit()
 
 
-def test_draw_image_no_font_alloc_when_surface_none(monkeypatch):
+def test_draw_image_loading_branch_no_inline_font_construction():
+    """draw_image's loading branch must not allocate a fresh Font per frame.
+
+    pygame.font.Font is a C-extension immutable type so we cannot monkey-patch
+    Font.__init__ to count allocations directly. Instead, verify the spec by
+    static inspection: draw_image's body must not contain a Font(...) literal.
+    The 'tiny' font is cached by _make_fonts and reused.
+    """
+    import inspect
+    import re
+    import hamclock_pygame
+    src = inspect.getsource(hamclock_pygame.draw_image)
+    assert not re.search(r"pygame\.font\.Font\s*\(", src), \
+        "draw_image still constructs a pygame.font.Font inline:\n%s" % src
+    assert "Font(None" not in src, \
+        "draw_image still references Font(None, ...) inline:\n%s" % src
+
+
+def test_draw_image_loading_branch_uses_cached_tiny_font(monkeypatch):
+    """Smoke: drive the loading branch 30 times; passing fonts dict reuses
+    fonts['tiny'] without raising. If the implementation regressed to inline
+    Font allocation, this still passes — but the static check above catches it.
+    """
     import pygame
     pygame.init()
     try:
         import hamclock_pygame
-
-        alloc_count = {'n': 0}
-        real_font_init = pygame.font.Font.__init__
-
-        def counting_init(self, *args, **kwargs):
-            alloc_count['n'] += 1
-            return real_font_init(self, *args, **kwargs)
-
-        monkeypatch.setattr(pygame.font.Font, '__init__', counting_init)
-
         fonts = hamclock_pygame._make_fonts()
-        baseline = alloc_count['n']
+        assert "tiny" in fonts
         screen = pygame.Surface((200, 100))
         rect = pygame.Rect(0, 0, 200, 100)
-
         for _ in range(30):
             hamclock_pygame.draw_image(screen, rect, None, fonts)
-
-        assert alloc_count['n'] == baseline, \
-            'draw_image allocated %d Font objects in loading state' % (
-                alloc_count['n'] - baseline)
     finally:
         pygame.quit()
