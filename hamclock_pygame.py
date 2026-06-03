@@ -663,6 +663,60 @@ def _render_recovering_overlay(screen, fonts, theme):
         pass
 
 
+_DEFAULT_SETTINGS = {
+    'callsign': '',
+    'timezone': 'UTC',
+    'theme': 'kstate',
+    'ntp': '',
+}
+
+
+def load_settings(path='/etc/hamclock-lite/settings.json'):
+    """Read settings.json with a kstate fallback.
+
+    Returns a dict containing at minimum the four keys in _DEFAULT_SETTINGS.
+    On any failure (missing file, malformed JSON, missing key, unknown
+    theme name) returns the defaults and prints a warning to stderr.
+    Tolerates a transient JSONDecodeError (file mid-write) with one 200 ms
+    retry before falling back.
+    """
+    defaults = dict(_DEFAULT_SETTINGS)
+
+    def _read_once():
+        with open(path, 'r') as f:
+            return json.load(f)
+
+    try:
+        try:
+            raw = _read_once()
+        except json.JSONDecodeError:
+            time.sleep(0.2)
+            raw = _read_once()
+    except FileNotFoundError:
+        return defaults
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        print('[settings] could not load %s: %s; using defaults' %
+              (path, e), file=sys.stderr)
+        return defaults
+
+    if not isinstance(raw, dict):
+        print('[settings] %s is not a JSON object; using defaults' % path,
+              file=sys.stderr)
+        return defaults
+
+    out = dict(defaults)
+    for k in defaults:
+        if k in raw and isinstance(raw[k], str):
+            out[k] = raw[k]
+
+    if out['theme'] not in THEMES:
+        print('[settings] unknown theme %r in %s; falling back to kstate' %
+              (out['theme'], path), file=sys.stderr)
+        out['theme'] = 'kstate'
+
+    return out
+
+
 def main(argv=None):
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     injected_iter = None

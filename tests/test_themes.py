@@ -69,3 +69,82 @@ def test_amber_bg_matches_browser_css():
 def test_blue_bg_matches_browser_css():
     # index.html L390: blue bg #0a0f1e
     assert hamclock_pygame.THEMES['blue']['bg'] == (10, 15, 30)
+
+
+import json
+import tempfile
+import pathlib
+
+
+def test_load_settings_returns_defaults_when_file_missing(tmp_path):
+    missing = tmp_path / 'nope.json'
+    d = hamclock_pygame.load_settings(str(missing))
+    assert d == {
+        'callsign': '',
+        'timezone': 'UTC',
+        'theme': 'kstate',
+        'ntp': '',
+    }
+
+
+def test_load_settings_returns_defaults_when_json_malformed(tmp_path, capsys):
+    bad = tmp_path / 'bad.json'
+    bad.write_text('{not json')
+    d = hamclock_pygame.load_settings(str(bad))
+    assert d['theme'] == 'kstate'
+    assert d['timezone'] == 'UTC'
+    err = capsys.readouterr().err
+    assert 'settings' in err.lower()
+
+
+def test_load_settings_returns_defaults_when_theme_unknown(tmp_path):
+    bad = tmp_path / 's.json'
+    bad.write_text(json.dumps({
+        'callsign': 'W1ABC', 'timezone': 'UTC',
+        'theme': 'mystery', 'ntp': '',
+    }))
+    d = hamclock_pygame.load_settings(str(bad))
+    assert d['theme'] == 'kstate'
+
+
+def test_load_settings_returns_file_contents_when_valid(tmp_path):
+    good = tmp_path / 's.json'
+    payload = {
+        'callsign': 'W1ABC', 'timezone': 'America/Chicago',
+        'theme': 'classic', 'ntp': 'pool.ntp.org',
+    }
+    good.write_text(json.dumps(payload))
+    d = hamclock_pygame.load_settings(str(good))
+    assert d == payload
+
+
+def test_load_settings_fills_missing_keys_with_defaults(tmp_path):
+    partial = tmp_path / 's.json'
+    partial.write_text(json.dumps({'theme': 'amber'}))
+    d = hamclock_pygame.load_settings(str(partial))
+    assert d['theme'] == 'amber'
+    assert d['callsign'] == ''
+    assert d['timezone'] == 'UTC'
+    assert d['ntp'] == ''
+
+
+def test_load_settings_retries_once_on_json_decode_error(tmp_path, monkeypatch):
+    """Mid-write race: first read raises JSONDecodeError, second succeeds."""
+    p = tmp_path / 's.json'
+    p.write_text(json.dumps({
+        'callsign': 'K1A', 'timezone': 'UTC',
+        'theme': 'blue', 'ntp': '',
+    }))
+    real_open = open
+    calls = {'n': 0}
+    def flaky_open(path, *a, **kw):
+        if str(path) == str(p) and calls['n'] == 0:
+            calls['n'] += 1
+            # First call returns a file whose contents trip JSONDecodeError.
+            import io
+            return io.StringIO('')
+        return real_open(path, *a, **kw)
+    monkeypatch.setattr('builtins.open', flaky_open)
+    d = hamclock_pygame.load_settings(str(p))
+    assert d['theme'] == 'blue'
+    assert calls['n'] == 1
