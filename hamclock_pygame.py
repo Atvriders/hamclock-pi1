@@ -5,8 +5,10 @@ the same /api/* endpoints as the web UI but rendering directly with
 Pygame/SDL for a ~50 MB RAM and ~10% CPU win over the browser stack.
 """
 
+import argparse
 import collections
 import io
+import json
 import os
 import sys
 import time
@@ -464,7 +466,78 @@ def _compute_dirty_rects(state, panel_rects, active_tab,
     return dirty
 
 
-def main():
+# ---- --inject-events debug flag (Phase 1 verification harness) ----
+# Gated by HAMCLOCK_DEBUG=1 so production never accepts injected events.
+# Reads a JSON list of {"type": "MOUSEBUTTONDOWN"|"KEYDOWN"|"QUIT", ...}
+# dicts and yields one per frame via _inject_event_iter().
+
+_KEY_NAME_MAP = {
+    'q': pygame.K_q,
+    'escape': pygame.K_ESCAPE,
+    'return': pygame.K_RETURN,
+    'tab': pygame.K_TAB,
+    'space': pygame.K_SPACE,
+    'left': pygame.K_LEFT,
+    'right': pygame.K_RIGHT,
+    'up': pygame.K_UP,
+    'down': pygame.K_DOWN,
+}
+
+
+def _parse_args(argv):
+    """Parse CLI args. --inject-events requires HAMCLOCK_DEBUG=1 in env."""
+    p = argparse.ArgumentParser(prog='hamclock_pygame')
+    p.add_argument('--inject-events', default=None,
+                   help='debug builds only: JSON event list to replay')
+    args = p.parse_args(argv)
+    if args.inject_events is not None and os.environ.get('HAMCLOCK_DEBUG') != '1':
+        p.error('--inject-events is debug builds only '
+                '(set HAMCLOCK_DEBUG=1 to enable)')
+    return args
+
+
+def _load_injected_events(path):
+    """Load a JSON list of event dicts and convert to pygame.event.Event."""
+    with open(path, 'r') as f:
+        raw = json.load(f)
+    out = []
+    for d in raw:
+        t = d.get('type')
+        if t == 'MOUSEBUTTONDOWN':
+            out.append(pygame.event.Event(
+                pygame.MOUSEBUTTONDOWN,
+                pos=tuple(d.get('pos', (0, 0))),
+                button=int(d.get('button', 1))))
+        elif t == 'MOUSEBUTTONUP':
+            out.append(pygame.event.Event(
+                pygame.MOUSEBUTTONUP,
+                pos=tuple(d.get('pos', (0, 0))),
+                button=int(d.get('button', 1))))
+        elif t == 'KEYDOWN':
+            key = d.get('key', '')
+            kc = _KEY_NAME_MAP.get(str(key).lower(),
+                                   getattr(pygame, 'K_' + str(key).lower(), 0))
+            out.append(pygame.event.Event(pygame.KEYDOWN, key=kc))
+        elif t == 'QUIT':
+            out.append(pygame.event.Event(pygame.QUIT))
+    return out
+
+
+def _inject_event_iter(events):
+    """Yield [event] one frame at a time, then [] forever."""
+    for ev in events:
+        yield [ev]
+    while True:
+        yield []
+
+
+def main(argv=None):
+    args = _parse_args(sys.argv[1:] if argv is None else argv)
+    injected_iter = None
+    if args.inject_events:
+        injected_iter = _inject_event_iter(
+            _load_injected_events(args.inject_events))
+
     if 'DISPLAY' not in os.environ:
         os.environ.setdefault('SDL_VIDEODRIVER', 'fbcon')
         os.environ.setdefault('SDL_FBDEV', '/dev/fb0')
@@ -514,7 +587,10 @@ def main():
     consecutive_errors = 0
     while running:
         try:
-            for event in pygame.event.get():
+            frame_events = (next(injected_iter)
+                            if injected_iter is not None
+                            else pygame.event.get())
+            for event in frame_events:
                 if event.type == pygame.QUIT:
                     running = False
                 elif event.type == pygame.KEYDOWN:
