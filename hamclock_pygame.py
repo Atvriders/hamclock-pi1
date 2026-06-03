@@ -83,6 +83,38 @@ def load_settings(path: str = SETTINGS_PATH) -> dict:
     return dict(DEFAULT_SETTINGS)
 
 
+def write_settings(d: dict, path: str = SETTINGS_PATH) -> None:
+    """Atomic write: tempfile in same dir + fsync + os.replace + chmod 0644.
+
+    When running as root, attempts to chown to SERVICE_UID/SERVICE_GID so the
+    file is owned by the service user regardless of who invoked the CLI.
+    PermissionError on chown is expected (wizard already runs as SERVICE_USER)
+    and is suppressed."""
+    dirpath = os.path.dirname(path) or "."
+    os.makedirs(dirpath, exist_ok=True)
+    tmp = os.path.join(dirpath, "settings.json.tmp.%d" % os.getpid())
+    try:
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    if SERVICE_UID is not None and SERVICE_GID is not None:
+        try:
+            os.chown(path, SERVICE_UID, SERVICE_GID)
+        except PermissionError:
+            pass
+        except OSError as e:
+            print("[settings] chown failed: %s" % e, file=sys.stderr)
+
+
 # ---- THEMES (Phase 3) ----
 # Palettes are extracted from the browser dashboard at index.html L387-392
 # (the `var themes={...}` literal). kstate values match the existing pygame

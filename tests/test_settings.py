@@ -62,3 +62,50 @@ def test_load_settings_retries_on_transient_jsondecode(tmp_path, monkeypatch):
     d = load_settings(str(p))
     assert d["callsign"] == "K1A"
     assert calls["n"] == 1
+
+
+from hamclock_pygame import write_settings
+
+
+def test_write_settings_atomic(tmp_path):
+    p = tmp_path / "settings.json"
+    d = {"callsign": "W1ABC", "timezone": "UTC",
+         "theme": "kstate", "ntp": ""}
+    write_settings(d, str(p))
+    assert p.exists()
+    assert json.loads(p.read_text()) == d
+    st = os.stat(p)
+    assert (st.st_mode & 0o777) == 0o644
+
+
+def test_write_settings_no_temp_files_remain(tmp_path):
+    p = tmp_path / "settings.json"
+    write_settings({"callsign": "K1A", "timezone": "UTC",
+                    "theme": "kstate", "ntp": ""}, str(p))
+    leftovers = [f for f in os.listdir(tmp_path)
+                 if f.startswith("settings.json.tmp.")]
+    assert leftovers == []
+
+
+def test_write_settings_overwrites_existing(tmp_path):
+    p = tmp_path / "settings.json"
+    p.write_text('{"old":"junk"}')
+    d = {"callsign": "W1ABC", "timezone": "UTC",
+         "theme": "amber", "ntp": ""}
+    write_settings(d, str(p))
+    assert json.loads(p.read_text()) == d
+
+
+def test_write_settings_chown_permission_error_suppressed(tmp_path, monkeypatch):
+    p = tmp_path / "settings.json"
+
+    def raise_perm(*a, **kw):
+        raise PermissionError("not allowed")
+
+    monkeypatch.setattr(os, "chown", raise_perm)
+    # Force a non-None UID so chown is attempted.
+    monkeypatch.setattr("hamclock_pygame.SERVICE_UID", 1000)
+    monkeypatch.setattr("hamclock_pygame.SERVICE_GID", 1000)
+    write_settings({"callsign": "K1A", "timezone": "UTC",
+                    "theme": "kstate", "ntp": ""}, str(p))
+    assert p.exists()
