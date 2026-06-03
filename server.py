@@ -47,8 +47,39 @@ PHASE2_TIMEOUT_S = 45
 
 
 def _rasterize_muf(svg_bytes):
-    """Phase 2 stub — full body added in Task 2.3."""
-    raise NotImplementedError
+    """Render the KC2G MUF SVG to PNG in a subprocess so the multi-second
+    render does not block the request thread or the background fetcher.
+
+    output_width=720 because the MUF panel is ~720x420 in the 1440x900
+    layout; rendering at native panel width halves cairo's CPU cost vs.
+    full screen. cairosvg.svg2png preserves aspect ratio when only
+    output_width is given — the 1526x905 SVG becomes 720x427 PNG.
+
+    cpulimit caps the subprocess to 50% of one core so the render loop
+    keeps its frame budget even mid-rasterize. nice -n 19 alone is
+    ineffective on an idle single-core box because the render loop
+    sleeps between 10 FPS frames; the cairosvg job would still claim
+    the core. cpulimit enforces a hard duty cycle.
+
+    Returns the PNG bytes, or None on subprocess error / timeout /
+    missing cpulimit / cairosvg ImportError inside the child.
+    """
+    try:
+        p = subprocess.run(
+            ['cpulimit', '-l', '50', '-q', '--',
+             'python3', '-c',
+             'import sys, cairosvg; cairosvg.svg2png('
+             'bytestring=sys.stdin.buffer.read(), '
+             'output_width=720, write_to=sys.stdout.buffer)'],
+            input=svg_bytes,
+            capture_output=True,
+            timeout=PHASE2_TIMEOUT_S,
+            check=True,
+        )
+        return p.stdout
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        print('[muf] rasterize failed: %s' % e, file=sys.stderr)
+        return None
 
 
 # Solar image proxy (NASA SDO)
