@@ -80,3 +80,82 @@ def test_textfield_draw_does_not_raise():
     tf = TextField(pygame.Rect(0, 0, 200, 40), initial="W1ABC", label="Call")
     tf.draw(surf, THEME, focused=True)
     tf.draw(surf, THEME, focused=False)
+
+
+import json as _json
+from hamclock_pygame import setup_screen
+
+
+def _make_fake_fonts():
+    return {
+        "tiny": pygame.font.Font(None, 14),
+        "small": pygame.font.Font(None, 18),
+        "med": pygame.font.Font(None, 24),
+        "lg": pygame.font.Font(None, 36),
+    }
+
+
+def test_setup_screen_writes_expected_json(tmp_path, monkeypatch):
+    """Inject the canonical Phase 4 wizard sequence and assert the
+    returned dict matches the spec."""
+    events_path = tmp_path / "events.json"
+    seq = []
+    for ch in "W1ABC":
+        seq.append({"type": "KEYDOWN", "key": "K_" + ch.lower(),
+                    "unicode": ch})
+        if ch.isalpha():
+            # Ensure unicode key matches printable.
+            seq[-1]["unicode"] = ch
+    seq.append({"type": "KEYDOWN", "key": "K_TAB", "unicode": ""})
+    for ch in "America/Chicago":
+        seq.append({"type": "KEYDOWN", "key": "K_a",
+                    "unicode": ch})
+    seq.append({"type": "KEYDOWN", "key": "K_TAB", "unicode": ""})
+    seq.append({"type": "KEYDOWN", "key": "K_RIGHT", "unicode": ""})
+    seq.append({"type": "KEYDOWN", "key": "K_TAB", "unicode": ""})
+    seq.append({"type": "KEYDOWN", "key": "K_RETURN", "unicode": ""})
+    events_path.write_text(_json.dumps(seq))
+
+    monkeypatch.setenv("HAMCLOCK_DEBUG", "1")
+    monkeypatch.setenv("HAMCLOCK_INJECT_EVENTS", str(events_path))
+
+    screen = pygame.display.set_mode((1440, 900))
+    fonts = _make_fake_fonts()
+    theme = THEME
+
+    result = setup_screen(screen, fonts, theme)
+    assert result["callsign"] == "W1ABC"
+    assert result["timezone"] == "America/Chicago"
+    assert result["theme"] in ("classic", "amber", "blue", "kstate")
+    assert result["ntp"] == ""
+
+
+def test_setup_screen_rejects_invalid_timezone(tmp_path, monkeypatch):
+    events_path = tmp_path / "ev.json"
+    seq = []
+    for ch in "W1ABC":
+        seq.append({"type": "KEYDOWN", "key": "K_w", "unicode": ch})
+    seq.append({"type": "KEYDOWN", "key": "K_TAB", "unicode": ""})
+    for ch in "Atlantis/Lost":
+        seq.append({"type": "KEYDOWN", "key": "K_a", "unicode": ch})
+    seq.append({"type": "KEYDOWN", "key": "K_TAB", "unicode": ""})
+    seq.append({"type": "KEYDOWN", "key": "K_TAB", "unicode": ""})
+    seq.append({"type": "KEYDOWN", "key": "K_RETURN", "unicode": ""})
+    # After save is rejected, fix tz and resubmit.
+    seq.append({"type": "KEYDOWN", "key": "K_HOME", "unicode": ""})
+    for _ in range(len("Atlantis/Lost")):
+        seq.append({"type": "KEYDOWN", "key": "K_DELETE", "unicode": ""})
+    for ch in "UTC":
+        seq.append({"type": "KEYDOWN", "key": "K_u", "unicode": ch})
+    seq.append({"type": "KEYDOWN", "key": "K_TAB", "unicode": ""})
+    seq.append({"type": "KEYDOWN", "key": "K_TAB", "unicode": ""})
+    seq.append({"type": "KEYDOWN", "key": "K_RETURN", "unicode": ""})
+    events_path.write_text(_json.dumps(seq))
+
+    monkeypatch.setenv("HAMCLOCK_DEBUG", "1")
+    monkeypatch.setenv("HAMCLOCK_INJECT_EVENTS", str(events_path))
+
+    screen = pygame.display.set_mode((1440, 900))
+    fonts = _make_fake_fonts()
+    result = setup_screen(screen, fonts, THEME)
+    assert result["timezone"] == "UTC"

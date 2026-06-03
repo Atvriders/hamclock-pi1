@@ -269,6 +269,204 @@ class TextField:
             surface.blit(er, (box_rect.x, box_rect.y + box_rect.h + 4))
 
 
+WIZARD_THEMES = ["kstate", "classic", "amber", "blue"]
+
+
+def _inject_events_from_file(path):
+    """Read a JSON list of pygame events and post them.
+
+    Each entry: {"type": "KEYDOWN", "key": "K_a", "unicode": "a"}
+    or {"type": "MOUSEBUTTONDOWN", "pos": [x, y], "button": 1}.
+    """
+    with open(path, "r") as f:
+        seq = json.load(f)
+    out = []
+    for e in seq:
+        if e["type"] == "KEYDOWN":
+            key_name = e.get("key", "K_UNKNOWN")
+            key = getattr(pygame, key_name, pygame.K_UNKNOWN)
+            out.append(pygame.event.Event(
+                pygame.KEYDOWN,
+                {"key": key, "unicode": e.get("unicode", ""),
+                 "mod": e.get("mod", 0)}))
+        elif e["type"] == "MOUSEBUTTONDOWN":
+            out.append(pygame.event.Event(
+                pygame.MOUSEBUTTONDOWN,
+                {"pos": tuple(e.get("pos", (0, 0))),
+                 "button": e.get("button", 1)}))
+    return out
+
+
+def setup_screen(screen, fonts, theme):
+    """Render the first-boot wizard. Block until Save, return settings dict.
+
+    Reads events from pygame.event.get() unless HAMCLOCK_DEBUG=1 and
+    HAMCLOCK_INJECT_EVENTS is set, in which case events are read from
+    the named JSON file and dispatched one per frame."""
+    sw, sh = screen.get_size()
+
+    # Resolve fonts defensively: the kiosk passes {title, panel, small, ...}
+    # but tests use {tiny, small, med, lg}. Fall back to any available font.
+    def _font(*names):
+        for n in names:
+            f = fonts.get(n)
+            if f is not None:
+                return f
+        return next(iter(fonts.values()))
+    title_font = _font("title", "lg", "med")
+    panel_font = _font("panel", "med", "small")
+    small_font = _font("small", "tiny")
+
+    # Set key repeat once (skip on x11 where the WM already handles it).
+    try:
+        if pygame.display.get_driver() != "x11":
+            pygame.key.set_repeat(400, 40)
+    except pygame.error:
+        pass
+    pygame.mouse.set_visible(False)
+
+    # Panel layout (centered 700x500 panel).
+    panel_w, panel_h = 700, 500
+    px = (sw - panel_w) // 2
+    py = (sh - panel_h) // 2
+
+    call_field = TextField(
+        pygame.Rect(px + 220, 280, 440, 44),
+        initial="", max_len=10,
+        validator=lambda s: validate_callsign(s.upper()),
+        label="Callsign")
+    tz_field = TextField(
+        pygame.Rect(px + 220, 360, 440, 44),
+        initial="", max_len=64,
+        validator=validate_timezone, label="Timezone")
+    theme_idx = 0
+    focus = 0  # 0=call, 1=tz, 2=theme, 3=save
+    fields = [call_field, tz_field]
+
+    # Inject-event source (debug only).
+    inject_path = None
+    if os.environ.get("HAMCLOCK_DEBUG") == "1":
+        inject_path = os.environ.get("HAMCLOCK_INJECT_EVENTS")
+    injected_events = None
+    inject_idx = 0
+    if inject_path:
+        injected_events = _inject_events_from_file(inject_path)
+
+    clock = pygame.time.Clock()
+    running = True
+    result = None
+    max_frames = 5000  # debug safety net so injected runs always terminate
+
+    frame = 0
+    while running and frame < max_frames:
+        frame += 1
+        if injected_events is not None:
+            if inject_idx >= len(injected_events):
+                events = [pygame.event.Event(pygame.QUIT, {})]
+            else:
+                events = [injected_events[inject_idx]]
+                inject_idx += 1
+        else:
+            events = pygame.event.get()
+
+        for ev in events:
+            if ev.type == pygame.QUIT:
+                running = False
+                break
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                sys.exit(1)
+
+            if focus == 0 or focus == 1:
+                res = fields[focus].handle_event(ev)
+                if res == "next":
+                    focus = (focus + 1) % 4
+                elif res == "prev":
+                    focus = (focus - 1) % 4
+                elif res == "submit":
+                    focus = 3  # jump to Save
+                elif res == "cancel":
+                    sys.exit(1)
+            elif focus == 2:  # theme cycler
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key in (pygame.K_LEFT,):
+                        theme_idx = (theme_idx - 1) % len(WIZARD_THEMES)
+                    elif ev.key in (pygame.K_RIGHT,):
+                        theme_idx = (theme_idx + 1) % len(WIZARD_THEMES)
+                    elif ev.key in (pygame.K_TAB, pygame.K_DOWN, pygame.K_RETURN):
+                        focus = 3
+                    elif ev.key == pygame.K_UP:
+                        focus = 1
+            elif focus == 3:  # Save button
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key in (pygame.K_TAB, pygame.K_DOWN):
+                        focus = 0
+                    elif ev.key == pygame.K_UP:
+                        focus = 2
+                    elif ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                        # Re-validate both fields.
+                        ok1 = call_field._validate()
+                        ok2 = tz_field._validate()
+                        if ok1 and ok2:
+                            result = {
+                                "callsign": call_field.text.upper(),
+                                "timezone": tz_field.text,
+                                "theme": WIZARD_THEMES[theme_idx],
+                                "ntp": "",
+                            }
+                            running = False
+                        else:
+                            focus = 0 if not ok1 else 1
+
+        # Draw.
+        screen.fill(theme["bg"])
+        pygame.draw.rect(screen, theme["card"],
+                         pygame.Rect(px, py, panel_w, panel_h))
+        title = title_font.render("HAMCLOCK SETUP", True, theme["fg"])
+        screen.blit(title, (sw // 2 - title.get_width() // 2, 180))
+
+        call_field.draw(screen, theme, focused=(focus == 0))
+        tz_field.draw(screen, theme, focused=(focus == 1))
+
+        # Theme cycler row.
+        tf_font = panel_font
+        lbl = tf_font.render("Theme", True, theme["label"])
+        screen.blit(lbl, (px + 220 - lbl.get_width() - 14, 440 + 10))
+        cur = WIZARD_THEMES[theme_idx]
+        arrows = "< %s >" % cur if focus == 2 else "  %s  " % cur
+        col = theme["accent"] if focus == 2 else theme["fg"]
+        arr = tf_font.render(arrows, True, col)
+        screen.blit(arr, (sw // 2 - arr.get_width() // 2, 440 + 4))
+
+        # Save button.
+        save_rect = pygame.Rect(sw // 2 - 80, 540, 160, 48)
+        save_col = theme["accent"] if focus == 3 else theme["muted"]
+        pygame.draw.rect(screen, theme["card"], save_rect)
+        pygame.draw.rect(screen, save_col, save_rect, 3)
+        sv = tf_font.render("Save", True, theme["fg"])
+        screen.blit(sv, (save_rect.centerx - sv.get_width() // 2,
+                         save_rect.centery - sv.get_height() // 2))
+
+        hint = small_font.render(
+            "Tab to move, Enter to save", True, theme["muted"])
+        screen.blit(hint, (sw // 2 - hint.get_width() // 2, 620))
+
+        pygame.display.flip()
+        if injected_events is None:
+            clock.tick(30)
+        else:
+            clock.tick(0)  # no throttle in tests
+
+    if result is None:
+        # QUIT/timeout: return current values with kstate fallback.
+        result = {
+            "callsign": call_field.text.upper(),
+            "timezone": tz_field.text if validate_timezone(tz_field.text)[0] else "UTC",
+            "theme": WIZARD_THEMES[theme_idx],
+            "ntp": "",
+        }
+    return result
+
+
 # ---- THEMES (Phase 3) ----
 # Palettes are extracted from the browser dashboard at index.html L387-392
 # (the `var themes={...}` literal). kstate values match the existing pygame
