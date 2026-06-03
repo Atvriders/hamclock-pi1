@@ -15,7 +15,7 @@
 main() {
 set -euo pipefail
 
-KIOSK_MODE="browser"
+KIOSK_MODE="pygame"   # default — native client, no browser, <=200ms p99 clicks
 for arg in "$@"; do
     case "$arg" in
         --pygame)  KIOSK_MODE="pygame" ;;
@@ -4131,6 +4131,35 @@ done
 KIOSKEOF
 fi
 sudo chmod +x /opt/hamclock-lite/kiosk.sh
+
+# --- Phase 5: pygame-mode reinstall detection -----------------------------
+if [ "$KIOSK_MODE" = "pygame" ]; then
+    SETTINGS_FILE="/etc/hamclock-lite/settings.json"
+    SERVICE_UNIT="/etc/systemd/system/hamclock-kiosk.service"
+    if [ -f "$SETTINGS_FILE" ]; then
+        REINSTALL_DECISION="keep-settings"
+    elif [ -f "$SERVICE_UNIT" ]; then
+        REINSTALL_DECISION="seed-defaults"
+    else
+        REINSTALL_DECISION="fresh-install"
+    fi
+    echo "Pygame reinstall decision: $REINSTALL_DECISION"
+
+    if [ "$REINSTALL_DECISION" = "seed-defaults" ]; then
+        sudo install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 /etc/hamclock-lite
+        sudo -u "$SERVICE_USER" tee "$SETTINGS_FILE" >/dev/null <<'JSON'
+{
+  "callsign": "",
+  "timezone": "UTC",
+  "theme": "kstate",
+  "ntp": ""
+}
+JSON
+        sudo chmod 0644 "$SETTINGS_FILE"
+        echo "Run 'sudo hamclock-setup' to personalize your settings."
+    fi
+fi
+# --- end Phase 5 reinstall detection -------------------------------------
 
 # ── Step 10: Create hamclock-kiosk systemd service (mode-specific) ──
 if [ "$KIOSK_MODE" = "pygame" ]; then

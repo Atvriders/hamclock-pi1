@@ -21,3 +21,9 @@ def test_kiosk_installer_default_is_pygame():
 def test_offline_installer_default_is_pygame():
     text = (REPO / "offline-install.sh").read_text()
     assert _default_line(text).startswith('KIOSK_MODE="pygame"')
+
+def test_offline_installer_contains_reinstall_block():
+    text = (REPO / "offline-install.sh").read_text()
+    assert 'REINSTALL_DECISION="keep-settings"' in text
+    assert 'REINSTALL_DECISION="seed-defaults"' in text
+    assert 'REINSTALL_DECISION="fresh-install"' in text
