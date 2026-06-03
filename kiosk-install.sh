@@ -131,6 +131,37 @@ fi
 # Detect the user
 SERVICE_USER="${SUDO_USER:-$USER}"
 
+# ---- Phase 4: settings directory + hamclock-setup wrapper ----
+sudo install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 /etc/hamclock-lite
+
+# Reinstall detection: if settings already exist, don't overwrite. If a
+# pygame service already exists but settings don't, write a default file.
+if [ ! -f /etc/hamclock-lite/settings.json ]; then
+    if systemctl list-unit-files | grep -q '^hamclock-kiosk\.service'; then
+        sudo -u "$SERVICE_USER" tee /etc/hamclock-lite/settings.json >/dev/null <<'SETTINGSEOF'
+{
+  "callsign": "",
+  "timezone": "UTC",
+  "theme": "kstate",
+  "ntp": ""
+}
+SETTINGSEOF
+        sudo chmod 0644 /etc/hamclock-lite/settings.json
+        echo "Existing pygame install detected; wrote default settings.json."
+        echo "Run 'sudo hamclock-setup --callsign YOUR_CALL --timezone YOUR_TZ --theme kstate' to personalize."
+    fi
+    # Truly fresh install (no service unit yet) leaves settings.json absent
+    # so the wizard auto-launches on first kiosk boot.
+fi
+
+# Install the hamclock-setup wrapper.
+sudo tee /usr/local/bin/hamclock-setup > /dev/null <<'HSEOF'
+#!/bin/sh
+# Thin wrapper around the pygame client's --setup-cli mode.
+exec python3 /opt/hamclock-lite/hamclock_pygame.py --setup-cli "$@"
+HSEOF
+sudo chmod 0755 /usr/local/bin/hamclock-setup
+
 # Add user to video and tty groups for X server access
 sudo usermod -aG video,tty,input "$SERVICE_USER"
 
@@ -253,6 +284,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 User=$SERVICE_USER
+Environment=HAMCLOCK_SERVICE_USER=$SERVICE_USER
 StandardInput=tty
 StandardOutput=tty
 TTYPath=/dev/tty7
@@ -281,6 +313,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 User=$SERVICE_USER
+Environment=HAMCLOCK_SERVICE_USER=$SERVICE_USER
 Environment=DISPLAY=:0
 StandardInput=tty
 StandardOutput=tty
