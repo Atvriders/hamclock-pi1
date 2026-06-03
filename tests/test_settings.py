@@ -128,3 +128,34 @@ def test_validate_timezone_rejected():
         ok, err = validate_timezone(name)
         assert not ok, "expected reject for %r" % name
         assert err != ""
+
+
+def test_concurrent_writes_leave_valid_json(tmp_path):
+    p = tmp_path / "settings.json"
+    base = {"callsign": "W1ABC", "timezone": "UTC",
+            "theme": "kstate", "ntp": ""}
+
+    def writer(theme):
+        d = dict(base)
+        d["theme"] = theme
+        for _ in range(50):
+            write_settings(d, str(p))
+
+    threads = [threading.Thread(target=writer, args=(t,))
+               for t in ("kstate", "amber", "classic", "blue")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Final file must parse cleanly and contain a known theme.
+    data = json.loads(p.read_text())
+    assert data["theme"] in ("kstate", "amber", "classic", "blue")
+    # And load_settings must not raise.
+    d = load_settings(str(p))
+    assert d["callsign"] == "W1ABC"
+
+    # No leftover tempfiles.
+    leftovers = [f for f in os.listdir(tmp_path)
+                 if f.startswith("settings.json.tmp.")]
+    assert leftovers == []

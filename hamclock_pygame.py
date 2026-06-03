@@ -92,7 +92,8 @@ def write_settings(d: dict, path: str = SETTINGS_PATH) -> None:
     and is suppressed."""
     dirpath = os.path.dirname(path) or "."
     os.makedirs(dirpath, exist_ok=True)
-    tmp = os.path.join(dirpath, "settings.json.tmp.%d" % os.getpid())
+    fd, tmp = tempfile.mkstemp(prefix="settings.json.tmp.", dir=dirpath)
+    os.close(fd)
     try:
         with open(tmp, "w") as f:
             json.dump(d, f, indent=2)
