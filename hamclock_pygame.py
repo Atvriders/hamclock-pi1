@@ -18,45 +18,131 @@ import pygame
 from hamclock_data import HamClockData
 
 
-# ---- Theme palettes (minimal stub; expanded with full 4-theme dict in Phase 3) ----
+# ---- THEMES (Phase 3) ----
+# Palettes are extracted from the browser dashboard at index.html L387-392
+# (the `var themes={...}` literal). kstate values match the existing pygame
+# constants the kiosk has been shipping. Every draw function takes a
+# `theme: dict` and indexes by the keys below.
+#
+# Required keys per palette:
+#   bg, card, border, fg, bright, muted, label, accent, callsign,
+#   good, fair, poor, na, band_palette (list of 10), sdo_accent.
+
 THEMES = {
     'kstate': {
-        'bg': (42, 20, 80),
-        'card': (58, 29, 101),
-        'fg': (232, 221, 245),
-        'label': (184, 160, 216),
-        'accent': (244, 197, 92),
+        'bg':       (42, 20, 80),
+        'card':     (58, 29, 101),
+        'border':   (81, 40, 136),
+        'fg':       (232, 221, 245),
+        'bright':   (255, 255, 255),
+        'muted':    (146, 126, 180),
+        'label':    (184, 160, 216),
+        'accent':   (244, 197, 92),
+        'callsign': (244, 114, 182),
+        'good':     (34, 197, 94),
+        'fair':     (234, 179, 8),
+        'poor':     (239, 68, 68),
+        'na':       (74, 85, 104),
+        'band_palette': [
+            (255, 107, 107), (240, 101, 149), (204, 93, 232),
+            (132, 94, 247),  (92, 124, 250),  (51, 154, 240),
+            (34, 184, 207),  (32, 201, 151),  (81, 207, 102),
+            (148, 216, 45),
+        ],
+        'sdo_accent': (244, 197, 92),
+    },
+    'classic': {
+        'bg':       (10, 14, 20),
+        'card':     (17, 24, 32),
+        'border':   (26, 37, 48),
+        'fg':       (200, 208, 216),
+        'bright':   (232, 240, 240),
+        'muted':    (96, 112, 128),
+        'label':    (136, 153, 170),
+        'accent':   (6, 182, 212),
+        'callsign': (244, 114, 182),
+        'good':     (34, 197, 94),
+        'fair':     (234, 179, 8),
+        'poor':     (239, 68, 68),
+        'na':       (74, 85, 104),
+        'band_palette': [
+            (255, 107, 107), (240, 101, 149), (204, 93, 232),
+            (132, 94, 247),  (92, 124, 250),  (51, 154, 240),
+            (34, 184, 207),  (32, 201, 151),  (81, 207, 102),
+            (148, 216, 45),
+        ],
+        'sdo_accent': (6, 182, 212),
+    },
+    'amber': {
+        'bg':       (26, 16, 0),
+        'card':     (31, 24, 0),
+        'border':   (51, 40, 0),
+        'fg':       (220, 180, 130),
+        'bright':   (255, 220, 160),
+        'muted':    (138, 104, 64),
+        'label':    (184, 128, 96),
+        'accent':   (245, 158, 11),
+        'callsign': (59, 130, 246),
+        'good':     (245, 158, 11),
+        'fair':     (251, 191, 36),
+        'poor':     (239, 68, 68),
+        'na':       (90, 70, 40),
+        'band_palette': [
+            (255, 99, 71),  (255, 140, 70),  (255, 170, 70),
+            (255, 200, 80), (245, 220, 90),  (245, 158, 11),
+            (220, 140, 50), (200, 120, 40),  (180, 100, 30),
+            (160, 90, 20),
+        ],
+        'sdo_accent': (245, 158, 11),
+    },
+    'blue': {
+        'bg':       (10, 15, 30),
+        'card':     (15, 22, 40),
+        'border':   (26, 37, 64),
+        'fg':       (200, 215, 235),
+        'bright':   (232, 240, 248),
+        'muted':    (80, 104, 136),
+        'label':    (112, 144, 176),
+        'accent':   (59, 130, 246),
+        'callsign': (245, 158, 11),
+        'good':     (96, 165, 250),
+        'fair':     (234, 179, 8),
+        'poor':     (239, 68, 68),
+        'na':       (60, 80, 110),
+        'band_palette': [
+            (255, 107, 107), (240, 101, 149), (204, 93, 232),
+            (132, 94, 247),  (92, 124, 250),  (51, 154, 240),
+            (34, 184, 207),  (32, 201, 151),  (81, 207, 102),
+            (148, 216, 45),
+        ],
+        'sdo_accent': (59, 130, 246),
     },
 }
 
+HF_BANDS = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m', '12m', '10m']
 
-# ---- K-State theme colors ----
-BG = (42, 20, 80)
-CARD = (58, 29, 101)
-BORDER = (81, 40, 136)
-TEXT = (232, 221, 245)
-LABEL = (184, 160, 216)
-BRIGHT = (255, 255, 255)
-ACCENT_GOLD = (244, 197, 92)
-STATUS_GREEN = (34, 197, 94)
-STATUS_YELLOW = (234, 179, 8)
-STATUS_RED = (239, 68, 68)
+# Legacy constants kept for the in-place refactor steps that follow.
+# Each subsequent task replaces one draw function's references; by Task 3.7
+# these are deleted.
+BG = THEMES['kstate']['bg']
+CARD = THEMES['kstate']['card']
+BORDER = THEMES['kstate']['border']
+TEXT = THEMES['kstate']['fg']
+LABEL = THEMES['kstate']['label']
+BRIGHT = THEMES['kstate']['bright']
+ACCENT_GOLD = THEMES['kstate']['accent']
+STATUS_GREEN = THEMES['kstate']['good']
+STATUS_YELLOW = THEMES['kstate']['fair']
+STATUS_RED = THEMES['kstate']['poor']
 
 COND_COLORS = {
-    'Good': (34, 197, 94),
-    'Fair': (234, 179, 8),
-    'Poor': (239, 68, 68),
-    'N/A': (74, 85, 104),
+    'Good': THEMES['kstate']['good'],
+    'Fair': THEMES['kstate']['fair'],
+    'Poor': THEMES['kstate']['poor'],
+    'N/A':  THEMES['kstate']['na'],
 }
 
-BAND_COLORS = {
-    '160m': (255, 107, 107), '80m': (240, 101, 149), '60m': (204, 93, 232),
-    '40m': (132, 94, 247), '30m': (92, 124, 250), '20m': (51, 154, 240),
-    '17m': (34, 184, 207), '15m': (32, 201, 151), '12m': (81, 207, 102),
-    '10m': (148, 216, 45),
-}
-
-HF_BANDS = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m', '12m', '10m']
+BAND_COLORS = dict(zip(HF_BANDS, THEMES['kstate']['band_palette']))
 
 SCREEN_W = 1440
 SCREEN_H = 900
