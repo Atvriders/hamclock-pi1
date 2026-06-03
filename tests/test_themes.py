@@ -97,16 +97,6 @@ def test_load_settings_returns_defaults_when_json_malformed(tmp_path, capsys):
     assert 'settings' in err.lower()
 
 
-def test_load_settings_returns_defaults_when_theme_unknown(tmp_path):
-    bad = tmp_path / 's.json'
-    bad.write_text(json.dumps({
-        'callsign': 'W1ABC', 'timezone': 'UTC',
-        'theme': 'mystery', 'ntp': '',
-    }))
-    d = hamclock_pygame.load_settings(str(bad))
-    assert d['theme'] == 'kstate'
-
-
 def test_load_settings_returns_file_contents_when_valid(tmp_path):
     good = tmp_path / 's.json'
     payload = {

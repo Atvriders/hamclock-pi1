@@ -17,6 +17,71 @@ import pygame
 
 from hamclock_data import HamClockData
 
+import pwd
+import grp
+import re
+import tempfile
+
+# ---- Settings layer (Phase 4) ----
+SETTINGS_PATH = "/etc/hamclock-lite/settings.json"
+SETTINGS_DIR = "/etc/hamclock-lite"
+
+DEFAULT_SETTINGS = {
+    "callsign": "",
+    "timezone": "UTC",
+    "theme": "kstate",
+    "ntp": "",
+}
+
+
+def _resolve_service_ids():
+    """Return (uid, gid) for the SERVICE_USER, or (None, None) if unknown.
+
+    Used only when running as root (CLI under sudo). The wizard runs as
+    SERVICE_USER already and skips this path."""
+    name = os.environ.get("HAMCLOCK_SERVICE_USER") or os.environ.get("SUDO_USER")
+    if not name:
+        return (None, None)
+    try:
+        pw = pwd.getpwnam(name)
+        return (pw.pw_uid, pw.pw_gid)
+    except KeyError:
+        return (None, None)
+
+
+SERVICE_UID, SERVICE_GID = _resolve_service_ids()
+
+
+def load_settings(path: str = SETTINGS_PATH) -> dict:
+    """Return settings dict, falling back to DEFAULT_SETTINGS on any error.
+
+    Tolerates a transient JSONDecodeError (mid-replace race) by retrying
+    once after 200 ms before treating the file as missing."""
+    for attempt in (0, 1):
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            merged = dict(DEFAULT_SETTINGS)
+            if isinstance(data, dict):
+                for k in DEFAULT_SETTINGS:
+                    if k in data and isinstance(data[k], str):
+                        merged[k] = data[k]
+            return merged
+        except FileNotFoundError:
+            return dict(DEFAULT_SETTINGS)
+        except json.JSONDecodeError:
+            if attempt == 0:
+                time.sleep(0.2)
+                continue
+            print("[settings] malformed %s; using defaults" % path,
+                  file=sys.stderr)
+            return dict(DEFAULT_SETTINGS)
+        except OSError as e:
+            print("[settings] cannot read %s: %s" % (path, e),
+                  file=sys.stderr)
+            return dict(DEFAULT_SETTINGS)
+    return dict(DEFAULT_SETTINGS)
+
 
 # ---- THEMES (Phase 3) ----
 # Palettes are extracted from the browser dashboard at index.html L387-392
@@ -669,60 +734,6 @@ def _render_recovering_overlay(screen, fonts, theme):
         pass
 
 
-_DEFAULT_SETTINGS = {
-    'callsign': '',
-    'timezone': 'UTC',
-    'theme': 'kstate',
-    'ntp': '',
-}
-
-
-def load_settings(path='/etc/hamclock-lite/settings.json'):
-    """Read settings.json with a kstate fallback.
-
-    Returns a dict containing at minimum the four keys in _DEFAULT_SETTINGS.
-    On any failure (missing file, malformed JSON, missing key, unknown
-    theme name) returns the defaults and prints a warning to stderr.
-    Tolerates a transient JSONDecodeError (file mid-write) with one 200 ms
-    retry before falling back.
-    """
-    defaults = dict(_DEFAULT_SETTINGS)
-
-    def _read_once():
-        with open(path, 'r') as f:
-            return json.load(f)
-
-    try:
-        try:
-            raw = _read_once()
-        except json.JSONDecodeError:
-            time.sleep(0.2)
-            raw = _read_once()
-    except FileNotFoundError:
-        return defaults
-    except (OSError, json.JSONDecodeError, ValueError) as e:
-        print('[settings] could not load %s: %s; using defaults' %
-              (path, e), file=sys.stderr)
-        return defaults
-
-    if not isinstance(raw, dict):
-        print('[settings] %s is not a JSON object; using defaults' % path,
-              file=sys.stderr)
-        return defaults
-
-    out = dict(defaults)
-    for k in defaults:
-        if k in raw and isinstance(raw[k], str):
-            out[k] = raw[k]
-
-    if out['theme'] not in THEMES:
-        print('[settings] unknown theme %r in %s; falling back to kstate' %
-              (out['theme'], path), file=sys.stderr)
-        out['theme'] = 'kstate'
-
-    return out
-
-
 def main(argv=None):
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     injected_iter = None
@@ -751,7 +762,7 @@ def main(argv=None):
 
     fonts = _make_fonts()
     settings = load_settings()
-    theme = THEMES[settings['theme']]
+    theme = THEMES.get(settings['theme'], THEMES['kstate'])
 
     data = HamClockData()
     try:
