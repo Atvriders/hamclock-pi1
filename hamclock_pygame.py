@@ -297,6 +297,29 @@ def _inject_events_from_file(path):
     return out
 
 
+def _wait_for_ntp_sync(deadline_s: float = 10.0) -> bool:
+    """Block up to deadline_s for `timedatectl show -p NTPSynchronized`
+    to report `yes`. Returns True on success, False on timeout (with a
+    stderr warning). Avoids saving settings.json mtime with a wrong
+    clock right after boot."""
+    import subprocess, time
+    end = time.time() + deadline_s
+    while time.time() < end:
+        try:
+            r = subprocess.run(
+                ["timedatectl", "show", "-p", "NTPSynchronized",
+                 "--value"],
+                capture_output=True, text=True, timeout=2)
+            if r.stdout.strip() == "yes":
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    print("wizard: NTP not yet synced after %.0fs — saving anyway; "
+          "mtime may be wrong" % deadline_s, file=sys.stderr)
+    return False
+
+
 def setup_screen(screen, fonts, theme):
     """Render the first-boot wizard. Block until Save, return settings dict.
 
@@ -407,6 +430,7 @@ def setup_screen(screen, fonts, theme):
                         ok1 = call_field._validate()
                         ok2 = tz_field._validate()
                         if ok1 and ok2:
+                            _wait_for_ntp_sync(deadline_s=10.0)
                             result = {
                                 "callsign": call_field.text.upper(),
                                 "timezone": tz_field.text,

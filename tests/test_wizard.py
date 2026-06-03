@@ -159,3 +159,29 @@ def test_setup_screen_rejects_invalid_timezone(tmp_path, monkeypatch):
     fonts = _make_fake_fonts()
     result = setup_screen(screen, fonts, THEME)
     assert result["timezone"] == "UTC"
+
+
+def test_wait_for_ntp_returns_quickly_when_synced(monkeypatch):
+    import subprocess as _sp
+    import hamclock_pygame as hp
+
+    class R: pass
+    def fake_run(cmd, capture_output, text, timeout):
+        r = R(); r.stdout = "yes\n"; r.returncode = 0
+        return r
+    monkeypatch.setattr(_sp, "run", fake_run)
+    assert hp._wait_for_ntp_sync(deadline_s=10) is True
+
+
+def test_wait_for_ntp_warns_on_timeout(monkeypatch, capsys):
+    import subprocess as _sp
+    import hamclock_pygame as hp
+
+    class R: pass
+    def fake_run(cmd, capture_output, text, timeout):
+        r = R(); r.stdout = "no\n"; r.returncode = 0
+        return r
+    monkeypatch.setattr(_sp, "run", fake_run)
+    assert hp._wait_for_ntp_sync(deadline_s=0) is False
+    out = capsys.readouterr()
+    assert "NTP" in out.err or "ntp" in out.err
