@@ -163,6 +163,112 @@ def validate_timezone(s: str) -> tuple:
     return (False, "unknown timezone (use IANA name like America/Chicago)")
 
 
+class TextField:
+    """Single-line text input widget for the setup wizard.
+
+    handle_event returns one of:
+      'submit' (Enter), 'next' (Tab / Down), 'cancel' (Esc), or None.
+    Shift+Tab and Up are returned by the wizard via handle_event as 'prev'
+    handled at the panel level — TextField itself returns 'next' on Tab/Down
+    and 'submit'/'cancel' on Enter/Esc; the panel inspects modifiers.
+    """
+
+    def __init__(self, rect, initial="", max_len=32,
+                 validator=None, label=""):
+        self.rect = rect
+        self.text = initial
+        self.cursor = len(initial)
+        self.max_len = max_len
+        self.validator = validator
+        self.label = label
+        self.error = ""
+
+    def _validate(self):
+        if self.validator is None:
+            self.error = ""
+            return True
+        ok, err = self.validator(self.text)
+        self.error = "" if ok else err
+        return ok
+
+    def handle_event(self, ev):
+        if ev.type != pygame.KEYDOWN:
+            return None
+        key = ev.key
+        if key == pygame.K_RETURN or key == pygame.K_KP_ENTER:
+            self._validate()
+            return "submit"
+        if key == pygame.K_TAB or key == pygame.K_DOWN:
+            self._validate()
+            return "next"
+        if key == pygame.K_UP:
+            self._validate()
+            return "prev"
+        if key == pygame.K_ESCAPE:
+            return "cancel"
+        if key == pygame.K_BACKSPACE:
+            if self.cursor > 0:
+                self.text = (self.text[:self.cursor - 1]
+                             + self.text[self.cursor:])
+                self.cursor -= 1
+                self._validate()
+            return None
+        if key == pygame.K_DELETE:
+            if self.cursor < len(self.text):
+                self.text = (self.text[:self.cursor]
+                             + self.text[self.cursor + 1:])
+                self._validate()
+            return None
+        if key == pygame.K_LEFT:
+            self.cursor = max(0, self.cursor - 1)
+            return None
+        if key == pygame.K_RIGHT:
+            self.cursor = min(len(self.text), self.cursor + 1)
+            return None
+        if key == pygame.K_HOME:
+            self.cursor = 0
+            return None
+        if key == pygame.K_END:
+            self.cursor = len(self.text)
+            return None
+        ch = ev.unicode or ""
+        if ch and ch.isprintable():
+            if len(self.text) >= self.max_len:
+                return None
+            self.text = (self.text[:self.cursor] + ch
+                         + self.text[self.cursor:])
+            self.cursor += len(ch)
+            self._validate()
+        return None
+
+    def draw(self, surface, theme, focused):
+        # Label on the left, box on the right (or no label).
+        box_rect = self.rect.copy()
+        if self.label:
+            font = pygame.font.Font(None, 28)
+            lbl = font.render(self.label, True, theme["label"])
+            surface.blit(lbl, (self.rect.x - lbl.get_width() - 14,
+                               self.rect.y + (self.rect.h - lbl.get_height()) // 2))
+        border = theme["poor"] if self.error else (
+            theme["accent"] if focused else theme["muted"])
+        pygame.draw.rect(surface, theme["card"], box_rect)
+        pygame.draw.rect(surface, border, box_rect, 2)
+        font = pygame.font.Font(None, 28)
+        txt = font.render(self.text, True, theme["fg"])
+        surface.blit(txt, (box_rect.x + 8,
+                           box_rect.y + (box_rect.h - txt.get_height()) // 2))
+        if focused:
+            # Blinking caret driven by time; always drawn here for tests.
+            cx = box_rect.x + 8 + font.size(self.text[:self.cursor])[0]
+            cy = box_rect.y + 6
+            pygame.draw.line(surface, theme["fg"],
+                             (cx, cy), (cx, cy + box_rect.h - 12), 2)
+        if self.error:
+            ef = pygame.font.Font(None, 20)
+            er = ef.render(self.error, True, theme["poor"])
+            surface.blit(er, (box_rect.x, box_rect.y + box_rect.h + 4))
+
+
 # ---- THEMES (Phase 3) ----
 # Palettes are extracted from the browser dashboard at index.html L387-392
 # (the `var themes={...}` literal). kstate values match the existing pygame
