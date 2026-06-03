@@ -256,30 +256,36 @@ def _load_image(data_bytes):
         return None
 
 
-def draw_panel(screen, rect, title, fonts):
-    pygame.draw.rect(screen, CARD, rect)
-    pygame.draw.rect(screen, BORDER, rect, 1)
+def draw_panel(screen, rect, title, fonts, theme):
+    pygame.draw.rect(screen, theme['card'], rect)
+    pygame.draw.rect(screen, theme['border'], rect, 1)
     bar = pygame.Rect(rect.x, rect.y, rect.w, 18)
-    pygame.draw.rect(screen, BORDER, bar)
-    _blit_text(screen, fonts['panel'], title, BRIGHT, rect.x + 6, rect.y + 2)
+    pygame.draw.rect(screen, theme['border'], bar)
+    _blit_text(screen, fonts['panel'], title, theme['bright'],
+               rect.x + 6, rect.y + 2)
     return pygame.Rect(rect.x + 6, rect.y + 22, rect.w - 12, rect.h - 26)
 
 
-def draw_header(screen, rect, callsign, fonts):
-    pygame.draw.rect(screen, CARD, rect)
-    pygame.draw.rect(screen, BORDER, rect, 1)
-    _blit_text(screen, fonts['title'], 'HAMCLOCK LITE', ACCENT_GOLD, rect.x + 8, rect.y + 4)
+def draw_header(screen, rect, callsign, fonts, theme):
+    pygame.draw.rect(screen, theme['card'], rect)
+    pygame.draw.rect(screen, theme['border'], rect, 1)
+    _blit_text(screen, fonts['title'], 'HAMCLOCK LITE', theme['accent'],
+               rect.x + 8, rect.y + 4)
     if callsign:
-        _blit_text(screen, fonts['body'], str(callsign), BRIGHT, rect.x + 220, rect.y + 8)
+        _blit_text(screen, fonts['body'], str(callsign), theme['bright'],
+                   rect.x + 220, rect.y + 8)
     try:
         utc = time.strftime('%H:%M:%S', time.gmtime())
         local = time.strftime('%H:%M:%S')
     except Exception:
         utc = local = '--:--:--'
-    _blit_text(screen, fonts['body'], 'UTC ' + utc, TEXT, rect.x + rect.w - 340, rect.y + 8)
-    _blit_text(screen, fonts['body'], 'LOC ' + local, TEXT, rect.x + rect.w - 180, rect.y + 8)
-    dot_color = STATUS_GREEN if (int(time.time()) % 2 == 0) else STATUS_YELLOW
-    pygame.draw.circle(screen, dot_color, (rect.x + rect.w - 18, rect.y + 14), 5)
+    _blit_text(screen, fonts['body'], 'UTC ' + utc, theme['fg'],
+               rect.x + rect.w - 340, rect.y + 8)
+    _blit_text(screen, fonts['body'], 'LOC ' + local, theme['fg'],
+               rect.x + rect.w - 180, rect.y + 8)
+    dot_color = theme['good'] if (int(time.time()) % 2 == 0) else theme['fair']
+    pygame.draw.circle(screen, dot_color,
+                       (rect.x + rect.w - 18, rect.y + 14), 5)
 
 
 def draw_solar(screen, rect, solar, fonts):
@@ -498,9 +504,9 @@ def draw_open_bands(screen, rect, bands, fonts):
                STATUS_RED, rect.x, rect.y + 16)
 
 
-def draw_status_bar(screen, rect, data, fonts):
-    pygame.draw.rect(screen, CARD, rect)
-    pygame.draw.rect(screen, BORDER, rect, 1)
+def draw_status_bar(screen, rect, data, fonts, theme):
+    pygame.draw.rect(screen, theme['card'], rect)
+    pygame.draw.rect(screen, theme['border'], rect, 1)
     now = time.time()
     dage = int(now - data.last_data_refresh) if data.last_data_refresh else -1
     iage = int(now - data.last_image_refresh) if data.last_image_refresh else -1
@@ -511,8 +517,9 @@ def draw_status_bar(screen, rect, data, fonts):
         'OK' if data.bands else '--',
         len(data.dxspots) if isinstance(data.dxspots, list) else 0,
     )
-    _blit_text(screen, fonts['small'], text, LABEL, rect.x + 6, rect.y + 4)
-    _blit_text(screen, fonts['small'], 'ESC/Q to quit', LABEL,
+    _blit_text(screen, fonts['small'], text, theme['label'],
+               rect.x + 6, rect.y + 4)
+    _blit_text(screen, fonts['small'], 'ESC/Q to quit', theme['label'],
                rect.x + rect.w - 110, rect.y + 4)
 
 
@@ -744,6 +751,8 @@ def main(argv=None):
     pygame.display.set_caption('HamClock Lite')
 
     fonts = _make_fonts()
+    settings = load_settings()
+    theme = THEMES[settings['theme']]
 
     data = HamClockData()
     try:
@@ -791,14 +800,14 @@ def main(argv=None):
                             break
 
             sw, sh = screen.get_size()
-            screen.fill(BG)
+            screen.fill(theme['bg'])
 
             header = pygame.Rect(0, 0, sw, 30)
             callsign = os.environ.get('HAMCLOCK_CALLSIGN', 'N0CALL')
-            draw_header(screen, header, callsign, fonts)
+            draw_header(screen, header, callsign, fonts, theme)
 
             status = pygame.Rect(0, sh - 20, sw, 20)
-            draw_status_bar(screen, status, data, fonts)
+            draw_status_bar(screen, status, data, fonts, theme)
 
             content_top = 32
             content_bot = sh - 22
@@ -826,7 +835,7 @@ def main(argv=None):
             panel_rects = []
             for h, t in zip(heights, titles):
                 r = pygame.Rect(lx, cy, left_w - 4, h)
-                inner = draw_panel(screen, r, t, fonts)
+                inner = draw_panel(screen, r, t, fonts, theme)
                 panel_rects.append(inner)
                 cy += h + panel_gap
 
@@ -861,7 +870,7 @@ def main(argv=None):
             # ---- MIDDLE COLUMN ----
             mx = lx + left_w
             mid_rect = pygame.Rect(mx, content_top, mid_w - 4, content_h)
-            mid_inner = draw_panel(screen, mid_rect, 'MUF STATUS', fonts)
+            mid_inner = draw_panel(screen, mid_rect, 'MUF STATUS', fonts, theme)
             try:
                 draw_muf_text(screen, mid_inner, data.solar or {}, fonts)
             except Exception:
@@ -874,14 +883,14 @@ def main(argv=None):
             rh_prop = content_h - rh_dx - rh_ba - panel_gap * 2
 
             dx_r = pygame.Rect(rx, content_top, right_w - 4, rh_dx)
-            dx_inner = draw_panel(screen, dx_r, 'DX SPOTS', fonts)
+            dx_inner = draw_panel(screen, dx_r, 'DX SPOTS', fonts, theme)
             try:
                 draw_dx_spots(screen, dx_inner, data.dxspots or [], fonts)
             except Exception:
                 pass
 
             ba_r = pygame.Rect(rx, content_top + rh_dx + panel_gap, right_w - 4, rh_ba)
-            ba_inner = draw_panel(screen, ba_r, 'BAND ACTIVITY', fonts)
+            ba_inner = draw_panel(screen, ba_r, 'BAND ACTIVITY', fonts, theme)
             try:
                 draw_band_activity(screen, ba_inner, data.dxspots or [], fonts)
             except Exception:
@@ -889,7 +898,7 @@ def main(argv=None):
 
             prop_r = pygame.Rect(rx, content_top + rh_dx + rh_ba + panel_gap * 2,
                                  right_w - 4, rh_prop)
-            prop_inner = draw_panel(screen, prop_r, 'PROPAGATION', fonts)
+            prop_inner = draw_panel(screen, prop_r, 'PROPAGATION', fonts, theme)
             tab_bar = pygame.Rect(prop_inner.x, prop_inner.y, prop_inner.w, 20)
             tab_regions = draw_tabs(screen, tab_bar, ['drap', 'aurora', 'enlil'],
                                     active_tab, fonts)

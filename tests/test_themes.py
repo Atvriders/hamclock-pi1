@@ -148,3 +148,35 @@ def test_load_settings_retries_once_on_json_decode_error(tmp_path, monkeypatch):
     d = hamclock_pygame.load_settings(str(p))
     assert d['theme'] == 'blue'
     assert calls['n'] == 1
+
+
+import inspect
+
+
+def test_draw_panel_signature_takes_theme():
+    sig = inspect.signature(hamclock_pygame.draw_panel)
+    assert 'theme' in sig.parameters
+
+
+def test_draw_header_signature_takes_theme():
+    sig = inspect.signature(hamclock_pygame.draw_header)
+    assert 'theme' in sig.parameters
+
+
+def test_draw_status_bar_signature_takes_theme():
+    sig = inspect.signature(hamclock_pygame.draw_status_bar)
+    assert 'theme' in sig.parameters
+
+
+def test_draw_panel_uses_theme_card_color():
+    import pygame
+    pygame.init()
+    surf = pygame.Surface((200, 100))
+    surf.fill((0, 0, 0))
+    fonts = hamclock_pygame._make_fonts()
+    theme = hamclock_pygame.THEMES['blue']
+    rect = pygame.Rect(10, 10, 100, 60)
+    hamclock_pygame.draw_panel(surf, rect, 'TEST', fonts, theme)
+    # Sample the interior of the panel (below the title bar at y+22).
+    px = surf.get_at((50, 50))[:3]
+    assert tuple(px) == theme['card'], f'got {tuple(px)}, want {theme["card"]}'
