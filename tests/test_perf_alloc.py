@@ -272,3 +272,72 @@ def test_compute_dirty_rects_tab_change_forces_full_flip():
         assert state['prev_active_tab'] == 'aurora'
     finally:
         pygame.quit()
+
+
+def test_render_loop_30_frame_alloc_budget(monkeypatch):
+    """30-frame headless render: smoothscale <= N_visible_images,
+    no Font(None, 18) literal in draw_image source, glyph hit rate >= 90%.
+    """
+    import inspect, re
+    import pygame
+    pygame.init()
+    try:
+        import hamclock_pygame
+
+        calls = {'smoothscale': 0, 'render': 0}
+
+        real_ss = pygame.transform.smoothscale
+        def counting_ss(surf, size, *a, **kw):
+            calls['smoothscale'] += 1
+            return real_ss(surf, size, *a, **kw)
+        monkeypatch.setattr(pygame.transform, 'smoothscale', counting_ss)
+
+        # pygame.font.Font is an immutable C type; class and instance .render
+        # cannot be monkeypatched. Wrap each font in the fonts dict with a
+        # proxy that counts render calls and forwards everything else.
+        class _CountingFont:
+            def __init__(self, inner):
+                self._inner = inner
+            def render(self, *a, **kw):
+                calls['render'] += 1
+                return self._inner.render(*a, **kw)
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        # Static-source check: draw_image must not construct Font inline.
+        di_src = inspect.getsource(hamclock_pygame.draw_image)
+        assert not re.search(r"pygame\.font\.Font\s*\(", di_src), \
+            'draw_image still constructs Font inline'
+
+        hamclock_pygame._scaled_cache.clear()
+        hamclock_pygame._glyph_cache.clear()
+        raw_fonts = hamclock_pygame._make_fonts()
+        fonts = {k: _CountingFont(v) for k, v in raw_fonts.items()}
+        screen = pygame.Surface((1440, 900))
+        src_img = pygame.Surface((800, 600))
+        rect_sdo = pygame.Rect(0, 30, 280, 250)
+        rect_prop = pygame.Rect(1100, 600, 340, 280)
+
+        # Reset render counter AFTER fonts built (SysFont init may call render).
+        calls['render'] = 0
+
+        for frame in range(30):
+            hamclock_pygame.draw_image(screen, rect_sdo, src_img, fonts,
+                                       image_key='solar-image', fetched_at=1000.0)
+            hamclock_pygame.draw_image(screen, rect_prop, src_img, fonts,
+                                       image_key='real-drap', fetched_at=1000.0)
+            for label in ('SOLAR', 'BANDS', 'SDO IMAGE', 'OPEN:', 'CLOSED:',
+                          'SFI', 'Kp', 'A', 'FREQ', 'BND'):
+                hamclock_pygame._blit_text(screen, fonts['panel'], label,
+                                           (255, 255, 255), 0, 0)
+
+        assert calls['smoothscale'] <= 2, \
+            'smoothscale ran %d times over 30 frames (expected <= 2)' % calls['smoothscale']
+        # 30 frames * 10 labels = 300 _blit_text calls; first frame: 10 cache
+        # misses, remaining 29 frames hit. Expected render count = 10.
+        assert calls['render'] == 10, \
+            'glyph cache: expected 10 renders, got %d' % calls['render']
+        hit_rate = 1.0 - (calls['render'] / 300.0)
+        assert hit_rate >= 0.90, 'glyph cache hit rate %.2f < 0.90' % hit_rate
+    finally:
+        pygame.quit()
