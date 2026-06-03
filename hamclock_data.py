@@ -56,6 +56,11 @@ class HamClockData:
         # Timestamps (Unix seconds; 0 means never)
         self.last_data_refresh = 0
         self.last_image_refresh = 0
+        # Per-image refresh timestamps (epoch seconds). Maps image_key
+        # ('solar-image' | 'muf-map' | 'enlil' | 'drap' | 'real-drap')
+        # to the epoch-second when that key's bytes last refreshed.
+        # Used by the pygame client's _scaled_cache to invalidate per-image.
+        self.image_fetched_at = {}
         # Errors (most recent error per key, None if last fetch succeeded)
         self.errors = {}
         # Internal
@@ -120,11 +125,16 @@ class HamClockData:
             results[key] = data is not None
             if data is not None:
                 fetched[key] = data
+        now = time.time()
         with self._lock:
             new_images = dict(self.images)
             new_images.update(fetched)
             self.images = new_images
-            self.last_image_refresh = time.time()
+            new_ts = dict(self.image_fetched_at)
+            for key in fetched:
+                new_ts[key] = now
+            self.image_fetched_at = new_ts
+            self.last_image_refresh = now
         return results
 
     def start_background(self, data_interval=60, image_interval=900):
