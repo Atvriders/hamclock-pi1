@@ -1144,7 +1144,10 @@ def _render_recovering_overlay(screen, fonts, theme):
 
 
 def main(argv=None):
-    args = _parse_args(sys.argv[1:] if argv is None else argv)
+    # Use parse_known_args so stray runner args (e.g. pytest) don't kill us
+    # when a caller invokes main() directly without scrubbing sys.argv.
+    raw_argv = sys.argv[1:] if argv is None else argv
+    args, _unknown = _parse_args_known(raw_argv)
     injected_iter = None
     if args.inject_events:
         injected_iter = _inject_event_iter(
@@ -1170,9 +1173,51 @@ def main(argv=None):
     pygame.display.set_caption('HamClock Lite')
 
     fonts = _make_fonts()
-    settings = load_settings()
-    theme = THEMES.get(settings['theme'], THEMES['kstate'])
 
+    # ---- Phase 4: first-boot wizard ----
+    settings = load_settings(SETTINGS_PATH)
+    need_wizard = not os.path.exists(SETTINGS_PATH)
+    if need_wizard:
+        # Wizard always renders in kstate (user hasn't picked yet).
+        wiz_theme = THEMES["kstate"] if "THEMES" in globals() else {
+            "bg": (42, 20, 80), "card": (58, 29, 101),
+            "fg": (232, 221, 245), "muted": (146, 126, 180),
+            "label": (184, 160, 216), "accent": (244, 197, 92),
+            "good": (34, 197, 94), "fair": (234, 179, 8),
+            "poor": (239, 68, 68),
+            "band_palette": [(0, 0, 0)] * 10,
+            "sdo_accent": (244, 197, 92),
+        }
+        settings = setup_screen(screen, fonts, wiz_theme)
+        try:
+            write_settings(settings, SETTINGS_PATH)
+        except OSError as e:
+            print("[main] could not persist settings: %s" % e,
+                  file=sys.stderr)
+
+    theme = THEMES.get(settings.get('theme', 'kstate'), THEMES['kstate'])
+
+    _run_render_loop(screen, fonts, theme, settings, injected_iter)
+
+
+def _parse_args_known(argv):
+    """parse_known_args wrapper around _parse_args' parser so that callers
+    invoking main() inside a host process (e.g. pytest) don't blow up on
+    arguments meant for the host."""
+    p = argparse.ArgumentParser(prog='hamclock_pygame')
+    p.add_argument('--inject-events', default=None,
+                   help='debug builds only: JSON event list to replay')
+    args, unknown = p.parse_known_args(argv)
+    if args.inject_events is not None and os.environ.get('HAMCLOCK_DEBUG') != '1':
+        p.error('--inject-events is debug builds only '
+                '(set HAMCLOCK_DEBUG=1 to enable)')
+    return args, unknown
+
+
+def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
+    """The dashboard render loop, factored out of main() so that the
+    Phase-4 first-boot wizard can run beforehand and tests can patch this
+    entry point to assert ordering without spinning up real rendering."""
     data = HamClockData()
     try:
         data.start_background(data_interval=60, image_interval=900)

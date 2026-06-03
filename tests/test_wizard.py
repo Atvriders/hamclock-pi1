@@ -270,3 +270,38 @@ def test_setup_cli_apply_ntp_writes_dropin(tmp_path):
     content = ntp_path.read_text()
     assert "[Time]" in content
     assert "NTP=pool.ntp.org" in content
+
+
+def test_main_launches_wizard_when_settings_absent(tmp_path, monkeypatch):
+    """When SETTINGS_PATH points at a missing file, main() should call
+    setup_screen() once, persist the result, and only then enter the
+    render loop. The test patches setup_screen and the render loop to
+    assert ordering."""
+    import hamclock_pygame as hp
+
+    calls = []
+
+    def fake_setup(screen, fonts, theme):
+        calls.append("setup")
+        return {"callsign": "W1ABC", "timezone": "UTC",
+                "theme": "kstate", "ntp": ""}
+
+    def fake_render_loop(*a, **kw):
+        calls.append("render")
+        raise SystemExit(0)
+
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(hp, "SETTINGS_PATH", str(settings_file))
+    monkeypatch.setattr(hp, "setup_screen", fake_setup)
+    monkeypatch.setattr(hp, "_run_render_loop", fake_render_loop,
+                        raising=False)
+    monkeypatch.setenv("SDL_VIDEODRIVER", "dummy")
+
+    with pytest.raises(SystemExit):
+        hp.main()
+
+    assert calls[0] == "setup"
+    assert "render" in calls
+    assert settings_file.exists()
+    data = _json.loads(settings_file.read_text())
+    assert data["callsign"] == "W1ABC"
