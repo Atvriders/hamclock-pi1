@@ -121,29 +121,6 @@ THEMES = {
 
 HF_BANDS = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m', '12m', '10m']
 
-# Legacy constants kept for the in-place refactor steps that follow.
-# Each subsequent task replaces one draw function's references; by Task 3.7
-# these are deleted.
-BG = THEMES['kstate']['bg']
-CARD = THEMES['kstate']['card']
-BORDER = THEMES['kstate']['border']
-TEXT = THEMES['kstate']['fg']
-LABEL = THEMES['kstate']['label']
-BRIGHT = THEMES['kstate']['bright']
-ACCENT_GOLD = THEMES['kstate']['accent']
-STATUS_GREEN = THEMES['kstate']['good']
-STATUS_YELLOW = THEMES['kstate']['fair']
-STATUS_RED = THEMES['kstate']['poor']
-
-COND_COLORS = {
-    'Good': THEMES['kstate']['good'],
-    'Fair': THEMES['kstate']['fair'],
-    'Poor': THEMES['kstate']['poor'],
-    'N/A':  THEMES['kstate']['na'],
-}
-
-BAND_COLORS = dict(zip(HF_BANDS, THEMES['kstate']['band_palette']))
-
 SCREEN_W = 1440
 SCREEN_H = 900
 
@@ -340,7 +317,7 @@ def draw_image(screen, rect, surface, fonts=None, theme=None,
                image_key=None, fetched_at=None):
     if surface is None:
         if fonts is not None and 'tiny' in fonts:
-            label_color = theme['label'] if theme is not None else LABEL
+            label_color = theme['label'] if theme is not None else (184, 160, 216)
             _blit_text(screen, fonts['tiny'], 'image loading...',
                        label_color, rect.x + 6, rect.y + 6)
         return

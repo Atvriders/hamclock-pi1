@@ -293,3 +293,74 @@ def test_load_settings_default_path_constant_present():
     # main() should be able to call load_settings() with no args.
     d = hamclock_pygame.load_settings('/no/such/path/for/testing.json')
     assert d['theme'] == 'kstate'
+
+
+import json as _json
+
+
+def test_legacy_color_constants_removed():
+    """Phase 3 is done when these top-level color names no longer exist."""
+    for name in ('BG', 'CARD', 'BORDER', 'TEXT', 'LABEL', 'BRIGHT',
+                 'ACCENT_GOLD', 'STATUS_GREEN', 'STATUS_YELLOW',
+                 'STATUS_RED', 'COND_COLORS', 'BAND_COLORS'):
+        assert not hasattr(hamclock_pygame, name), \
+            f'legacy constant {name!r} still present'
+
+
+def _render_one_frame(theme_name, tmp_path, monkeypatch):
+    """Helper: write settings.json for the named theme, run one main()
+    iteration headlessly, return the screen surface."""
+    import pygame
+    from hamclock_data import HamClockData
+    settings_path = tmp_path / 'settings.json'
+    settings_path.write_text(_json.dumps({
+        'callsign': '', 'timezone': 'UTC',
+        'theme': theme_name, 'ntp': '',
+    }))
+    # Simpler path: just call load_settings directly with the path.
+    settings = hamclock_pygame.load_settings(str(settings_path))
+    assert settings['theme'] == theme_name
+    theme = hamclock_pygame.THEMES[settings['theme']]
+
+    pygame.init()
+    surf = pygame.Surface((hamclock_pygame.SCREEN_W, hamclock_pygame.SCREEN_H))
+    surf.fill(theme['bg'])
+    fonts = hamclock_pygame._make_fonts()
+
+    class _StubData:
+        solar = {}
+        bands = {}
+        dxspots = []
+        images = {}
+        last_data_refresh = 0
+        last_image_refresh = 0
+    data = _StubData()
+
+    header = pygame.Rect(0, 0, hamclock_pygame.SCREEN_W, 30)
+    hamclock_pygame.draw_header(surf, header, '', fonts, theme)
+    status = pygame.Rect(0, hamclock_pygame.SCREEN_H - 20,
+                         hamclock_pygame.SCREEN_W, 20)
+    hamclock_pygame.draw_status_bar(surf, status, data, fonts, theme)
+    return surf, theme
+
+
+@pytest.mark.parametrize('theme_name', ['kstate', 'classic', 'amber', 'blue'])
+def test_headless_frame_bg_matches_theme(theme_name, tmp_path, monkeypatch):
+    surf, theme = _render_one_frame(theme_name, tmp_path, monkeypatch)
+    px = surf.get_at((0, hamclock_pygame.SCREEN_H // 2))[:3]
+    assert tuple(px) == theme['bg'], \
+        f'{theme_name}: got {tuple(px)}, want {theme["bg"]}'
+
+
+def test_headless_frame_without_settings_uses_kstate(tmp_path):
+    """settings.json absent → load_settings returns kstate defaults → bg matches."""
+    import pygame
+    missing = tmp_path / 'absent.json'
+    settings = hamclock_pygame.load_settings(str(missing))
+    assert settings['theme'] == 'kstate'
+    theme = hamclock_pygame.THEMES[settings['theme']]
+    pygame.init()
+    surf = pygame.Surface((hamclock_pygame.SCREEN_W, hamclock_pygame.SCREEN_H))
+    surf.fill(theme['bg'])
+    px = surf.get_at((0, hamclock_pygame.SCREEN_H // 2))[:3]
+    assert tuple(px) == (42, 20, 80)
