@@ -134,26 +134,6 @@ SERVICE_USER="${SUDO_USER:-$USER}"
 # ---- Phase 4: settings directory + hamclock-setup wrapper ----
 sudo install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 /etc/hamclock-lite
 
-# Reinstall detection: if settings already exist, don't overwrite. If a
-# pygame service already exists but settings don't, write a default file.
-if [ ! -f /etc/hamclock-lite/settings.json ]; then
-    if systemctl list-unit-files | grep -q '^hamclock-kiosk\.service'; then
-        sudo -u "$SERVICE_USER" tee /etc/hamclock-lite/settings.json >/dev/null <<'SETTINGSEOF'
-{
-  "callsign": "",
-  "timezone": "UTC",
-  "theme": "kstate",
-  "ntp": ""
-}
-SETTINGSEOF
-        sudo chmod 0644 /etc/hamclock-lite/settings.json
-        echo "Existing pygame install detected; wrote default settings.json."
-        echo "Run 'sudo hamclock-setup --callsign YOUR_CALL --timezone YOUR_TZ --theme kstate' to personalize."
-    fi
-    # Truly fresh install (no service unit yet) leaves settings.json absent
-    # so the wizard auto-launches on first kiosk boot.
-fi
-
 # Install the hamclock-setup wrapper.
 sudo tee /usr/local/bin/hamclock-setup > /dev/null <<'HSEOF'
 #!/bin/sh
@@ -270,6 +250,43 @@ done
 KIOSKEOF
 fi
 sudo chmod +x /opt/hamclock-lite/kiosk.sh
+
+# --- Phase 5: pygame-mode reinstall detection -----------------------------
+# Decide whether to: keep an existing user settings file untouched,
+# seed a default settings file for a Pi already running the OLD pygame
+# mode (service unit present, settings absent), or treat this as a
+# truly fresh install where the wizard will auto-launch on first boot.
+if [ "$KIOSK_MODE" = "pygame" ]; then
+    SETTINGS_FILE="/etc/hamclock-lite/settings.json"
+    SERVICE_UNIT="/etc/systemd/system/hamclock-kiosk.service"
+    if [ -f "$SETTINGS_FILE" ]; then
+        REINSTALL_DECISION="keep-settings"
+    elif [ -f "$SERVICE_UNIT" ]; then
+        REINSTALL_DECISION="seed-defaults"
+    else
+        REINSTALL_DECISION="fresh-install"
+    fi
+    echo "Pygame reinstall decision: $REINSTALL_DECISION"
+
+    if [ "$REINSTALL_DECISION" = "seed-defaults" ]; then
+        sudo install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 /etc/hamclock-lite
+        sudo -u "$SERVICE_USER" tee "$SETTINGS_FILE" >/dev/null <<'JSON'
+{
+  "callsign": "",
+  "timezone": "UTC",
+  "theme": "kstate",
+  "ntp": ""
+}
+JSON
+        sudo chmod 0644 "$SETTINGS_FILE"
+        echo "Run 'sudo hamclock-setup' to personalize your settings."
+    fi
+    # Fresh-install case: do nothing here. /etc/hamclock-lite is created
+    # later by the Phase 4 installer block; the wizard auto-launches on
+    # first boot because settings.json is absent.
+    # Keep-settings case: do nothing — wizard will not run.
+fi
+# --- end Phase 5 reinstall detection -------------------------------------
 
 # Create kiosk systemd service
 if [ "$KIOSK_MODE" = "pygame" ]; then
