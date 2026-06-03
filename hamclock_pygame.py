@@ -288,7 +288,7 @@ def draw_header(screen, rect, callsign, fonts, theme):
                        (rect.x + rect.w - 18, rect.y + 14), 5)
 
 
-def draw_solar(screen, rect, solar, fonts):
+def draw_solar(screen, rect, solar, fonts, theme):
     rows = [
         ('SFI', _safe(solar, 'sfi')),
         ('Kp', _safe(solar, 'kIndex')),
@@ -303,29 +303,36 @@ def draw_solar(screen, rect, solar, fonts):
     ]
     y = rect.y
     for label, value in rows:
-        _blit_text(screen, fonts['label'], label, LABEL, rect.x, y)
-        _blit_text(screen, fonts['body'], str(value), BRIGHT, rect.x + 70, y - 1)
+        _blit_text(screen, fonts['label'], label, theme['label'], rect.x, y)
+        _blit_text(screen, fonts['body'], str(value), theme['bright'],
+                   rect.x + 70, y - 1)
         y += 16
 
 
-def draw_bands(screen, rect, bands, fonts):
+def draw_bands(screen, rect, bands, fonts, theme):
     groups = [
         ('80m-40m', ['80m-40m']),
         ('30m-20m', ['30m-20m']),
         ('17m-15m', ['17m-15m']),
         ('12m-10m', ['12m-10m']),
     ]
-    _blit_text(screen, fonts['label'], 'BAND', LABEL, rect.x, rect.y)
-    _blit_text(screen, fonts['label'], 'DAY', LABEL, rect.x + 100, rect.y)
-    _blit_text(screen, fonts['label'], 'NIGHT', LABEL, rect.x + 160, rect.y)
+    cond = {
+        'Good': theme['good'], 'Fair': theme['fair'],
+        'Poor': theme['poor'], 'N/A': theme['na'],
+    }
+    _blit_text(screen, fonts['label'], 'BAND',  theme['label'], rect.x, rect.y)
+    _blit_text(screen, fonts['label'], 'DAY',   theme['label'], rect.x + 100, rect.y)
+    _blit_text(screen, fonts['label'], 'NIGHT', theme['label'], rect.x + 160, rect.y)
     y = rect.y + 16
     for name, keys in groups:
         entry = bands.get(keys[0], {}) if isinstance(bands, dict) else {}
         day = entry.get('day', 'N/A') if isinstance(entry, dict) else 'N/A'
         night = entry.get('night', 'N/A') if isinstance(entry, dict) else 'N/A'
-        _blit_text(screen, fonts['body'], name, TEXT, rect.x, y)
-        _blit_text(screen, fonts['body'], str(day), COND_COLORS.get(day, TEXT), rect.x + 100, y)
-        _blit_text(screen, fonts['body'], str(night), COND_COLORS.get(night, TEXT), rect.x + 160, y)
+        _blit_text(screen, fonts['body'], name, theme['fg'], rect.x, y)
+        _blit_text(screen, fonts['body'], str(day),
+                   cond.get(day, theme['fg']), rect.x + 100, y)
+        _blit_text(screen, fonts['body'], str(night),
+                   cond.get(night, theme['fg']), rect.x + 160, y)
         y += 16
 
 
@@ -375,31 +382,34 @@ def draw_bar(screen, rect, value, vmax, color):
         pygame.draw.rect(screen, color, inner)
 
 
-def draw_muf_text(screen, rect, solar, fonts):
+def draw_muf_text(screen, rect, solar, fonts, theme):
     rows = [
-        ('FOF2', '{} MHz'.format(_safe(solar, 'fof2'))),
+        ('FOF2',   '{} MHz'.format(_safe(solar, 'fof2'))),
         ('GEOMAG', _safe(solar, 'geomagField')),
-        ('KP', _safe(solar, 'kIndex')),
-        ('SFI', _safe(solar, 'sfi')),
-        ('SSN', _safe(solar, 'ssn')),
+        ('KP',     _safe(solar, 'kIndex')),
+        ('SFI',    _safe(solar, 'sfi')),
+        ('SSN',    _safe(solar, 'ssn')),
     ]
     y = rect.y + 20
     for label, value in rows:
-        _blit_text(screen, fonts['panel'], label, LABEL, rect.x + 20, y)
-        _blit_text(screen, fonts['title'], str(value), BRIGHT, rect.x + 140, y - 4)
+        _blit_text(screen, fonts['panel'], label, theme['label'],
+                   rect.x + 20, y)
+        _blit_text(screen, fonts['title'], str(value), theme['bright'],
+                   rect.x + 140, y - 4)
         y += 44
-    _blit_text(screen, fonts['small'], '(Map available in web UI)', LABEL,
-               rect.x + 20, rect.y + rect.h - 20)
+    _blit_text(screen, fonts['small'], '(Map available in web UI)',
+               theme['label'], rect.x + 20, rect.y + rect.h - 20)
 
 
-def draw_dx_spots(screen, rect, dxspots, fonts):
+def draw_dx_spots(screen, rect, dxspots, fonts, theme):
     if not isinstance(dxspots, list):
         dxspots = []
-    _blit_text(screen, fonts['label'], 'FREQ', LABEL, rect.x, rect.y)
-    _blit_text(screen, fonts['label'], 'BND', LABEL, rect.x + 90, rect.y)
-    _blit_text(screen, fonts['label'], 'DX', LABEL, rect.x + 140, rect.y)
-    _blit_text(screen, fonts['label'], 'SPOTTER', LABEL, rect.x + 230, rect.y)
-    _blit_text(screen, fonts['label'], 'TIME', LABEL, rect.x + 340, rect.y)
+    band_lut = dict(zip(HF_BANDS, theme['band_palette']))
+    _blit_text(screen, fonts['label'], 'FREQ',    theme['label'], rect.x, rect.y)
+    _blit_text(screen, fonts['label'], 'BND',     theme['label'], rect.x + 90, rect.y)
+    _blit_text(screen, fonts['label'], 'DX',      theme['label'], rect.x + 140, rect.y)
+    _blit_text(screen, fonts['label'], 'SPOTTER', theme['label'], rect.x + 230, rect.y)
+    _blit_text(screen, fonts['label'], 'TIME',    theme['label'], rect.x + 340, rect.y)
     y = rect.y + 16
     for spot in dxspots[:5]:
         if not isinstance(spot, dict):
@@ -409,11 +419,14 @@ def draw_dx_spots(screen, rect, dxspots, fonts):
         dx = _safe(spot, 'dxCall')
         spotter = _safe(spot, 'spotter')
         tm = _safe(spot, 'time')
-        _blit_text(screen, fonts['body'], str(freq), ACCENT_GOLD, rect.x, y)
-        _blit_text(screen, fonts['body'], str(band), BAND_COLORS.get(str(band), TEXT), rect.x + 90, y)
-        _blit_text(screen, fonts['body'], str(dx), BRIGHT, rect.x + 140, y)
-        _blit_text(screen, fonts['body'], str(spotter)[:10], TEXT, rect.x + 230, y)
-        _blit_text(screen, fonts['body'], str(tm), LABEL, rect.x + 340, y)
+        _blit_text(screen, fonts['body'], str(freq), theme['accent'], rect.x, y)
+        _blit_text(screen, fonts['body'], str(band),
+                   band_lut.get(str(band), theme['fg']), rect.x + 90, y)
+        _blit_text(screen, fonts['body'], str(dx), theme['bright'], rect.x + 140, y)
+        _blit_text(screen, fonts['body'], str(spotter)[:10], theme['fg'],
+                   rect.x + 230, y)
+        _blit_text(screen, fonts['body'], str(tm), theme['label'],
+                   rect.x + 340, y)
         y += 16
 
 
@@ -840,11 +853,11 @@ def main(argv=None):
                 cy += h + panel_gap
 
             try:
-                draw_solar(screen, panel_rects[0], data.solar or {}, fonts)
+                draw_solar(screen, panel_rects[0], data.solar or {}, fonts, theme)
             except Exception:
                 pass
             try:
-                draw_bands(screen, panel_rects[1], data.bands or {}, fonts)
+                draw_bands(screen, panel_rects[1], data.bands or {}, fonts, theme)
             except Exception:
                 pass
             try:
@@ -872,7 +885,7 @@ def main(argv=None):
             mid_rect = pygame.Rect(mx, content_top, mid_w - 4, content_h)
             mid_inner = draw_panel(screen, mid_rect, 'MUF STATUS', fonts, theme)
             try:
-                draw_muf_text(screen, mid_inner, data.solar or {}, fonts)
+                draw_muf_text(screen, mid_inner, data.solar or {}, fonts, theme)
             except Exception:
                 pass
 
@@ -885,7 +898,7 @@ def main(argv=None):
             dx_r = pygame.Rect(rx, content_top, right_w - 4, rh_dx)
             dx_inner = draw_panel(screen, dx_r, 'DX SPOTS', fonts, theme)
             try:
-                draw_dx_spots(screen, dx_inner, data.dxspots or [], fonts)
+                draw_dx_spots(screen, dx_inner, data.dxspots or [], fonts, theme)
             except Exception:
                 pass
 

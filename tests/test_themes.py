@@ -180,3 +180,36 @@ def test_draw_panel_uses_theme_card_color():
     # Sample the interior of the panel (below the title bar at y+22).
     px = surf.get_at((50, 50))[:3]
     assert tuple(px) == theme['card'], f'got {tuple(px)}, want {theme["card"]}'
+
+
+def test_draw_solar_signature_takes_theme():
+    sig = inspect.signature(hamclock_pygame.draw_solar)
+    assert 'theme' in sig.parameters
+
+
+def test_draw_bands_signature_takes_theme():
+    sig = inspect.signature(hamclock_pygame.draw_bands)
+    assert 'theme' in sig.parameters
+
+
+def test_draw_muf_text_signature_takes_theme():
+    sig = inspect.signature(hamclock_pygame.draw_muf_text)
+    assert 'theme' in sig.parameters
+
+
+def test_draw_dx_spots_signature_takes_theme():
+    sig = inspect.signature(hamclock_pygame.draw_dx_spots)
+    assert 'theme' in sig.parameters
+
+
+def test_draw_solar_runs_for_every_theme():
+    import pygame
+    pygame.init()
+    surf = pygame.Surface((400, 200))
+    fonts = hamclock_pygame._make_fonts()
+    rect = pygame.Rect(0, 0, 400, 200)
+    sample = {'sfi': 130, 'kIndex': 3, 'ssn': 80, 'xray': 'C1.0'}
+    for name in ('kstate', 'classic', 'amber', 'blue'):
+        surf.fill((0, 0, 0))
+        hamclock_pygame.draw_solar(surf, rect, sample, fonts,
+                                   hamclock_pygame.THEMES[name])
