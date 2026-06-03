@@ -559,20 +559,30 @@ class Handler(SimpleHTTPRequestHandler):
                         return
             self.send_binary(CACHE['solar_image'], 'image/jpeg')
         elif path.startswith('/api/muf-map'):
-            if CACHE.get('muf_image'):
+            # Phase 2: prefer the pre-rasterized PNG (native pygame client
+            # blits this directly). Fall back to the SVG when the
+            # rasterizer hasn't run yet, when cairosvg/cpulimit are
+            # missing, or when the upstream source briefly fails.
+            png = CACHE.get('muf_image_png')
+            if png:
+                body = png
+                ctype = 'image/png'
+            elif CACHE.get('muf_image'):
                 body = CACHE['muf_image']
-                self.send_response(200)
-                self.send_header('Content-Type', 'image/svg+xml')
-                self.send_header('Content-Length', len(body))
-                self.send_header('Access-Control-Allow-Origin', '*')
-                # no-store: the dashboard fetches a fresh URL each cycle; if the
-                # browser cached these it would accumulate entries until OOM.
-                self.send_header('Cache-Control', 'no-store')
-                self.end_headers()
-                if self.command != 'HEAD':
-                    self.wfile.write(body)
+                ctype = 'image/svg+xml'
             else:
                 self.send_error(503, 'MUF map not yet loaded')
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', len(body))
+            self.send_header('Access-Control-Allow-Origin', '*')
+            # no-store: the dashboard fetches a fresh URL each cycle; if the
+            # browser cached these it would accumulate entries until OOM.
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            if self.command != 'HEAD':
+                self.wfile.write(body)
         elif path.startswith('/api/enlil'):
             if CACHE.get('enlil_image'):
                 self.send_binary(CACHE['enlil_image'], 'image/jpeg')

@@ -157,3 +157,73 @@ def test_fetch_muf_leaves_png_none_when_rasterize_fails(monkeypatch):
     assert server.CACHE['muf_image'] == FAKE_SVG
     # PNG slot cleared so /api/muf-map falls through to SVG.
     assert server.CACHE['muf_image_png'] is None
+
+
+class _Recorder:
+    """Mimic the BaseHTTPRequestHandler write API enough to capture output."""
+    def __init__(self):
+        self.status = None
+        self.headers = []
+        self.body = b''
+        self.command = 'GET'
+        self.path = '/api/muf-map'
+    def send_response(self, code):
+        self.status = code
+    def send_header(self, k, v):
+        self.headers.append((k, str(v)))
+    def end_headers(self):
+        pass
+    def write(self, b):
+        self.body += b
+
+
+def _invoke_muf_map(rec):
+    # Drive only the /api/muf-map branch by re-implementing the dispatch
+    # contract here — we can't easily instantiate the full Handler in tests.
+    # Instead, exercise the production code by importing Handler and
+    # calling the muf branch via a thin shim attached in this test.
+    from server import Handler
+    # Bind the recorder's writes to wfile interface.
+    class _W:
+        def __init__(self, rec): self.rec = rec
+        def write(self, b): self.rec.write(b)
+    class _Shim(Handler):
+        def __init__(s):  # bypass super().__init__
+            s.command = rec.command
+            s.path = rec.path
+            s.wfile = _W(rec)
+        def send_response(s, code): rec.send_response(code)
+        def send_header(s, k, v): rec.send_header(k, v)
+        def end_headers(s): rec.end_headers()
+        def send_error(s, code, msg=None):
+            rec.status = code
+    shim = _Shim()
+    shim.do_GET()
+    return rec
+
+
+def test_muf_map_serves_png_when_available(monkeypatch):
+    server.CACHE['muf_image'] = FAKE_SVG
+    server.CACHE['muf_image_png'] = FAKE_PNG
+    rec = _invoke_muf_map(_Recorder())
+    assert rec.status == 200
+    ctypes = [v for (k, v) in rec.headers if k.lower() == 'content-type']
+    assert ctypes == ['image/png']
+    assert rec.body == FAKE_PNG
+
+
+def test_muf_map_falls_back_to_svg_when_png_missing(monkeypatch):
+    server.CACHE['muf_image'] = FAKE_SVG
+    server.CACHE['muf_image_png'] = None
+    rec = _invoke_muf_map(_Recorder())
+    assert rec.status == 200
+    ctypes = [v for (k, v) in rec.headers if k.lower() == 'content-type']
+    assert ctypes == ['image/svg+xml']
+    assert rec.body == FAKE_SVG
+
+
+def test_muf_map_503_when_neither_cached(monkeypatch):
+    server.CACHE['muf_image'] = None
+    server.CACHE['muf_image_png'] = None
+    rec = _invoke_muf_map(_Recorder())
+    assert rec.status == 503
