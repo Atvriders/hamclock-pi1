@@ -336,12 +336,13 @@ def draw_bands(screen, rect, bands, fonts, theme):
         y += 16
 
 
-def draw_image(screen, rect, surface, fonts=None,
+def draw_image(screen, rect, surface, fonts=None, theme=None,
                image_key=None, fetched_at=None):
     if surface is None:
         if fonts is not None and 'tiny' in fonts:
-            _blit_text(screen, fonts['tiny'], 'image loading...', LABEL,
-                       rect.x + 6, rect.y + 6)
+            label_color = theme['label'] if theme is not None else LABEL
+            _blit_text(screen, fonts['tiny'], 'image loading...',
+                       label_color, rect.x + 6, rect.y + 6)
         return
     try:
         iw, ih = surface.get_size()
@@ -824,7 +825,8 @@ def main(argv=None):
             screen.fill(theme['bg'])
 
             header = pygame.Rect(0, 0, sw, 30)
-            callsign = os.environ.get('HAMCLOCK_CALLSIGN', 'N0CALL')
+            callsign = settings.get('callsign') or os.environ.get(
+                'HAMCLOCK_CALLSIGN', 'N0CALL')
             draw_header(screen, header, callsign, fonts, theme)
 
             status = pygame.Rect(0, sh - 20, sw, 20)
@@ -870,7 +872,7 @@ def main(argv=None):
                 pass
             try:
                 sdo_surf = _get_cached_image(data, 'solar-image', image_cache, image_cache_ts)
-                draw_image(screen, panel_rects[2], sdo_surf, fonts,
+                draw_image(screen, panel_rects[2], sdo_surf, fonts, theme,
                            image_key='solar-image',
                            fetched_at=data.image_fetched_at.get('solar-image', 0.0))
             except Exception:
@@ -928,7 +930,7 @@ def main(argv=None):
             try:
                 key = tab_image_key.get(active_tab, 'real-drap')
                 surf = _get_cached_image(data, key, image_cache, image_cache_ts)
-                draw_image(screen, img_rect, surf, fonts,
+                draw_image(screen, img_rect, surf, fonts, theme,
                            image_key=key,
                            fetched_at=data.image_fetched_at.get(key, 0.0))
             except Exception:

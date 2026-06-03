@@ -261,3 +261,35 @@ def test_draw_band_activity_uses_theme_palette():
     px = surf.get_at((80, 184))[:3]
     assert tuple(px) == theme['band_palette'][9], \
         f'got {tuple(px)}, want {theme["band_palette"][9]}'
+
+
+def test_draw_image_signature_takes_theme():
+    sig = inspect.signature(hamclock_pygame.draw_image)
+    assert 'theme' in sig.parameters
+
+
+def test_draw_image_loading_state_uses_theme_label_color(monkeypatch):
+    """When surface is None, the 'image loading...' text must use
+    theme['label'], not a hardcoded constant."""
+    import pygame
+    pygame.init()
+    surf = pygame.Surface((200, 60))
+    fonts = hamclock_pygame._make_fonts()
+    theme = hamclock_pygame.THEMES['amber']
+    rect = pygame.Rect(0, 0, 200, 60)
+    captured = {}
+    real_blit = hamclock_pygame._blit_text
+    def spy(screen, font, text, color, x, y):
+        captured['color'] = color
+        captured['text'] = text
+        return real_blit(screen, font, text, color, x, y)
+    monkeypatch.setattr(hamclock_pygame, '_blit_text', spy)
+    hamclock_pygame.draw_image(surf, rect, None, fonts, theme)
+    assert captured['text'].lower().startswith('image')
+    assert captured['color'] == theme['label']
+
+
+def test_load_settings_default_path_constant_present():
+    # main() should be able to call load_settings() with no args.
+    d = hamclock_pygame.load_settings('/no/such/path/for/testing.json')
+    assert d['theme'] == 'kstate'
