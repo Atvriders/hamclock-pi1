@@ -96,3 +96,64 @@ def test_rasterize_muf_returns_none_when_cpulimit_missing(monkeypatch, capsys):
     assert server._rasterize_muf(FAKE_SVG) is None
     err = capsys.readouterr().err
     assert '[muf]' in err
+
+
+def test_cache_has_muf_image_png_slot():
+    assert 'muf_image_png' in server.CACHE, (
+        "Phase 2: CACHE must declare a 'muf_image_png' slot (initial None)."
+    )
+    # On import, before any fetch, the PNG slot is None.
+    assert server.CACHE['muf_image_png'] is None or isinstance(
+        server.CACHE['muf_image_png'], (bytes, bytearray)
+    )
+
+
+def test_fetch_muf_populates_png_when_rasterize_succeeds(monkeypatch):
+    # Stub urlopen so fetch_muf does not hit the network.
+    class FakeResp:
+        def __init__(self, body):
+            self._body = body
+        def read(self):
+            return self._body
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(server, 'urlopen', lambda req, timeout=20: FakeResp(FAKE_SVG))
+    monkeypatch.setattr(server, '_rasterize_muf', lambda b: FAKE_PNG)
+    # Reset cache slots
+    server.CACHE['muf_image'] = None
+    server.CACHE['muf_image_png'] = None
+    server.CACHE['muf_image_updated'] = 0
+
+    server.fetch_muf()
+
+    assert server.CACHE['muf_image'] == FAKE_SVG
+    assert server.CACHE['muf_image_png'] == FAKE_PNG
+    assert server.CACHE['muf_image_updated'] > 0
+
+
+def test_fetch_muf_leaves_png_none_when_rasterize_fails(monkeypatch):
+    class FakeResp:
+        def __init__(self, body):
+            self._body = body
+        def read(self):
+            return self._body
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(server, 'urlopen', lambda req, timeout=20: FakeResp(FAKE_SVG))
+    monkeypatch.setattr(server, '_rasterize_muf', lambda b: None)
+    server.CACHE['muf_image'] = None
+    server.CACHE['muf_image_png'] = b'STALE'
+    server.CACHE['muf_image_updated'] = 0
+
+    server.fetch_muf()
+
+    # SVG must still cache (browser path still works).
+    assert server.CACHE['muf_image'] == FAKE_SVG
+    # PNG slot cleared so /api/muf-map falls through to SVG.
+    assert server.CACHE['muf_image_png'] is None

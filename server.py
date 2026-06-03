@@ -29,6 +29,7 @@ CACHE = {
     'dx_updated': 0,
     'solar_image_updated': 0,
     'muf_image': None,
+    'muf_image_png': None,
     'muf_image_updated': 0,
     'enlil_image': None,
     'enlil_image_updated': 0,
@@ -281,14 +282,30 @@ def fetch_dx():
 
 
 def fetch_muf():
-    """Fetch KC2G MUF propagation map SVG"""
+    """Fetch KC2G MUF propagation map SVG and rasterize to PNG.
+
+    The SVG bytes stay in CACHE['muf_image'] so the browser dashboard keeps
+    working (it consumes the SVG directly). The native pygame client wants
+    pre-rasterized PNG because cairosvg on a Pi 1 takes seconds — too slow
+    for the render loop. CACHE['muf_image_png'] is populated by the
+    subprocess rasterizer; on failure it is set to None so /api/muf-map
+    falls back to the SVG payload.
+    """
     try:
-        req = Request('https://prop.kc2g.com/renders/current/mufd-normal-now.svg', headers={'User-Agent': UA})
+        req = Request('https://prop.kc2g.com/renders/current/mufd-normal-now.svg',
+                      headers={'User-Agent': UA})
         with urlopen(req, timeout=20) as resp:
             data = resp.read()
         CACHE['muf_image'] = data
         CACHE['muf_image_updated'] = time.time()
-        print(f'[{time.strftime("%H:%M:%S")}] MUF map updated ({len(data)} bytes)')
+        png = _rasterize_muf(data)
+        CACHE['muf_image_png'] = png  # may be None on failure
+        if png is not None:
+            print(f'[{time.strftime("%H:%M:%S")}] MUF map updated '
+                  f'({len(data)} B SVG -> {len(png)} B PNG)')
+        else:
+            print(f'[{time.strftime("%H:%M:%S")}] MUF map updated '
+                  f'({len(data)} B SVG, PNG rasterize failed)')
     except Exception as e:
         print(f'[{time.strftime("%H:%M:%S")}] MUF map fetch failed: {e}')
 
