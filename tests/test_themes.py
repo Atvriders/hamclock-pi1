@@ -213,3 +213,51 @@ def test_draw_solar_runs_for_every_theme():
         surf.fill((0, 0, 0))
         hamclock_pygame.draw_solar(surf, rect, sample, fonts,
                                    hamclock_pygame.THEMES[name])
+
+
+def test_draw_bar_signature_takes_theme():
+    sig = inspect.signature(hamclock_pygame.draw_bar)
+    assert 'theme' in sig.parameters
+
+
+def test_draw_band_activity_signature_takes_theme():
+    sig = inspect.signature(hamclock_pygame.draw_band_activity)
+    assert 'theme' in sig.parameters
+
+
+def test_draw_tabs_signature_takes_theme():
+    sig = inspect.signature(hamclock_pygame.draw_tabs)
+    assert 'theme' in sig.parameters
+
+
+def test_draw_geomag_signature_takes_theme():
+    sig = inspect.signature(hamclock_pygame.draw_geomag)
+    assert 'theme' in sig.parameters
+
+
+def test_draw_xray_signature_takes_theme():
+    sig = inspect.signature(hamclock_pygame.draw_xray)
+    assert 'theme' in sig.parameters
+
+
+def test_draw_open_bands_signature_takes_theme():
+    sig = inspect.signature(hamclock_pygame.draw_open_bands)
+    assert 'theme' in sig.parameters
+
+
+def test_draw_band_activity_uses_theme_palette():
+    """A '10m' bar should use band_palette[-1] of the active theme."""
+    import pygame
+    pygame.init()
+    surf = pygame.Surface((400, 200))
+    surf.fill((0, 0, 0))
+    fonts = hamclock_pygame._make_fonts()
+    theme = hamclock_pygame.THEMES['amber']
+    rect = pygame.Rect(0, 0, 400, 200)
+    spots = [{'band': '10m'}]
+    hamclock_pygame.draw_band_activity(surf, rect, spots, fonts, theme)
+    # 10m is the 10th band; row_h ≈ (200-4)/10 = 19; row 10 center ~ y=180.
+    # Sample inside the bar interior (label width = 40, sample at x=80).
+    px = surf.get_at((80, 184))[:3]
+    assert tuple(px) == theme['band_palette'][9], \
+        f'got {tuple(px)}, want {theme["band_palette"][9]}'

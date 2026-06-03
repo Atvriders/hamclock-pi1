@@ -370,14 +370,15 @@ def draw_image(screen, rect, surface, fonts=None,
         pass
 
 
-def draw_bar(screen, rect, value, vmax, color):
-    pygame.draw.rect(screen, BG, rect)
-    pygame.draw.rect(screen, BORDER, rect, 1)
+def draw_bar(screen, rect, value, vmax, color, theme):
+    pygame.draw.rect(screen, theme['bg'], rect)
+    pygame.draw.rect(screen, theme['border'], rect, 1)
     try:
         frac = 0.0 if vmax <= 0 else max(0.0, min(1.0, float(value) / float(vmax)))
     except Exception:
         frac = 0.0
-    inner = pygame.Rect(rect.x + 1, rect.y + 1, int((rect.w - 2) * frac), rect.h - 2)
+    inner = pygame.Rect(rect.x + 1, rect.y + 1,
+                        int((rect.w - 2) * frac), rect.h - 2)
     if inner.w > 0:
         pygame.draw.rect(screen, color, inner)
 
@@ -430,7 +431,7 @@ def draw_dx_spots(screen, rect, dxspots, fonts, theme):
         y += 16
 
 
-def draw_band_activity(screen, rect, dxspots, fonts):
+def draw_band_activity(screen, rect, dxspots, fonts, theme):
     counts = {b: 0 for b in HF_BANDS}
     if isinstance(dxspots, list):
         for spot in dxspots:
@@ -439,22 +440,24 @@ def draw_band_activity(screen, rect, dxspots, fonts):
                 if b in counts:
                     counts[b] += 1
     vmax = max(counts.values()) if any(counts.values()) else 1
+    band_lut = dict(zip(HF_BANDS, theme['band_palette']))
     label_w = 40
     count_w = 36
     row_h = max(14, (rect.h - 4) // len(HF_BANDS))
     y = rect.y + 2
     for band in HF_BANDS:
         c = counts[band]
-        _blit_text(screen, fonts['label'], band, LABEL, rect.x, y + 1)
+        _blit_text(screen, fonts['label'], band, theme['label'], rect.x, y + 1)
         bar_rect = pygame.Rect(rect.x + label_w, y + 2,
                                max(1, rect.w - label_w - count_w), row_h - 4)
-        draw_bar(screen, bar_rect, c, vmax, BAND_COLORS.get(band, TEXT))
-        _blit_text(screen, fonts['label'], str(c), BRIGHT,
+        draw_bar(screen, bar_rect, c, vmax,
+                 band_lut.get(band, theme['fg']), theme)
+        _blit_text(screen, fonts['label'], str(c), theme['bright'],
                    rect.x + rect.w - count_w + 4, y + 1)
         y += row_h
 
 
-def draw_tabs(screen, rect, tabs, active, fonts):
+def draw_tabs(screen, rect, tabs, active, fonts, theme):
     """Draw a tab bar across rect.y (height 20). Returns {name: Rect}."""
     regions = {}
     if not tabs:
@@ -462,29 +465,32 @@ def draw_tabs(screen, rect, tabs, active, fonts):
     tw = rect.w // len(tabs)
     for i, name in enumerate(tabs):
         tab_rect = pygame.Rect(rect.x + i * tw, rect.y, tw - 2, 20)
-        color = BORDER if name == active else CARD
+        color = theme['border'] if name == active else theme['card']
         pygame.draw.rect(screen, color, tab_rect)
-        pygame.draw.rect(screen, BORDER, tab_rect, 1)
-        text_color = ACCENT_GOLD if name == active else LABEL
+        pygame.draw.rect(screen, theme['border'], tab_rect, 1)
+        text_color = theme['accent'] if name == active else theme['label']
         _blit_text(screen, fonts['panel'], name.upper(), text_color,
                    tab_rect.x + 8, tab_rect.y + 2)
         regions[name] = tab_rect
     return regions
 
 
-def draw_geomag(screen, rect, solar, fonts):
+def draw_geomag(screen, rect, solar, fonts, theme):
     kp = _safe(solar, 'kIndex', 0)
     try:
         kp_val = float(kp)
     except Exception:
         kp_val = 0.0
-    color = STATUS_GREEN if kp_val < 4 else STATUS_YELLOW if kp_val < 6 else STATUS_RED
-    _blit_text(screen, fonts['body'], 'Kp {}'.format(kp), BRIGHT, rect.x, rect.y + 2)
+    color = (theme['good'] if kp_val < 4
+             else theme['fair'] if kp_val < 6
+             else theme['poor'])
+    _blit_text(screen, fonts['body'], 'Kp {}'.format(kp), theme['bright'],
+               rect.x, rect.y + 2)
     bar_rect = pygame.Rect(rect.x, rect.y + 20, rect.w, 10)
-    draw_bar(screen, bar_rect, kp_val, 9.0, color)
+    draw_bar(screen, bar_rect, kp_val, 9.0, color, theme)
 
 
-def draw_xray(screen, rect, solar, fonts):
+def draw_xray(screen, rect, solar, fonts, theme):
     xray = _safe(solar, 'xray', 'A0.0')
     s = str(xray)
     try:
@@ -494,13 +500,15 @@ def draw_xray(screen, rect, solar, fonts):
         value = scale + (mag / 10.0)
     except Exception:
         value = 0.0
-    color = STATUS_GREEN if value < 2 else STATUS_YELLOW if value < 3 else STATUS_RED
-    _blit_text(screen, fonts['body'], s, BRIGHT, rect.x, rect.y + 2)
+    color = (theme['good'] if value < 2
+             else theme['fair'] if value < 3
+             else theme['poor'])
+    _blit_text(screen, fonts['body'], s, theme['bright'], rect.x, rect.y + 2)
     bar_rect = pygame.Rect(rect.x, rect.y + 20, rect.w, 10)
-    draw_bar(screen, bar_rect, value, 5.0, color)
+    draw_bar(screen, bar_rect, value, 5.0, color, theme)
 
 
-def draw_open_bands(screen, rect, bands, fonts):
+def draw_open_bands(screen, rect, bands, fonts, theme):
     opens, closes = [], []
     if isinstance(bands, dict):
         for key, entry in bands.items():
@@ -512,9 +520,9 @@ def draw_open_bands(screen, rect, bands, fonts):
             elif day == 'Poor':
                 closes.append(key)
     _blit_text(screen, fonts['label'], 'OPEN: ' + (', '.join(opens) or '--'),
-               STATUS_GREEN, rect.x, rect.y)
+               theme['good'], rect.x, rect.y)
     _blit_text(screen, fonts['label'], 'CLOSED: ' + (', '.join(closes) or '--'),
-               STATUS_RED, rect.x, rect.y + 16)
+               theme['poor'], rect.x, rect.y + 16)
 
 
 def draw_status_bar(screen, rect, data, fonts, theme):
@@ -868,15 +876,15 @@ def main(argv=None):
             except Exception:
                 pass
             try:
-                draw_geomag(screen, panel_rects[3], data.solar or {}, fonts)
+                draw_geomag(screen, panel_rects[3], data.solar or {}, fonts, theme)
             except Exception:
                 pass
             try:
-                draw_xray(screen, panel_rects[4], data.solar or {}, fonts)
+                draw_xray(screen, panel_rects[4], data.solar or {}, fonts, theme)
             except Exception:
                 pass
             try:
-                draw_open_bands(screen, panel_rects[5], data.bands or {}, fonts)
+                draw_open_bands(screen, panel_rects[5], data.bands or {}, fonts, theme)
             except Exception:
                 pass
 
@@ -905,7 +913,7 @@ def main(argv=None):
             ba_r = pygame.Rect(rx, content_top + rh_dx + panel_gap, right_w - 4, rh_ba)
             ba_inner = draw_panel(screen, ba_r, 'BAND ACTIVITY', fonts, theme)
             try:
-                draw_band_activity(screen, ba_inner, data.dxspots or [], fonts)
+                draw_band_activity(screen, ba_inner, data.dxspots or [], fonts, theme)
             except Exception:
                 pass
 
@@ -914,7 +922,7 @@ def main(argv=None):
             prop_inner = draw_panel(screen, prop_r, 'PROPAGATION', fonts, theme)
             tab_bar = pygame.Rect(prop_inner.x, prop_inner.y, prop_inner.w, 20)
             tab_regions = draw_tabs(screen, tab_bar, ['drap', 'aurora', 'enlil'],
-                                    active_tab, fonts)
+                                    active_tab, fonts, theme)
             img_rect = pygame.Rect(prop_inner.x, prop_inner.y + 24,
                                    prop_inner.w, prop_inner.h - 24)
             try:
