@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Parse mode flag
-KIOSK_MODE="browser"  # default
+KIOSK_MODE="pygame"   # default — native client, no browser, <=200ms p99 clicks
 for arg in "$@"; do
     case "$arg" in
         --pygame)  KIOSK_MODE="pygame" ;;
