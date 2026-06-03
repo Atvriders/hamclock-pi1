@@ -1377,5 +1377,106 @@ def main(argv=None):
     pygame.quit()
 
 
+import socket
+
+
+def _drop_privileges_if_root():
+    """When running under sudo, drop to SERVICE_USER before writing files."""
+    if os.geteuid() != 0:
+        return
+    if SERVICE_UID is None or SERVICE_GID is None:
+        return
+    try:
+        os.setgroups([])
+    except (PermissionError, OSError):
+        pass
+    try:
+        os.setgid(SERVICE_GID)
+        os.setuid(SERVICE_UID)
+    except OSError as e:
+        print("[setup] could not drop privileges: %s" % e, file=sys.stderr)
+
+
+def _apply_ntp(ntp_value, conf_path, restart):
+    """Write systemd-timesyncd drop-in and optionally restart the unit."""
+    try:
+        socket.gethostbyname(ntp_value)
+    except socket.gaierror as e:
+        print("[setup] NTP host %r does not resolve: %s"
+              % (ntp_value, e), file=sys.stderr)
+        return 2
+    os.makedirs(os.path.dirname(conf_path) or ".", exist_ok=True)
+    with open(conf_path, "w") as f:
+        f.write("[Time]\nNTP=%s\n" % ntp_value)
+    os.chmod(conf_path, 0o644)
+    if restart:
+        import subprocess as _sp
+        try:
+            _sp.run(["systemctl", "restart", "systemd-timesyncd"],
+                    check=False)
+        except FileNotFoundError:
+            print("[setup] systemctl not found; skipping restart",
+                  file=sys.stderr)
+    return 0
+
+
+def _cli_main(argv):
+    ap = argparse.ArgumentParser(prog="hamclock-setup")
+    ap.add_argument("--setup-cli", action="store_true",
+                    help="run headless settings writer")
+    ap.add_argument("--callsign")
+    ap.add_argument("--timezone")
+    ap.add_argument("--theme", choices=WIZARD_THEMES)
+    ap.add_argument("--ntp", default="")
+    ap.add_argument("--apply-ntp", action="store_true",
+                    help="also write /etc/systemd/timesyncd.conf.d/hamclock.conf")
+    ap.add_argument("--ntp-conf-path",
+                    default="/etc/systemd/timesyncd.conf.d/hamclock.conf")
+    ap.add_argument("--no-restart-timesyncd", action="store_true")
+    ap.add_argument("--settings-path", default=SETTINGS_PATH)
+    ap.add_argument("--inject-events",
+                    help="(debug only) JSON event sequence for wizard")
+    args = ap.parse_args(argv)
+
+    if args.inject_events and os.environ.get("HAMCLOCK_DEBUG") != "1":
+        ap.error("--inject-events is debug builds only "
+                 "(set HAMCLOCK_DEBUG=1)")
+
+    if not args.setup_cli:
+        return None  # caller falls through to dashboard main()
+
+    if args.callsign is None or args.timezone is None or args.theme is None:
+        ap.error("--callsign, --timezone, --theme are required in --setup-cli mode")
+
+    ok, err = validate_callsign(args.callsign)
+    if not ok:
+        print("[setup] invalid callsign: %s" % err, file=sys.stderr)
+        return 2
+    ok, err = validate_timezone(args.timezone)
+    if not ok:
+        print("[setup] invalid timezone: %s" % err, file=sys.stderr)
+        return 2
+
+    d = {
+        "callsign": args.callsign.upper(),
+        "timezone": args.timezone,
+        "theme": args.theme,
+        "ntp": args.ntp,
+    }
+
+    _drop_privileges_if_root()
+    write_settings(d, args.settings_path)
+    if args.apply_ntp and args.ntp:
+        rc = _apply_ntp(args.ntp, args.ntp_conf_path,
+                        restart=not args.no_restart_timesyncd)
+        if rc != 0:
+            return rc
+    return 0
+
+
 if __name__ == '__main__':
-    main()
+    # CLI dispatch: --setup-cli short-circuits before the dashboard runs.
+    rc = _cli_main(sys.argv[1:])
+    if rc is not None:
+        sys.exit(rc)
+    main()  # existing dashboard entry point

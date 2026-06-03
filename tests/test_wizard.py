@@ -185,3 +185,88 @@ def test_wait_for_ntp_warns_on_timeout(monkeypatch, capsys):
     assert hp._wait_for_ntp_sync(deadline_s=0) is False
     out = capsys.readouterr()
     assert "NTP" in out.err or "ntp" in out.err
+
+
+import subprocess
+import sys as _sys
+
+
+def _run_cli(tmp_path, *args, env=None):
+    cmd = [_sys.executable,
+           "/home/kasm-user/hamclock-pi1/hamclock_pygame.py",
+           "--setup-cli", *args]
+    e = dict(os.environ)
+    if env:
+        e.update(env)
+    return subprocess.run(cmd, env=e, capture_output=True, text=True)
+
+
+def test_setup_cli_writes_valid_settings(tmp_path):
+    out = tmp_path / "settings.json"
+    r = _run_cli(tmp_path,
+                 "--callsign", "W1ABC",
+                 "--timezone", "UTC",
+                 "--theme", "kstate",
+                 "--settings-path", str(out))
+    assert r.returncode == 0, "stderr: %s" % r.stderr
+    data = _json.loads(out.read_text())
+    assert data["callsign"] == "W1ABC"
+    assert data["timezone"] == "UTC"
+    assert data["theme"] == "kstate"
+    assert data["ntp"] == ""
+    assert (os.stat(out).st_mode & 0o777) == 0o644
+
+
+def test_setup_cli_rejects_bad_callsign(tmp_path):
+    out = tmp_path / "settings.json"
+    r = _run_cli(tmp_path,
+                 "--callsign", "123456",
+                 "--timezone", "UTC",
+                 "--theme", "kstate",
+                 "--settings-path", str(out))
+    assert r.returncode != 0
+    assert "letter" in r.stderr or "callsign" in r.stderr.lower()
+    assert not out.exists()
+
+
+def test_setup_cli_rejects_bad_timezone(tmp_path):
+    out = tmp_path / "settings.json"
+    r = _run_cli(tmp_path,
+                 "--callsign", "W1ABC",
+                 "--timezone", "Atlantis/Lost",
+                 "--theme", "kstate",
+                 "--settings-path", str(out))
+    assert r.returncode != 0
+    assert "timezone" in r.stderr.lower()
+
+
+def test_setup_cli_inject_events_requires_debug(tmp_path):
+    r = subprocess.run(
+        [_sys.executable,
+         "/home/kasm-user/hamclock-pi1/hamclock_pygame.py",
+         "--inject-events", "/tmp/x.json"],
+        env={k: v for k, v in os.environ.items()
+             if k != "HAMCLOCK_DEBUG"},
+        capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "debug" in r.stderr.lower()
+
+
+def test_setup_cli_apply_ntp_writes_dropin(tmp_path):
+    out = tmp_path / "settings.json"
+    ntp_path = tmp_path / "ntp.conf"
+    # Run apply-ntp in dry mode by pointing at the override path.
+    r = _run_cli(tmp_path,
+                 "--callsign", "W1ABC",
+                 "--timezone", "UTC",
+                 "--theme", "kstate",
+                 "--ntp", "pool.ntp.org",
+                 "--settings-path", str(out),
+                 "--apply-ntp",
+                 "--ntp-conf-path", str(ntp_path),
+                 "--no-restart-timesyncd")
+    assert r.returncode == 0, r.stderr
+    assert ntp_path.exists()
+    content = ntp_path.read_text()
+    assert "[Time]" in content
+    assert "NTP=pool.ntp.org" in content
