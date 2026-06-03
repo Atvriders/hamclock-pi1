@@ -62,3 +62,16 @@ def test_offline_install_pygame_apt_includes_cairosvg_and_cpulimit():
     assert re.search(r'sudo apt install -y[^\n]*cpulimit', text), (
         'Phase 2: offline-install.sh pygame apt list must include cpulimit.'
     )
+
+
+def test_mirror_installer_matches_offline_install():
+    if not MIRROR.exists():
+        import pytest as _p
+        _p.skip(f'mirror installer not present at {MIRROR}')
+    import hashlib
+    def h(p):
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+    assert h(OFFLINE) == h(MIRROR), (
+        'Phase 2: offline-install.sh and pi1-install.sh must be byte-identical. '
+        'Run `cp offline-install.sh /home/kasm-user/hamclock-reborn/public/downloads/pi1-install.sh`.'
+    )
