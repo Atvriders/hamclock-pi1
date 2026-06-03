@@ -364,3 +364,29 @@ def test_headless_frame_without_settings_uses_kstate(tmp_path):
     surf.fill(theme['bg'])
     px = surf.get_at((0, hamclock_pygame.SCREEN_H // 2))[:3]
     assert tuple(px) == (42, 20, 80)
+
+
+def test_module_imports_cleanly_under_sdl_dummy():
+    """A re-import should succeed with SDL_VIDEODRIVER=dummy and not raise."""
+    import importlib
+    import hamclock_pygame as hp
+    importlib.reload(hp)
+    assert hasattr(hp, 'THEMES')
+    assert hasattr(hp, 'load_settings')
+    assert hasattr(hp, 'main')
+    # Every draw function must accept theme as a kwarg.
+    import inspect
+    for fn_name in ('draw_panel', 'draw_header', 'draw_status_bar',
+                    'draw_solar', 'draw_bands', 'draw_muf_text',
+                    'draw_dx_spots', 'draw_band_activity', 'draw_tabs',
+                    'draw_geomag', 'draw_xray', 'draw_open_bands',
+                    'draw_image', 'draw_bar'):
+        fn = getattr(hp, fn_name)
+        assert 'theme' in inspect.signature(fn).parameters, \
+            f'{fn_name} missing theme parameter'
+
+
+def test_python_syntax_check_passes():
+    """py_compile the module — catches any structural slip from prior tasks."""
+    import py_compile
+    py_compile.compile('hamclock_pygame.py', doraise=True)
