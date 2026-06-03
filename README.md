@@ -280,17 +280,17 @@ wget -qO- https://hamclock-reborn.org/downloads/pi1-install.sh | bash
 
 This downloads and runs a self-contained installer that has everything embedded — no git needed. The Pi still needs internet to fetch ham radio data (solar conditions, DX spots), just not GitHub specifically.
 
-The curl-pipe installer also accepts the same display-mode flags as `kiosk-install.sh` (see [Display Modes](#display-modes-browser-vs-native) below):
+The curl-pipe installer also accepts the same display-mode flags as `kiosk-install.sh` (see [Display Modes](#display-modes) below):
 
 ```bash
-# Default (browser kiosk)
+# Default (pygame native client)
 curl -sL https://hamclock-reborn.org/downloads/pi1-install.sh | bash
 
-# Pygame framebuffer mode (no X11, lowest RAM)
-curl -sL https://hamclock-reborn.org/downloads/pi1-install.sh | bash -s -- --pygame
-
-# Tkinter native widget mode
+# Tkinter mode
 curl -sL https://hamclock-reborn.org/downloads/pi1-install.sh | bash -s -- --tkinter
+
+# Browser mode (opt-in)
+curl -sL https://hamclock-reborn.org/downloads/pi1-install.sh | bash -s -- --browser
 ```
 
 Note the `bash -s -- --pygame` pattern: `-s` tells bash to read the script from stdin (the curl output), and `--` separates bash's own arguments from the arguments passed through to the script.
@@ -310,21 +310,23 @@ This skips the display server and kiosk setup. The dashboard runs as a web serve
 
 ---
 
-## Display Modes: Browser vs Native
+## Display Modes
 
-The default kiosk installer runs a browser (surf/midori/chromium) fullscreen on the Pi's HDMI monitor at **1440×900**. That works great and gives you the full feature set (all 5 themes, setup wizard, MUF map), but a browser on Pi 1 uses 30–80 MB of RAM and takes 3–10 seconds to start.
+**Pygame is the default** on Pi 1: a native fullscreen client at 1440×900 with
+~15–20 MB RSS, p99 ≤ 200 ms click-to-photons, and no browser process. Browser
+and tkinter modes remain available as opt-in alternatives.
 
-For lower overhead, `kiosk-install.sh` supports two alternative **native display modes** that replace the browser entirely while still rendering on the same HDMI monitor at 1440×900. All three modes talk to the same `server.py` (no server changes) — they just swap out the display layer. Pick the mode at install time with a flag:
+All three modes talk to the same `server.py` (no server changes) — they just swap out the display layer. Pick the mode at install time with a flag:
 
-| Flag | Display layer | RAM | Needs X11 | Best for |
+| Mode | Renderer | RAM | X11 | Notes |
 |---|---|---|---|---|
-| `--browser` (default) | surf/midori/chromium | 30–80 MB | Yes | Full feature set |
-| `--tkinter` | Python Tkinter widgets | ~25–35 MB | Yes | Native widget feel |
-| `--pygame` | Pygame → /dev/fb0 | ~15–20 MB | **No** | Lowest RAM, no X11 overhead |
+| `--pygame` (default) | Pygame → SDL | ~15–20 MB | No | Native client, themes, first-boot wizard, MUF map |
+| `--tkinter` | Python Tkinter | ~25–35 MB | Yes | Alternative — native widget feel |
+| `--browser` | surf/midori/chromium | 30–80 MB | Yes | Opt-in — full HTML/CSS feature set |
 
 Whichever mode you pick, the installer sets up the `hamclock-lite` and `hamclock-kiosk` systemd services so the Pi boots straight into the dashboard on its HDMI display — no manual launching after install.
 
-### Option A — Pygame framebuffer client (`--pygame`)
+### Option A — Pygame framebuffer client (default)
 
 The lowest-overhead option. Uses Pygame to draw directly to `/dev/fb0` via SDL's `fbcon` driver — skips X11 entirely on the Pi 1. Target footprint: ~15–20 MB RAM, <1 second startup.
 
@@ -383,7 +385,7 @@ Behavior:
 
 Same MUF-map caveat as the Pygame client.
 
-### Option C — Browser kiosk (`--browser`, default)
+### Option C — Browser kiosk (`--browser`, opt-in)
 
 The original full-feature mode. If you don't pass any flag, this is what you get:
 
@@ -397,20 +399,14 @@ Installs the minimal X11 stack (`xserver-xorg`, `xinit`, `matchbox-window-manage
 
 ### Which one should I use?
 
-| | Browser (default) | Pygame client | Tkinter client |
+| Flag | Mode | Status | Notes |
 |---|---|---|---|
-| Install flag | `./kiosk-install.sh` | `./kiosk-install.sh --pygame` | `./kiosk-install.sh --tkinter` |
-| RAM footprint | 30–80 MB | **~15–20 MB** | ~25–35 MB |
-| Start time | 3–10 sec | **< 1 sec** | ~1 sec |
-| X11 required | Yes | **No** (fbcon) | Yes |
-| MUF map | ✅ (SVG) | ❌ (text replacement) | ❌ (text replacement) |
-| Theme switching | ✅ (5 themes) | ❌ (K-State only) | ❌ (K-State only) |
-| Setup wizard | ✅ | ❌ | ❌ |
-| Full interactivity | ✅ | ✅ (tab clicks) | ✅ (tab clicks) |
-| Packages installed | xserver-xorg xinit matchbox surf/midori/chromium | python3-pygame | python3-tk python3-pil.imagetk |
+| `--pygame` | Pygame client | default | ~15–20 MB RAM, <1 sec start, no X11 (fbcon) |
+| `--tkinter` | Tkinter client | alternative | ~25–35 MB RAM, ~1 sec start, X11 required |
+| `--browser` | Browser kiosk | opt-in | 30–80 MB RAM, 3–10 sec start, X11 required, full HTML/SVG features |
 
-**If you want the lowest-RAM Pi 1 kiosk**: `./kiosk-install.sh --pygame`.
-**If you want the richest display**: `./kiosk-install.sh` (browser default).
+**If you want the lowest-RAM Pi 1 kiosk**: `./kiosk-install.sh` (pygame default).
+**If you want the richest display**: `./kiosk-install.sh --browser`.
 **If you want native GUI widgets on a Pi with X11 already running**: `./kiosk-install.sh --tkinter`.
 
 ### Switching modes after install
@@ -438,6 +434,30 @@ d.start_background()
 ```
 
 Python 3.9+ stdlib only — no dependencies beyond the standard library for the data layer itself.
+
+---
+
+## Reverting to browser mode
+
+Pygame is the default, but the browser kiosk is still fully supported. To
+switch an existing Pi 1 back to the browser kiosk:
+
+```bash
+cd ~/hamclock-pi1
+sudo ./kiosk-install.sh --browser
+```
+
+This re-runs the installer in browser mode on the existing box, swapping the
+kiosk service unit. Your `/etc/hamclock-lite/settings.json` is left in place
+so you can switch back to pygame later without losing your callsign, theme,
+and NTP server.
+
+## Migration from browser mode
+
+When switching a previously-browser-mode Pi 1 to pygame mode, **browser
+localStorage settings (theme, callsign) are not migrated**. The installer
+prints a one-time notice; re-enter the values in the first-boot wizard or
+via `sudo hamclock-setup --callsign W1ABC --timezone America/Chicago --theme kstate`.
 
 ---
 
