@@ -341,3 +341,26 @@ def test_render_loop_30_frame_alloc_budget(monkeypatch):
         assert hit_rate >= 0.90, 'glyph cache hit rate %.2f < 0.90' % hit_rate
     finally:
         pygame.quit()
+
+
+def test_render_loop_recovery_overlay_renders(monkeypatch):
+    """The RECOVERING label must be drawn when the helper runs, using
+    cached fonts (no per-call Font allocation)."""
+    import pygame
+    pygame.display.init()
+    screen = pygame.display.set_mode((1440, 900))
+    import hamclock_pygame as hp
+
+    seen = {"recovering": 0}
+    original = hp._blit_text
+    def trace(surf, font, text, color, x, y):
+        if "RECOVERING" in str(text):
+            seen["recovering"] += 1
+        return original(surf, font, text, color, x, y)
+    monkeypatch.setattr(hp, "_blit_text", trace)
+
+    theme = hp.THEMES["kstate"]
+    fonts = hp._make_fonts()
+    hp._render_recovering_overlay(screen, fonts, theme)
+    assert seen["recovering"] >= 1
+    pygame.display.quit()

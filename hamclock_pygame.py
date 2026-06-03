@@ -18,6 +18,18 @@ import pygame
 from hamclock_data import HamClockData
 
 
+# ---- Theme palettes (minimal stub; expanded with full 4-theme dict in Phase 3) ----
+THEMES = {
+    'kstate': {
+        'bg': (42, 20, 80),
+        'card': (58, 29, 101),
+        'fg': (232, 221, 245),
+        'label': (184, 160, 216),
+        'accent': (244, 197, 92),
+    },
+}
+
+
 # ---- K-State theme colors ----
 BG = (42, 20, 80)
 CARD = (58, 29, 101)
@@ -87,6 +99,13 @@ def _make_fonts():
     Also clears the module-level _glyph_cache so stale renders from a
     previous font set cannot leak through (Task 1.3).
     """
+    # Ensure font subsystem is up; callers (incl. recovery-overlay tests) may
+    # only have initialized pygame.display, leaving pygame.font uninitialized.
+    try:
+        if not pygame.font.get_init():
+            pygame.font.init()
+    except Exception:
+        pass
     def mk(size):
         try:
             f = pygame.font.SysFont('monospace', size)
@@ -531,6 +550,33 @@ def _inject_event_iter(events):
         yield []
 
 
+def _render_recovering_overlay(screen, fonts, theme):
+    """Degraded-window display: fill with theme bg + centered RECOVERING
+    label so the user never sees the bare console or a stuck partial
+    frame while the render loop retries."""
+    try:
+        screen.fill(theme.get("bg", (0, 0, 0)))
+        sw, sh = screen.get_size()
+        font = (fonts.get("title")
+                or fonts.get("panel")
+                or next(iter(fonts.values())))
+        text = "RECOVERING…"
+        fg = theme.get("fg", (220, 230, 240))
+        # Compute approx text width to center via _blit_text (which uses the glyph cache).
+        try:
+            sample = font.render(text, True, fg)
+            tw, th = sample.get_size()
+        except Exception:
+            tw, th = 200, 30
+        x = (sw - tw) // 2
+        y = (sh - th) // 2
+        _blit_text(screen, font, text, fg, x, y)
+        import pygame as _pg
+        _pg.display.flip()
+    except Exception:
+        pass
+
+
 def main(argv=None):
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     injected_iter = None
@@ -745,14 +791,16 @@ def main(argv=None):
             consecutive_errors = 0
         except Exception as e:
             consecutive_errors += 1
-            print('render loop error (%d): %s' % (consecutive_errors, e),
-                  file=sys.stderr)
+            print("render loop error (%d): %s"
+                  % (consecutive_errors, e), file=sys.stderr)
+            backoff_ms = min(100 * consecutive_errors, 500)
+            _render_recovering_overlay(screen, fonts, theme if 'theme' in dir() else THEMES["kstate"])
             if consecutive_errors > 15:
-                print('too many render errors — exiting for a clean restart',
+                print("too many render errors — exiting for a clean restart",
                       file=sys.stderr)
                 running = False
             else:
-                time.sleep(1)
+                time.sleep(backoff_ms / 1000.0)
 
     try:
         data.stop()
