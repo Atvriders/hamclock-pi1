@@ -69,6 +69,14 @@ def _font_key(font):
     return (name, size)
 
 
+# ---- Scaled-image cache (Phase 1 perf fix #1) ----
+# Keyed by (image_key, fetched_at, (w, h)) -> scaled pygame.Surface.
+# Cap 16: dashboard has 5 image slots × 1 active scale each = 5; 16 leaves
+# margin for tab changes. Eviction is LRU (popitem(last=False) on overflow).
+_SCALED_CACHE_CAP = 16
+_scaled_cache = collections.OrderedDict()
+
+
 def _make_fonts():
     """Build the fonts dict. Falls back to default font if SysFont fails.
 
@@ -208,7 +216,8 @@ def draw_bands(screen, rect, bands, fonts):
         y += 16
 
 
-def draw_image(screen, rect, surface, fonts=None):
+def draw_image(screen, rect, surface, fonts=None,
+               image_key=None, fetched_at=None):
     if surface is None:
         if fonts is not None and 'tiny' in fonts:
             _blit_text(screen, fonts['tiny'], 'image loading...', LABEL,
@@ -220,7 +229,20 @@ def draw_image(screen, rect, surface, fonts=None):
             return
         scale = min(rect.w / iw, rect.h / ih)
         nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
-        scaled = pygame.transform.smoothscale(surface, (nw, nh)) if scale < 1.0 else surface
+        if scale >= 1.0:
+            scaled = surface
+        elif image_key is not None and fetched_at is not None:
+            key = (image_key, float(fetched_at), (nw, nh))
+            scaled = _scaled_cache.get(key)
+            if scaled is None:
+                scaled = pygame.transform.smoothscale(surface, (nw, nh))
+                _scaled_cache[key] = scaled
+                if len(_scaled_cache) > _SCALED_CACHE_CAP:
+                    _scaled_cache.popitem(last=False)
+            else:
+                _scaled_cache.move_to_end(key)
+        else:
+            scaled = pygame.transform.smoothscale(surface, (nw, nh))
         x = rect.x + (rect.w - nw) // 2
         y = rect.y + (rect.h - nh) // 2
         screen.blit(scaled, (x, y))
@@ -507,7 +529,9 @@ def main():
                 pass
             try:
                 sdo_surf = _get_cached_image(data, 'solar-image', image_cache, image_cache_ts)
-                draw_image(screen, panel_rects[2], sdo_surf, fonts)
+                draw_image(screen, panel_rects[2], sdo_surf, fonts,
+                           image_key='solar-image',
+                           fetched_at=data.image_fetched_at.get('solar-image', 0.0))
             except Exception:
                 pass
             try:
@@ -563,7 +587,9 @@ def main():
             try:
                 key = tab_image_key.get(active_tab, 'real-drap')
                 surf = _get_cached_image(data, key, image_cache, image_cache_ts)
-                draw_image(screen, img_rect, surf, fonts)
+                draw_image(screen, img_rect, surf, fonts,
+                           image_key=key,
+                           fetched_at=data.image_fetched_at.get(key, 0.0))
             except Exception:
                 pass
 

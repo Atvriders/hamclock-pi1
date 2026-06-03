@@ -137,3 +137,73 @@ def test_glyph_cache_evicts_at_cap():
         assert len(hamclock_pygame._glyph_cache) == 256
     finally:
         pygame.quit()
+
+
+def test_scaled_cache_avoids_repeat_smoothscale(monkeypatch):
+    import pygame
+    pygame.init()
+    try:
+        import hamclock_pygame
+        scale_calls = {'n': 0}
+        real_ss = pygame.transform.smoothscale
+        def counting_ss(surf, size, *a, **kw):
+            scale_calls['n'] += 1
+            return real_ss(surf, size, *a, **kw)
+        monkeypatch.setattr(pygame.transform, 'smoothscale', counting_ss)
+        hamclock_pygame._scaled_cache.clear()
+        screen = pygame.Surface((400, 300))
+        src = pygame.Surface((800, 600))
+        src.fill((10, 20, 30))
+        rect = pygame.Rect(0, 0, 400, 300)
+        fonts = hamclock_pygame._make_fonts()
+        for _ in range(30):
+            hamclock_pygame.draw_image(screen, rect, src, fonts,
+                                       image_key='solar-image',
+                                       fetched_at=1000.0)
+        assert scale_calls['n'] == 1, \
+            'smoothscale ran %d times for 30 identical draws' % scale_calls['n']
+    finally:
+        pygame.quit()
+
+
+def test_scaled_cache_reinvalidates_on_new_fetched_at(monkeypatch):
+    import pygame
+    pygame.init()
+    try:
+        import hamclock_pygame
+        scale_calls = {'n': 0}
+        real_ss = pygame.transform.smoothscale
+        def counting_ss(surf, size, *a, **kw):
+            scale_calls['n'] += 1
+            return real_ss(surf, size, *a, **kw)
+        monkeypatch.setattr(pygame.transform, 'smoothscale', counting_ss)
+        hamclock_pygame._scaled_cache.clear()
+        screen = pygame.Surface((400, 300))
+        src = pygame.Surface((800, 600))
+        rect = pygame.Rect(0, 0, 400, 300)
+        fonts = hamclock_pygame._make_fonts()
+        hamclock_pygame.draw_image(screen, rect, src, fonts,
+                                   image_key='solar-image', fetched_at=1000.0)
+        hamclock_pygame.draw_image(screen, rect, src, fonts,
+                                   image_key='solar-image', fetched_at=2000.0)
+        assert scale_calls['n'] == 2
+    finally:
+        pygame.quit()
+
+
+def test_scaled_cache_evicts_at_cap():
+    import pygame
+    pygame.init()
+    try:
+        import hamclock_pygame
+        hamclock_pygame._scaled_cache.clear()
+        screen = pygame.Surface((400, 300))
+        src = pygame.Surface((800, 600))
+        fonts = hamclock_pygame._make_fonts()
+        for i in range(40):
+            rect = pygame.Rect(0, 0, 100 + i, 100 + i)
+            hamclock_pygame.draw_image(screen, rect, src, fonts,
+                                       image_key='k%d' % i, fetched_at=1.0)
+        assert len(hamclock_pygame._scaled_cache) == 16
+    finally:
+        pygame.quit()
