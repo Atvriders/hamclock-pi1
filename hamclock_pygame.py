@@ -46,9 +46,21 @@ HF_BANDS = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m', '12m', '10m
 SCREEN_W = 1440
 SCREEN_H = 900
 
+# Glyph cache (populated by Task 1.3's _blit_text refactor). Declared here
+# so _make_fonts can clear it. Cleared on font reload so stale renders
+# from a previous font set cannot leak through.
+import collections as _collections
+_glyph_cache = _collections.OrderedDict()
+
 
 def _make_fonts():
-    """Build the fonts dict. Falls back to default font if SysFont fails."""
+    """Build the fonts dict. Falls back to default font if SysFont fails.
+
+    Includes 'tiny' (size 11) used by draw_image's loading placeholder so
+    the inline pygame.font.Font(None, 18) per-frame allocation is gone.
+    Also clears the module-level _glyph_cache so stale renders from a
+    previous font set cannot leak through (Task 1.3).
+    """
     def mk(size):
         try:
             f = pygame.font.SysFont('monospace', size)
@@ -57,12 +69,14 @@ def _make_fonts():
             return f
         except Exception:
             return pygame.font.Font(None, size + 4)
+    _glyph_cache.clear()
     return {
         'title': mk(22),
         'panel': mk(14),
         'body': mk(14),
         'label': mk(12),
         'small': mk(11),
+        'tiny': mk(11),
     }
 
 
@@ -167,9 +181,11 @@ def draw_bands(screen, rect, bands, fonts):
         y += 16
 
 
-def draw_image(screen, rect, surface):
+def draw_image(screen, rect, surface, fonts=None):
     if surface is None:
-        _blit_text(screen, pygame.font.Font(None, 18), 'image loading...', LABEL, rect.x + 6, rect.y + 6)
+        if fonts is not None and 'tiny' in fonts:
+            _blit_text(screen, fonts['tiny'], 'image loading...', LABEL,
+                       rect.x + 6, rect.y + 6)
         return
     try:
         iw, ih = surface.get_size()
@@ -464,7 +480,7 @@ def main():
                 pass
             try:
                 sdo_surf = _get_cached_image(data, 'solar-image', image_cache, image_cache_ts)
-                draw_image(screen, panel_rects[2], sdo_surf)
+                draw_image(screen, panel_rects[2], sdo_surf, fonts)
             except Exception:
                 pass
             try:
@@ -520,7 +536,7 @@ def main():
             try:
                 key = tab_image_key.get(active_tab, 'real-drap')
                 surf = _get_cached_image(data, key, image_cache, image_cache_ts)
-                draw_image(screen, img_rect, surf)
+                draw_image(screen, img_rect, surf, fonts)
             except Exception:
                 pass
 
