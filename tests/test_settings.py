@@ -109,3 +109,22 @@ def test_write_settings_chown_permission_error_suppressed(tmp_path, monkeypatch)
     write_settings({"callsign": "K1A", "timezone": "UTC",
                     "theme": "kstate", "ntp": ""}, str(p))
     assert p.exists()
+
+
+from hamclock_pygame import validate_timezone
+
+
+def test_validate_timezone_known_names():
+    for name in ("UTC", "America/Chicago", "Europe/London",
+                 "Asia/Tokyo", "Australia/Sydney"):
+        ok, err = validate_timezone(name)
+        assert ok, "expected accept for %r, got %r" % (name, err)
+        assert err == ""
+
+
+def test_validate_timezone_rejected():
+    for name in ("Atlantis/Lost", "", "Mars/Olympus", "utc",
+                 "America/Chicago ", "Not_a_zone"):
+        ok, err = validate_timezone(name)
+        assert not ok, "expected reject for %r" % name
+        assert err != ""

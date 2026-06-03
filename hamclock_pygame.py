@@ -145,6 +145,24 @@ def validate_callsign(s: str) -> tuple:
     return (True, "")
 
 
+def validate_timezone(s: str) -> tuple:
+    """Validate IANA timezone name.
+
+    ok iff s is a member of zoneinfo.available_timezones().
+    Returns (ok, error_msg)."""
+    if not s:
+        return (False, "timezone required")
+    try:
+        from zoneinfo import available_timezones
+    except ImportError:
+        # zoneinfo is stdlib on Python 3.9+; if unavailable, accept anything
+        # to avoid blocking the wizard on a non-Pi dev box.
+        return (True, "")
+    if s in available_timezones():
+        return (True, "")
+    return (False, "unknown timezone (use IANA name like America/Chicago)")
+
+
 # ---- THEMES (Phase 3) ----
 # Palettes are extracted from the browser dashboard at index.html L387-392
 # (the `var themes={...}` literal). kstate values match the existing pygame
