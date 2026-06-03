@@ -598,6 +598,159 @@ HF_BANDS = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m', '12m', '10m
 SCREEN_W = 1440
 SCREEN_H = 900
 
+# ---- Phase 1b: layout / counts / string / solar caches ----
+# Item 5: panel rect grid is recomputed only when screen size changes; every
+# per-frame pygame.Rect(...) panel allocation now reads from this dict.
+_layout_cache: dict = {"size": None, "rects": None}
+
+
+def _get_layout(screen_size):
+    """Cache the dashboard layout rects; recompute only on resize."""
+    if _layout_cache["size"] == screen_size:
+        return _layout_cache["rects"]
+    sw, sh = screen_size
+    header_h = 30
+    status_h = 20
+    content_top = header_h + 2
+    content_bot = sh - status_h - 2
+    content_h = content_bot - content_top
+    left_w = int(sw * 288 / 1440)
+    mid_w = int(sw * (936 - 288) / 1440)
+    right_w = sw - left_w - mid_w
+    panel_gap = 4
+    heights = [
+        int(content_h * 0.20),  # solar
+        int(content_h * 0.12),  # bands
+        int(content_h * 0.28),  # sdo
+        int(content_h * 0.10),  # geomag
+        int(content_h * 0.10),  # xray
+    ]
+    heights.append(content_h - sum(heights) - panel_gap * 5)
+    titles = ['solar', 'bands', 'sdo', 'geomag', 'xray', 'open_bands']
+    rects = {
+        "header": pygame.Rect(0, 0, sw, header_h),
+        "status": pygame.Rect(0, sh - status_h, sw, status_h),
+    }
+    cy = content_top
+    for h, key in zip(heights, titles):
+        rects[key] = pygame.Rect(2, cy, left_w - 4, h)
+        cy += h + panel_gap
+    mx = 2 + left_w
+    rects["muf"] = pygame.Rect(mx, content_top, mid_w - 4, content_h)
+    rx = mx + mid_w
+    rh_dx = int(content_h * 0.28)
+    rh_ba = int(content_h * 0.32)
+    rh_prop = content_h - rh_dx - rh_ba - panel_gap * 2
+    rects["dx_spots"] = pygame.Rect(rx, content_top, right_w - 4, rh_dx)
+    rects["band_activity"] = pygame.Rect(
+        rx, content_top + rh_dx + panel_gap, right_w - 4, rh_ba)
+    rects["propagation"] = pygame.Rect(
+        rx, content_top + rh_dx + rh_ba + panel_gap * 2,
+        right_w - 4, rh_prop)
+    _layout_cache["size"] = screen_size
+    _layout_cache["rects"] = rects
+    return rects
+
+
+# Item 6: draw_band_activity pre-allocated counts (no per-frame dict alloc).
+_band_counts: list = [0] * len(HF_BANDS)
+
+# Item 7: cached OPEN / CLOSED label strings keyed by data.last_data_refresh.
+_open_bands_cache: dict = {"ts": None, "open": "", "closed": ""}
+
+
+def _open_bands_strings(bands, data_refresh_ts):
+    """Return the cached (open_label, closed_label) strings; refresh only
+    on a new data.last_data_refresh tick."""
+    if _open_bands_cache["ts"] == data_refresh_ts:
+        return _open_bands_cache["open"], _open_bands_cache["closed"]
+    opens, closes = [], []
+    if isinstance(bands, dict):
+        for key, entry in bands.items():
+            if not isinstance(entry, dict):
+                continue
+            day = entry.get('day', 'N/A')
+            if day in ('Good', 'Fair'):
+                opens.append(key)
+            elif day == 'Poor':
+                closes.append(key)
+    o = 'OPEN: ' + (', '.join(opens) or '--')
+    c = 'CLOSED: ' + (', '.join(closes) or '--')
+    _open_bands_cache["ts"] = data_refresh_ts
+    _open_bands_cache["open"] = o
+    _open_bands_cache["closed"] = c
+    return o, c
+
+
+# Item 8: header / status / Kp string format cache keyed by
+# (int(time.time()), data.last_data_refresh, data.last_image_refresh, dx_len).
+_strfmt_cache: dict = {
+    "key": None, "utc": "", "local": "", "status": "", "kp": "",
+}
+
+
+def _formatted_strings(data):
+    """Return cached strings for header (utc, local), status bar, and Kp.
+    Refreshes once per UTC second OR on a data/image refresh tick."""
+    try:
+        now_sec = int(time.time())
+    except Exception:
+        now_sec = 0
+    dx_len = len(data.dxspots) if isinstance(data.dxspots, list) else 0
+    key = (now_sec, data.last_data_refresh,
+           data.last_image_refresh, dx_len,
+           bool(data.solar), bool(data.bands))
+    if _strfmt_cache["key"] == key:
+        return _strfmt_cache
+    try:
+        utc = time.strftime('%H:%M:%S', time.gmtime())
+        local = time.strftime('%H:%M:%S')
+    except Exception:
+        utc = local = '--:--:--'
+    dage = int(now_sec - data.last_data_refresh) if data.last_data_refresh else -1
+    iage = int(now_sec - data.last_image_refresh) if data.last_image_refresh else -1
+    _strfmt_cache["utc"] = 'UTC ' + utc
+    _strfmt_cache["local"] = 'LOC ' + local
+    _strfmt_cache["status"] = 'Data:{}s  Img:{}s  Solar:{}  Bands:{}  DX:{}'.format(
+        dage if dage >= 0 else '--',
+        iage if iage >= 0 else '--',
+        'OK' if data.solar else '--',
+        'OK' if data.bands else '--',
+        dx_len,
+    )
+    kp = _safe(data.solar or {}, 'kIndex', 0) if data.solar is not None else 0
+    _strfmt_cache["kp"] = 'Kp {}'.format(kp)
+    _strfmt_cache["key"] = key
+    return _strfmt_cache
+
+
+# Item 9: de-nested solar snapshot keyed by data.last_data_refresh.
+_solar_snapshot: dict = {"ts": None, "view": {}}
+
+
+def _solar_view(solar, data_refresh_ts):
+    """Single de-nested view of solar dict; refreshed only on data refresh."""
+    if _solar_snapshot["ts"] == data_refresh_ts and _solar_snapshot["view"]:
+        return _solar_snapshot["view"]
+    s = solar or {}
+    _solar_snapshot["view"] = {
+        'sfi':         _safe(s, 'sfi'),
+        'kIndex':      _safe(s, 'kIndex'),
+        'ssn':         _safe(s, 'ssn'),
+        'aIndex':      _safe(s, 'aIndex'),
+        'xray':        _safe(s, 'xray'),
+        'solarWind':   _safe(s, 'solarWind'),
+        'bz':          _safe(s, 'bz'),
+        'geomagField': _safe(s, 'geomagField'),
+        'signalNoise': _safe(s, 'signalNoise'),
+        'fof2':        _safe(s, 'fof2'),
+        'kIndex_raw':  _safe(s, 'kIndex', 0),
+        'xray_raw':    _safe(s, 'xray', 'A0.0'),
+    }
+    _solar_snapshot["ts"] = data_refresh_ts
+    return _solar_snapshot["view"]
+
+
 # ---- Glyph cache (Phase 1 perf fix #3) ----
 # Keyed by (font_name_or_None, font_size, text, color); explicitly NOT id(font)
 # because CPython reuses id() after GC. _make_fonts() clears this dict on
@@ -717,7 +870,10 @@ def draw_panel(screen, rect, title, fonts, theme):
     return pygame.Rect(rect.x + 6, rect.y + 22, rect.w - 12, rect.h - 26)
 
 
-def draw_header(screen, rect, callsign, fonts, theme):
+def draw_header(screen, rect, callsign, fonts, theme, data=None):
+    """Item 8: pull pre-formatted UTC/LOC strings from _strfmt_cache when a
+    HamClockData reference is available; the cache hits on every same-second
+    frame, eliminating per-frame strftime + Font.render churn."""
     pygame.draw.rect(screen, theme['card'], rect)
     pygame.draw.rect(screen, theme['border'], rect, 1)
     _blit_text(screen, fonts['title'], 'HAMCLOCK LITE', theme['accent'],
@@ -725,33 +881,50 @@ def draw_header(screen, rect, callsign, fonts, theme):
     if callsign:
         _blit_text(screen, fonts['body'], str(callsign), theme['bright'],
                    rect.x + 220, rect.y + 8)
-    try:
-        utc = time.strftime('%H:%M:%S', time.gmtime())
-        local = time.strftime('%H:%M:%S')
-    except Exception:
-        utc = local = '--:--:--'
-    _blit_text(screen, fonts['body'], 'UTC ' + utc, theme['fg'],
+    if data is not None:
+        cached = _formatted_strings(data)
+        utc_str = cached["utc"]
+        local_str = cached["local"]
+    else:
+        try:
+            utc_str = 'UTC ' + time.strftime('%H:%M:%S', time.gmtime())
+            local_str = 'LOC ' + time.strftime('%H:%M:%S')
+        except Exception:
+            utc_str = local_str = '--:--:--'
+    _blit_text(screen, fonts['body'], utc_str, theme['fg'],
                rect.x + rect.w - 340, rect.y + 8)
-    _blit_text(screen, fonts['body'], 'LOC ' + local, theme['fg'],
+    _blit_text(screen, fonts['body'], local_str, theme['fg'],
                rect.x + rect.w - 180, rect.y + 8)
     dot_color = theme['good'] if (int(time.time()) % 2 == 0) else theme['fair']
     pygame.draw.circle(screen, dot_color,
                        (rect.x + rect.w - 18, rect.y + 14), 5)
 
 
-def draw_solar(screen, rect, solar, fonts, theme):
-    rows = [
-        ('SFI', _safe(solar, 'sfi')),
-        ('Kp', _safe(solar, 'kIndex')),
-        ('SSN', _safe(solar, 'ssn')),
-        ('A', _safe(solar, 'aIndex')),
-        ('X-Ray', _safe(solar, 'xray')),
-        ('Wind', _safe(solar, 'solarWind')),
-        ('Bz', _safe(solar, 'bz')),
-        ('Geo', _safe(solar, 'geomagField')),
-        ('S/N', _safe(solar, 'signalNoise')),
-        ('foF2', _safe(solar, 'fof2')),
-    ]
+def draw_solar(screen, rect, solar, fonts, theme, data_refresh_ts=None):
+    """Item 9: pull values from _solar_view snapshot when a refresh ts is
+    known so the per-frame _safe(...) chain runs at most once per refresh."""
+    v = _solar_view(solar, data_refresh_ts) if data_refresh_ts is not None else None
+    if v is not None:
+        rows = [
+            ('SFI', v['sfi']), ('Kp', v['kIndex']), ('SSN', v['ssn']),
+            ('A', v['aIndex']), ('X-Ray', v['xray']),
+            ('Wind', v['solarWind']), ('Bz', v['bz']),
+            ('Geo', v['geomagField']), ('S/N', v['signalNoise']),
+            ('foF2', v['fof2']),
+        ]
+    else:
+        rows = [
+            ('SFI', _safe(solar, 'sfi')),
+            ('Kp', _safe(solar, 'kIndex')),
+            ('SSN', _safe(solar, 'ssn')),
+            ('A', _safe(solar, 'aIndex')),
+            ('X-Ray', _safe(solar, 'xray')),
+            ('Wind', _safe(solar, 'solarWind')),
+            ('Bz', _safe(solar, 'bz')),
+            ('Geo', _safe(solar, 'geomagField')),
+            ('S/N', _safe(solar, 'signalNoise')),
+            ('foF2', _safe(solar, 'fof2')),
+        ]
     y = rect.y
     for label, value in rows:
         _blit_text(screen, fonts['label'], label, theme['label'], rect.x, y)
@@ -884,21 +1057,24 @@ def draw_dx_spots(screen, rect, dxspots, fonts, theme):
 
 
 def draw_band_activity(screen, rect, dxspots, fonts, theme):
-    counts = {b: 0 for b in HF_BANDS}
+    """Item 6: pre-allocated _band_counts list (reset in place) replaces the
+    per-frame {b: 0 for b in HF_BANDS} dict comprehension."""
+    for i in range(len(_band_counts)):
+        _band_counts[i] = 0
     if isinstance(dxspots, list):
-        for spot in dxspots:
+        for spot in dxspots[:200]:
             if isinstance(spot, dict):
                 b = spot.get('band')
-                if b in counts:
-                    counts[b] += 1
-    vmax = max(counts.values()) if any(counts.values()) else 1
+                if b in HF_BANDS:
+                    _band_counts[HF_BANDS.index(b)] += 1
+    vmax = max(_band_counts) if any(_band_counts) else 1
     band_lut = dict(zip(HF_BANDS, theme['band_palette']))
     label_w = 40
     count_w = 36
     row_h = max(14, (rect.h - 4) // len(HF_BANDS))
     y = rect.y + 2
-    for band in HF_BANDS:
-        c = counts[band]
+    for i, band in enumerate(HF_BANDS):
+        c = _band_counts[i]
         _blit_text(screen, fonts['label'], band, theme['label'], rect.x, y + 1)
         bar_rect = pygame.Rect(rect.x + label_w, y + 2,
                                max(1, rect.w - label_w - count_w), row_h - 4)
@@ -927,8 +1103,14 @@ def draw_tabs(screen, rect, tabs, active, fonts, theme):
     return regions
 
 
-def draw_geomag(screen, rect, solar, fonts, theme):
-    kp = _safe(solar, 'kIndex', 0)
+def draw_geomag(screen, rect, solar, fonts, theme, data_refresh_ts=None):
+    """Items 8 + 9: pull Kp value & label from caches when a refresh ts is
+    known so neither the _safe call nor the format string runs each frame."""
+    if data_refresh_ts is not None:
+        v = _solar_view(solar, data_refresh_ts)
+        kp = v['kIndex_raw']
+    else:
+        kp = _safe(solar, 'kIndex', 0)
     try:
         kp_val = float(kp)
     except Exception:
@@ -942,8 +1124,14 @@ def draw_geomag(screen, rect, solar, fonts, theme):
     draw_bar(screen, bar_rect, kp_val, 9.0, color, theme)
 
 
-def draw_xray(screen, rect, solar, fonts, theme):
-    xray = _safe(solar, 'xray', 'A0.0')
+def draw_xray(screen, rect, solar, fonts, theme, data_refresh_ts=None):
+    """Item 9: read the X-Ray value from the cached _solar_view when a
+    refresh ts is known."""
+    if data_refresh_ts is not None:
+        v = _solar_view(solar, data_refresh_ts)
+        xray = v['xray_raw']
+    else:
+        xray = _safe(solar, 'xray', 'A0.0')
     s = str(xray)
     try:
         letter = s[0]
@@ -960,36 +1148,20 @@ def draw_xray(screen, rect, solar, fonts, theme):
     draw_bar(screen, bar_rect, value, 5.0, color, theme)
 
 
-def draw_open_bands(screen, rect, bands, fonts, theme):
-    opens, closes = [], []
-    if isinstance(bands, dict):
-        for key, entry in bands.items():
-            if not isinstance(entry, dict):
-                continue
-            day = entry.get('day', 'N/A')
-            if day in ('Good', 'Fair'):
-                opens.append(key)
-            elif day == 'Poor':
-                closes.append(key)
-    _blit_text(screen, fonts['label'], 'OPEN: ' + (', '.join(opens) or '--'),
-               theme['good'], rect.x, rect.y)
-    _blit_text(screen, fonts['label'], 'CLOSED: ' + (', '.join(closes) or '--'),
-               theme['poor'], rect.x, rect.y + 16)
+def draw_open_bands(screen, rect, bands, fonts, theme, data_refresh_ts=None):
+    """Item 7: build the OPEN / CLOSED labels once per data refresh; until
+    the next refresh tick we just read the cached strings."""
+    o, c = _open_bands_strings(bands, data_refresh_ts)
+    _blit_text(screen, fonts['label'], o, theme['good'], rect.x, rect.y)
+    _blit_text(screen, fonts['label'], c, theme['poor'], rect.x, rect.y + 16)
 
 
 def draw_status_bar(screen, rect, data, fonts, theme):
+    """Item 8: status bar text is pulled from _strfmt_cache so the format
+    string is built at most once per UTC second."""
     pygame.draw.rect(screen, theme['card'], rect)
     pygame.draw.rect(screen, theme['border'], rect, 1)
-    now = time.time()
-    dage = int(now - data.last_data_refresh) if data.last_data_refresh else -1
-    iage = int(now - data.last_image_refresh) if data.last_image_refresh else -1
-    text = 'Data:{}s  Img:{}s  Solar:{}  Bands:{}  DX:{}'.format(
-        dage if dage >= 0 else '--',
-        iage if iage >= 0 else '--',
-        'OK' if data.solar else '--',
-        'OK' if data.bands else '--',
-        len(data.dxspots) if isinstance(data.dxspots, list) else 0,
-    )
+    text = _formatted_strings(data)["status"]
     _blit_text(screen, fonts['small'], text, theme['label'],
                rect.x + 6, rect.y + 4)
     _blit_text(screen, fonts['small'], 'ESC/Q to quit', theme['label'],
@@ -1266,46 +1438,35 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
             sw, sh = screen.get_size()
             screen.fill(theme['bg'])
 
-            header = pygame.Rect(0, 0, sw, 30)
+            # Phase 1b item 5: panel rects are cached and rebuilt only on
+            # screen-size change. Per-frame pygame.Rect allocations are gone
+            # for every panel that uses a stable position.
+            layout = _get_layout((sw, sh))
+            data_ts = data.last_data_refresh
+
+            header = layout["header"]
             callsign = settings.get('callsign') or os.environ.get(
                 'HAMCLOCK_CALLSIGN', 'N0CALL')
-            draw_header(screen, header, callsign, fonts, theme)
+            draw_header(screen, header, callsign, fonts, theme, data=data)
 
-            status = pygame.Rect(0, sh - 20, sw, 20)
+            status = layout["status"]
             draw_status_bar(screen, status, data, fonts, theme)
 
-            content_top = 32
-            content_bot = sh - 22
-            content_h = content_bot - content_top
-
-            left_w = int(sw * 288 / 1440)
-            mid_w = int(sw * (936 - 288) / 1440)
-            right_w = sw - left_w - mid_w
+            panel_gap = 4
 
             # ---- LEFT COLUMN ----
-            lx = 2
-            ly = content_top
-            panel_gap = 4
-            # allocate heights (percent of content_h)
-            heights = [
-                int(content_h * 0.20),  # solar
-                int(content_h * 0.12),  # bands
-                int(content_h * 0.28),  # sdo
-                int(content_h * 0.10),  # geomag
-                int(content_h * 0.10),  # xray
-            ]
-            heights.append(content_h - sum(heights) - panel_gap * 5)  # open bands
-            titles = ['SOLAR', 'BANDS', 'SDO IMAGE', 'GEOMAGNETIC', 'X-RAY FLUX', 'OPEN BANDS']
-            cy = ly
+            titles = ['SOLAR', 'BANDS', 'SDO IMAGE',
+                      'GEOMAGNETIC', 'X-RAY FLUX', 'OPEN BANDS']
+            layout_keys = ['solar', 'bands', 'sdo',
+                           'geomag', 'xray', 'open_bands']
             panel_rects = []
-            for h, t in zip(heights, titles):
-                r = pygame.Rect(lx, cy, left_w - 4, h)
-                inner = draw_panel(screen, r, t, fonts, theme)
+            for key, t in zip(layout_keys, titles):
+                inner = draw_panel(screen, layout[key], t, fonts, theme)
                 panel_rects.append(inner)
-                cy += h + panel_gap
 
             try:
-                draw_solar(screen, panel_rects[0], data.solar or {}, fonts, theme)
+                draw_solar(screen, panel_rects[0], data.solar or {},
+                           fonts, theme, data_refresh_ts=data_ts)
             except Exception:
                 pass
             try:
@@ -1320,21 +1481,23 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
             except Exception:
                 pass
             try:
-                draw_geomag(screen, panel_rects[3], data.solar or {}, fonts, theme)
+                draw_geomag(screen, panel_rects[3], data.solar or {},
+                            fonts, theme, data_refresh_ts=data_ts)
             except Exception:
                 pass
             try:
-                draw_xray(screen, panel_rects[4], data.solar or {}, fonts, theme)
+                draw_xray(screen, panel_rects[4], data.solar or {},
+                          fonts, theme, data_refresh_ts=data_ts)
             except Exception:
                 pass
             try:
-                draw_open_bands(screen, panel_rects[5], data.bands or {}, fonts, theme)
+                draw_open_bands(screen, panel_rects[5], data.bands or {},
+                                fonts, theme, data_refresh_ts=data_ts)
             except Exception:
                 pass
 
             # ---- MIDDLE COLUMN ----
-            mx = lx + left_w
-            mid_rect = pygame.Rect(mx, content_top, mid_w - 4, content_h)
+            mid_rect = layout["muf"]
             mid_inner = draw_panel(screen, mid_rect, 'MUF STATUS', fonts, theme)
             try:
                 draw_muf_text(screen, mid_inner, data.solar or {}, fonts, theme)
@@ -1342,27 +1505,21 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 pass
 
             # ---- RIGHT COLUMN ----
-            rx = mx + mid_w
-            rh_dx = int(content_h * 0.28)
-            rh_ba = int(content_h * 0.32)
-            rh_prop = content_h - rh_dx - rh_ba - panel_gap * 2
-
-            dx_r = pygame.Rect(rx, content_top, right_w - 4, rh_dx)
+            dx_r = layout["dx_spots"]
             dx_inner = draw_panel(screen, dx_r, 'DX SPOTS', fonts, theme)
             try:
                 draw_dx_spots(screen, dx_inner, data.dxspots or [], fonts, theme)
             except Exception:
                 pass
 
-            ba_r = pygame.Rect(rx, content_top + rh_dx + panel_gap, right_w - 4, rh_ba)
+            ba_r = layout["band_activity"]
             ba_inner = draw_panel(screen, ba_r, 'BAND ACTIVITY', fonts, theme)
             try:
                 draw_band_activity(screen, ba_inner, data.dxspots or [], fonts, theme)
             except Exception:
                 pass
 
-            prop_r = pygame.Rect(rx, content_top + rh_dx + rh_ba + panel_gap * 2,
-                                 right_w - 4, rh_prop)
+            prop_r = layout["propagation"]
             prop_inner = draw_panel(screen, prop_r, 'PROPAGATION', fonts, theme)
             tab_bar = pygame.Rect(prop_inner.x, prop_inner.y, prop_inner.w, 20)
             tab_regions = draw_tabs(screen, tab_bar, ['drap', 'aurora', 'enlil'],
