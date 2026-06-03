@@ -82,3 +82,58 @@ def test_draw_image_loading_branch_uses_cached_tiny_font(monkeypatch):
             hamclock_pygame.draw_image(screen, rect, None, fonts)
     finally:
         pygame.quit()
+
+
+def test_glyph_cache_hit_rate(monkeypatch):
+    """Repeated _blit_text of the same (font,text,color) hits cache."""
+    import pygame
+    pygame.init()
+    try:
+        import hamclock_pygame
+        fonts = hamclock_pygame._make_fonts()
+        screen = pygame.Surface((400, 100))
+        hamclock_pygame._glyph_cache.clear()
+        # 100 repeated identical labels — should only populate 1 cache entry.
+        for _ in range(100):
+            hamclock_pygame._blit_text(screen, fonts['panel'],
+                                       'SOLAR', (255, 255, 255), 0, 0)
+        assert len(hamclock_pygame._glyph_cache) == 1, \
+            'expected 1 cache entry; got %d' % len(hamclock_pygame._glyph_cache)
+    finally:
+        pygame.quit()
+
+
+def test_glyph_cache_distinguishes_color_and_text():
+    import pygame
+    pygame.init()
+    try:
+        import hamclock_pygame
+        fonts = hamclock_pygame._make_fonts()
+        screen = pygame.Surface((400, 100))
+        hamclock_pygame._glyph_cache.clear()
+        hamclock_pygame._blit_text(screen, fonts['panel'], 'X',
+                                   (255, 0, 0), 0, 0)
+        hamclock_pygame._blit_text(screen, fonts['panel'], 'X',
+                                   (0, 255, 0), 0, 0)
+        hamclock_pygame._blit_text(screen, fonts['panel'], 'Y',
+                                   (255, 0, 0), 0, 0)
+        assert len(hamclock_pygame._glyph_cache) == 3
+    finally:
+        pygame.quit()
+
+
+def test_glyph_cache_evicts_at_cap():
+    import pygame
+    pygame.init()
+    try:
+        import hamclock_pygame
+        fonts = hamclock_pygame._make_fonts()
+        screen = pygame.Surface((400, 100))
+        hamclock_pygame._glyph_cache.clear()
+        # 300 unique texts; cap is 256.
+        for i in range(300):
+            hamclock_pygame._blit_text(screen, fonts['panel'],
+                                       'lbl%d' % i, (255, 255, 255), 0, 0)
+        assert len(hamclock_pygame._glyph_cache) == 256
+    finally:
+        pygame.quit()

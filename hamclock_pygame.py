@@ -5,6 +5,7 @@ the same /api/* endpoints as the web UI but rendering directly with
 Pygame/SDL for a ~50 MB RAM and ~10% CPU win over the browser stack.
 """
 
+import collections
 import io
 import os
 import sys
@@ -46,11 +47,26 @@ HF_BANDS = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m', '12m', '10m
 SCREEN_W = 1440
 SCREEN_H = 900
 
-# Glyph cache (populated by Task 1.3's _blit_text refactor). Declared here
-# so _make_fonts can clear it. Cleared on font reload so stale renders
-# from a previous font set cannot leak through.
-import collections as _collections
-_glyph_cache = _collections.OrderedDict()
+# ---- Glyph cache (Phase 1 perf fix #3) ----
+# Keyed by (font_name_or_None, font_size, text, color); explicitly NOT id(font)
+# because CPython reuses id() after GC. _make_fonts() clears this dict on
+# every call so stale glyphs cannot survive a fonts rebuild.
+_GLYPH_CACHE_CAP = 256
+_glyph_cache = collections.OrderedDict()
+
+
+def _font_key(font):
+    """Best-effort hashable key for a pygame Font. SysFont stores the name,
+    Font(None, sz) has no name; size is reliable via get_height."""
+    try:
+        name = getattr(font, 'name', None)
+    except Exception:
+        name = None
+    try:
+        size = font.get_height()
+    except Exception:
+        size = 0
+    return (name, size)
 
 
 def _make_fonts():
@@ -92,7 +108,18 @@ def _safe(d, key, default='--'):
 
 def _blit_text(screen, font, text, color, x, y):
     try:
-        surf = font.render(str(text), True, color)
+        s = str(text)
+        if not isinstance(color, tuple):
+            color = tuple(color)
+        key = (_font_key(font), s, color)
+        surf = _glyph_cache.get(key)
+        if surf is None:
+            surf = font.render(s, True, color)
+            _glyph_cache[key] = surf
+            if len(_glyph_cache) > _GLYPH_CACHE_CAP:
+                _glyph_cache.popitem(last=False)
+        else:
+            _glyph_cache.move_to_end(key)
         screen.blit(surf, (x, y))
         return surf.get_width()
     except Exception:
