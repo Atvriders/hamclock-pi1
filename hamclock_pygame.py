@@ -423,6 +423,47 @@ def _get_cached_image(data, key, image_cache, image_cache_ts):
     return image_cache.get(key)
 
 
+def _compute_dirty_rects(state, panel_rects, active_tab,
+                         now_sec, data_refresh, image_refresh):
+    """Return list of pygame.Rect to pass to display.update(), or None
+    to signal the caller to use display.flip() for a full repaint.
+
+    Triggers a full flip on: first frame, tab change, screen-size change.
+    Otherwise marks dirty: header+status when the second ticks over;
+    data-fed panels when data_refresh changes; image-fed panels when
+    image_refresh changes. State dict is mutated to record this frame's
+    values so the next call can diff against them.
+    """
+    if state.get('full_flip_pending') or state.get('prev_active_tab') != active_tab:
+        state['full_flip_pending'] = False
+        state['prev_active_tab'] = active_tab
+        state['prev_second'] = now_sec
+        state['prev_data_refresh'] = data_refresh
+        state['prev_image_refresh'] = image_refresh
+        return None
+    dirty = []
+    if now_sec != state.get('prev_second'):
+        state['prev_second'] = now_sec
+        for k in ('header', 'status'):
+            r = panel_rects.get(k)
+            if r is not None:
+                dirty.append(r)
+    if data_refresh != state.get('prev_data_refresh'):
+        state['prev_data_refresh'] = data_refresh
+        for k in ('solar', 'bands', 'geomag', 'xray', 'open_bands',
+                  'muf_text', 'dx_spots', 'band_activity'):
+            r = panel_rects.get(k)
+            if r is not None and r not in dirty:
+                dirty.append(r)
+    if image_refresh != state.get('prev_image_refresh'):
+        state['prev_image_refresh'] = image_refresh
+        for k in ('sdo', 'propagation'):
+            r = panel_rects.get(k)
+            if r is not None and r not in dirty:
+                dirty.append(r)
+    return dirty
+
+
 def main():
     if 'DISPLAY' not in os.environ:
         os.environ.setdefault('SDL_VIDEODRIVER', 'fbcon')
@@ -456,6 +497,13 @@ def main():
     image_cache_ts = {}
     tab_regions = {}
     tab_image_key = {'drap': 'real-drap', 'aurora': 'drap', 'enlil': 'enlil'}
+    dirty_state = {
+        'prev_active_tab': None,
+        'prev_second': -1,
+        'prev_data_refresh': 0.0,
+        'prev_image_refresh': 0.0,
+        'full_flip_pending': True,
+    }
 
     clock = pygame.time.Clock()
     running = True
@@ -477,6 +525,7 @@ def main():
                     for name, r in tab_regions.items():
                         if r.collidepoint(pos):
                             active_tab = name
+                            dirty_state['full_flip_pending'] = True
                             break
 
             sw, sh = screen.get_size()
@@ -593,7 +642,29 @@ def main():
             except Exception:
                 pass
 
-            pygame.display.flip()
+            panel_rects_map = {
+                'header': header,
+                'status': status,
+                'solar': panel_rects[0],
+                'bands': panel_rects[1],
+                'sdo': panel_rects[2],
+                'geomag': panel_rects[3],
+                'xray': panel_rects[4],
+                'open_bands': panel_rects[5],
+                'muf_text': mid_rect,
+                'dx_spots': dx_r,
+                'band_activity': ba_r,
+                'propagation': prop_r,
+            }
+            dirty = _compute_dirty_rects(
+                dirty_state, panel_rects_map, active_tab,
+                int(time.time()),
+                data.last_data_refresh,
+                data.last_image_refresh)
+            if dirty is None:
+                pygame.display.flip()
+            elif dirty:
+                pygame.display.update(dirty)
             clock.tick(10)
             consecutive_errors = 0
         except Exception as e:

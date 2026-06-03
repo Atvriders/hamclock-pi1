@@ -207,3 +207,68 @@ def test_scaled_cache_evicts_at_cap():
         assert len(hamclock_pygame._scaled_cache) == 16
     finally:
         pygame.quit()
+
+
+def test_compute_dirty_rects_full_on_first_frame():
+    import pygame
+    pygame.init()
+    try:
+        import hamclock_pygame
+        state = {'prev_active_tab': None, 'prev_second': -1,
+                 'prev_data_refresh': 0.0, 'prev_image_refresh': 0.0,
+                 'full_flip_pending': True}
+        panel_rects = {
+            'header': pygame.Rect(0, 0, 1440, 30),
+            'status': pygame.Rect(0, 880, 1440, 20),
+            'solar': pygame.Rect(0, 30, 280, 200),
+        }
+        dirty = hamclock_pygame._compute_dirty_rects(
+            state, panel_rects, active_tab='drap',
+            now_sec=1000, data_refresh=0.0, image_refresh=0.0)
+        assert dirty is None, \
+            'first-frame full-flip path returns None (caller uses flip())'
+        assert state['full_flip_pending'] is False
+    finally:
+        pygame.quit()
+
+
+def test_compute_dirty_rects_second_tick_only_redraws_clock_panels():
+    import pygame
+    pygame.init()
+    try:
+        import hamclock_pygame
+        state = {'prev_active_tab': 'drap', 'prev_second': 1000,
+                 'prev_data_refresh': 0.0, 'prev_image_refresh': 0.0,
+                 'full_flip_pending': False}
+        panel_rects = {
+            'header': pygame.Rect(0, 0, 1440, 30),
+            'status': pygame.Rect(0, 880, 1440, 20),
+            'solar': pygame.Rect(0, 30, 280, 200),
+        }
+        dirty = hamclock_pygame._compute_dirty_rects(
+            state, panel_rects, active_tab='drap',
+            now_sec=1001, data_refresh=0.0, image_refresh=0.0)
+        assert dirty is not None
+        assert panel_rects['header'] in dirty
+        assert panel_rects['status'] in dirty
+        assert panel_rects['solar'] not in dirty
+    finally:
+        pygame.quit()
+
+
+def test_compute_dirty_rects_tab_change_forces_full_flip():
+    import pygame
+    pygame.init()
+    try:
+        import hamclock_pygame
+        state = {'prev_active_tab': 'drap', 'prev_second': 1000,
+                 'prev_data_refresh': 0.0, 'prev_image_refresh': 0.0,
+                 'full_flip_pending': False}
+        panel_rects = {'header': pygame.Rect(0, 0, 1440, 30)}
+        dirty = hamclock_pygame._compute_dirty_rects(
+            state, panel_rects, active_tab='aurora',
+            now_sec=1000, data_refresh=0.0, image_refresh=0.0)
+        assert dirty is None, 'tab change must request full flip'
+        assert state['prev_active_tab'] == 'aurora'
+    finally:
+        pygame.quit()
