@@ -36,3 +36,29 @@ def test_kiosk_install_pygame_apt_includes_cairosvg_and_cpulimit():
     block = m.group(1)
     assert 'python3-cairosvg' in block
     assert 'cpulimit' in block
+
+
+def test_offline_install_embeds_rasterize_muf():
+    text = _read(OFFLINE)
+    assert 'def _rasterize_muf' in text, (
+        'Phase 2: offline-install.sh embedded server.py must define _rasterize_muf.'
+    )
+    assert 'PHASE2_TIMEOUT_S' in text
+    assert 'cpulimit' in text and "'-l', '50'" in text
+
+
+def test_offline_install_embeds_muf_image_png_cache_slot():
+    text = _read(OFFLINE)
+    assert "'muf_image_png'" in text, (
+        'Phase 2: offline-install.sh CACHE block must declare muf_image_png.'
+    )
+
+
+def test_offline_install_pygame_apt_includes_cairosvg_and_cpulimit():
+    text = _read(OFFLINE)
+    assert 'python3-cairosvg' in text
+    # cpulimit appears twice (once in our subprocess argv, once in apt list);
+    # require apt install to mention it explicitly.
+    assert re.search(r'sudo apt install -y[^\n]*cpulimit', text), (
+        'Phase 2: offline-install.sh pygame apt list must include cpulimit.'
+    )

@@ -70,6 +70,7 @@ from urllib.error import URLError
 from urllib.parse import urlparse
 from xml.etree import ElementTree
 import os
+import sys
 
 PORT = 8080
 CACHE = {
@@ -82,6 +83,7 @@ CACHE = {
     'dx_updated': 0,
     'solar_image_updated': 0,
     'muf_image': None,
+    'muf_image_png': None,
     'muf_image_updated': 0,
     'enlil_image': None,
     'enlil_image_updated': 0,
@@ -93,6 +95,28 @@ CACHE = {
 }
 
 UA = 'HamClockLite/1.0'
+
+PHASE2_TIMEOUT_S = 45
+
+
+def _rasterize_muf(svg_bytes):
+    """See server.py — Phase 2 MUF SVG -> PNG rasterizer (Pi 1 offline mirror)."""
+    try:
+        p = subprocess.run(
+            ['cpulimit', '-l', '50', '-q', '--',
+             'python3', '-c',
+             'import sys, cairosvg; cairosvg.svg2png('
+             'bytestring=sys.stdin.buffer.read(), '
+             'output_width=720, write_to=sys.stdout.buffer)'],
+            input=svg_bytes,
+            capture_output=True,
+            timeout=PHASE2_TIMEOUT_S,
+            check=True,
+        )
+        return p.stdout
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        print('[muf] rasterize failed: %s' % e, file=sys.stderr)
+        return None
 
 # Solar image proxy (NASA SDO)
 SDO_URL = 'https://sdo.gsfc.nasa.gov/assets/img/latest/latest_256_HMIIC.jpg'
@@ -293,14 +317,22 @@ def fetch_dx():
 
 
 def fetch_muf():
-    """Fetch KC2G MUF propagation map SVG"""
+    """Fetch KC2G MUF SVG and rasterize to PNG (Phase 2 offline mirror)."""
     try:
-        req = Request('https://prop.kc2g.com/renders/current/mufd-normal-now.svg', headers={'User-Agent': UA})
+        req = Request('https://prop.kc2g.com/renders/current/mufd-normal-now.svg',
+                      headers={'User-Agent': UA})
         with urlopen(req, timeout=20) as resp:
             data = resp.read()
         CACHE['muf_image'] = data
         CACHE['muf_image_updated'] = time.time()
-        print(f'[{time.strftime("%H:%M:%S")}] MUF map updated ({len(data)} bytes)')
+        png = _rasterize_muf(data)
+        CACHE['muf_image_png'] = png
+        if png is not None:
+            print(f'[{time.strftime("%H:%M:%S")}] MUF map updated '
+                  f'({len(data)} B SVG -> {len(png)} B PNG)')
+        else:
+            print(f'[{time.strftime("%H:%M:%S")}] MUF map updated '
+                  f'({len(data)} B SVG, PNG rasterize failed)')
     except Exception as e:
         print(f'[{time.strftime("%H:%M:%S")}] MUF map fetch failed: {e}')
 
@@ -554,20 +586,25 @@ class Handler(SimpleHTTPRequestHandler):
                         return
             self.send_binary(CACHE['solar_image'], 'image/jpeg')
         elif path.startswith('/api/muf-map'):
-            if CACHE.get('muf_image'):
+            # Phase 2: prefer pre-rasterized PNG; fall back to SVG.
+            png = CACHE.get('muf_image_png')
+            if png:
+                body = png
+                ctype = 'image/png'
+            elif CACHE.get('muf_image'):
                 body = CACHE['muf_image']
-                self.send_response(200)
-                self.send_header('Content-Type', 'image/svg+xml')
-                self.send_header('Content-Length', len(body))
-                self.send_header('Access-Control-Allow-Origin', '*')
-                # no-store: the dashboard fetches a fresh URL each cycle; if the
-                # browser cached these it would accumulate entries until OOM.
-                self.send_header('Cache-Control', 'no-store')
-                self.end_headers()
-                if self.command != 'HEAD':
-                    self.wfile.write(body)
+                ctype = 'image/svg+xml'
             else:
                 self.send_error(503, 'MUF map not yet loaded')
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', len(body))
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            if self.command != 'HEAD':
+                self.wfile.write(body)
         elif path.startswith('/api/enlil'):
             if CACHE.get('enlil_image'):
                 self.send_binary(CACHE['enlil_image'], 'image/jpeg')
@@ -2919,7 +2956,9 @@ fi
 
 # Mode-specific Python packages
 if [ "$KIOSK_MODE" = "pygame" ]; then
-    sudo apt install -y python3-pygame
+    # Phase 2: python3-cairosvg for MUF SVG->PNG rasterize; cpulimit caps
+    # the subprocess to 50% of one core so the render loop keeps its budget.
+    sudo apt install -y python3-pygame python3-cairosvg cpulimit
 elif [ "$KIOSK_MODE" = "tkinter" ]; then
     sudo apt install -y python3-tk python3-pil python3-pil.imagetk
 fi
