@@ -16,6 +16,7 @@ from urllib.error import URLError
 from urllib.parse import urlparse
 from xml.etree import ElementTree
 import os
+import sys
 
 PORT = 8080
 CACHE = {
@@ -39,6 +40,16 @@ CACHE = {
 }
 
 UA = 'HamClockLite/1.0'
+
+# Phase 2: raised by installer if pre-merge cairosvg benchmark > 20 s
+# (see docs/muf-source.md for the recorded measurement).
+PHASE2_TIMEOUT_S = 45
+
+
+def _rasterize_muf(svg_bytes):
+    """Phase 2 stub — full body added in Task 2.3."""
+    raise NotImplementedError
+
 
 # Solar image proxy (NASA SDO)
 SDO_URL = 'https://sdo.gsfc.nasa.gov/assets/img/latest/latest_256_HMIIC.jpg'
