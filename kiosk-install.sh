@@ -48,8 +48,11 @@ fi
 
 # Mode-specific dependencies
 if [ "$KIOSK_MODE" = "pygame" ]; then
-    echo "Installing Pygame for native framebuffer display..."
-    sudo apt install -y python3-pygame
+    echo "Installing Pygame + cairosvg + cpulimit for native framebuffer display..."
+    # python3-cairosvg: server-side MUF SVG -> PNG rasterize (Phase 2).
+    # cpulimit: caps the cairosvg subprocess to 50% of one core so the
+    # 10 FPS render loop keeps its frame budget while MUF refreshes.
+    sudo apt install -y python3-pygame python3-cairosvg cpulimit
 elif [ "$KIOSK_MODE" = "tkinter" ]; then
     echo "Installing Tkinter + PIL for native widget display..."
     sudo apt install -y python3-tk python3-pil python3-pil.imagetk
