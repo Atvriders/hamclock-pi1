@@ -16,15 +16,144 @@ main() {
 set -euo pipefail
 
 KIOSK_MODE="pygame"   # default — native client, no browser, <=200ms p99 clicks
+PROBE_ONLY=0
 for arg in "$@"; do
     case "$arg" in
         --pygame)  KIOSK_MODE="pygame" ;;
         --tkinter) KIOSK_MODE="tkinter" ;;
         --browser) KIOSK_MODE="browser" ;;
-        --help|-h) echo "Usage: curl ... | bash -s -- [--browser|--pygame|--tkinter]"; exit 0 ;;
+        --probe)   PROBE_ONLY=1 ;;
+        --help|-h) echo "Usage: curl ... | bash -s -- [--browser|--pygame|--tkinter] [--probe]"; exit 0 ;;
         *) echo "Unknown arg: $arg (try --help)"; exit 1 ;;
     esac
 done
+
+# --probe: produce the Phase 0/2 evidence docs (sdl-backend.md, muf-source.md)
+# inline -- this branch is what runs when the user curl-pipe'd us and has no
+# scripts/ directory. Writes to /tmp/pi1-evidence/ and exits without touching
+# the system.
+if [ "$PROBE_ONLY" = "1" ]; then
+    OUT_DIR="/tmp/pi1-evidence"
+    mkdir -p "$OUT_DIR"
+    DATE_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    # ---- SDL probe (mirrors scripts/probe_sdl_backends.sh) ----
+    PROBE_LOG="$OUT_DIR/probe_sdl_backends.log"
+    {
+        echo "=== hamclock-pi1 SDL backend probe (inline) ==="
+        echo "host:   $(uname -a)"
+        echo "date:   $DATE_UTC"
+        echo "python: $(python3 --version 2>&1)"
+        echo "pygame: $(python3 -c 'import pygame; print(pygame.version.ver)' 2>&1)"
+        echo "SDL:    $(python3 -c 'import pygame; print(pygame.get_sdl_version())' 2>&1)"
+        echo
+        echo "--- /etc/default/keyboard ---"
+        if [ -r /etc/default/keyboard ]; then cat /etc/default/keyboard; else echo "(not readable)"; fi
+        echo
+        echo "--- /dev/dri ---"
+        ls -la /dev/dri 2>&1 || echo "(no /dev/dri -- kmsdrm will not work)"
+        echo
+        python3 - <<'PYINLINE'
+import os, time, pygame
+for drv in ('fbcon', 'kmsdrm', 'x11', 'dummy'):
+    os.environ['SDL_VIDEODRIVER'] = drv
+    print('--- trying', drv, '---')
+    try:
+        pygame.display.init()
+        scr = pygame.display.set_mode((1440, 900), pygame.FULLSCREEN)
+        scr.fill((40, 20, 80)); pygame.display.flip(); time.sleep(1)
+        print(drv, '-> OK driver=', pygame.display.get_driver())
+    except Exception as e:
+        print(drv, '-> FAIL', type(e).__name__, e)
+    finally:
+        try: pygame.display.quit()
+        except Exception: pass
+PYINLINE
+        echo "=== probe complete ==="
+    } 2>&1 | tee "$PROBE_LOG"
+
+    CHOSEN=""
+    if   grep -q '^fbcon -> OK'  "$PROBE_LOG"; then CHOSEN="fbcon"
+    elif grep -q '^kmsdrm -> OK' "$PROBE_LOG"; then CHOSEN="kmsdrm"
+    else CHOSEN="xinit"
+    fi
+    KEYBOARD_CONF=""
+    [ -r /etc/default/keyboard ] && KEYBOARD_CONF="$(cat /etc/default/keyboard)"
+    {
+        echo "# Pi 1B SDL backend probe — offline-install.sh --probe output"
+        echo
+        echo "date: $DATE_UTC"
+        echo
+        echo "chosen backend: $CHOSEN"
+        echo "sdl-backend: $CHOSEN"
+        echo
+        echo "## /etc/default/keyboard"
+        echo '```'
+        echo "${KEYBOARD_CONF:-(not readable)}"
+        echo '```'
+        echo
+        echo "## Raw probe stdout"
+        echo '```'
+        cat "$PROBE_LOG"
+        echo '```'
+    } > "$OUT_DIR/sdl-backend.md"
+
+    # ---- cairosvg perf benchmark ----
+    if ! python3 -c 'import cairosvg' 2>/dev/null; then
+        if [ -r /etc/os-release ] && grep -qi 'bookworm\|debian' /etc/os-release 2>/dev/null; then
+            sudo apt install -y python3-cairosvg || true
+        fi
+    fi
+    if ! python3 -c 'import cairosvg' 2>/dev/null; then
+        echo "ERROR: python3-cairosvg not importable; cannot benchmark" >&2
+        exit 1
+    fi
+    TIMES=()
+    for i in 1 2 3 4 5; do
+        start=$(date +%s.%N)
+        python3 -c "import cairosvg; cairosvg.svg2png(url='https://prop.kc2g.com/renders/current/mufd-normal-now.svg', output_width=720, write_to='/tmp/m_$i.png')"
+        end=$(date +%s.%N)
+        elapsed=$(echo "$end - $start" | bc -l)
+        TIMES+=("$elapsed")
+        echo "  run $i: ${elapsed}s"
+    done
+    MEDIAN=$(printf '%s\n' "${TIMES[@]}" | sort -g | sed -n '3p')
+    if (( $(echo "$MEDIAN <= 20" | bc -l) )); then
+        DECISION="median ${MEDIAN}s <= 20s -> ship cairosvg, PHASE2_TIMEOUT_S=45"
+        TIMEOUT_S=45; MUF_SOURCE_LINE="muf-source: kc2g-svg-cairosvg"
+    elif (( $(echo "$MEDIAN <= 30" | bc -l) )); then
+        THREEX=$(echo "$MEDIAN * 3" | bc -l)
+        TIMEOUT_S=$(python3 -c "import math; print(int(math.ceil(float('$THREEX'))))")
+        [ "$TIMEOUT_S" -lt 60 ] && TIMEOUT_S=60
+        DECISION="median ${MEDIAN}s in (20,30]s -> ship cairosvg, PHASE2_TIMEOUT_S=$TIMEOUT_S"
+        MUF_SOURCE_LINE="muf-source: kc2g-svg-cairosvg"
+    else
+        DECISION="median ${MEDIAN}s > 30s -> cairosvg too slow; use BOM World I-Map GIF"
+        TIMEOUT_S=0; MUF_SOURCE_LINE="muf-source: bom-world-imap"
+    fi
+    {
+        echo "# Pi 1B MUF source decision — offline-install.sh --probe output"
+        echo
+        echo "date: $DATE_UTC"
+        echo
+        echo "## Measurements (cairosvg rasterize of KC2G mufd-normal-now.svg, width=720)"
+        i=1; for t in "${TIMES[@]}"; do echo "  run $i: ${t}s"; i=$((i+1)); done
+        echo "median: ${MEDIAN}s"
+        echo
+        echo "## Decision"
+        echo "$DECISION"
+        echo
+        echo "$MUF_SOURCE_LINE"
+        echo "muf-subprocess-timeout-s: $TIMEOUT_S"
+    } > "$OUT_DIR/muf-source.md"
+
+    echo
+    echo "Wrote $OUT_DIR/sdl-backend.md"
+    echo "Wrote $OUT_DIR/muf-source.md"
+    echo "Copy these into docs/ in a hamclock-pi1 clone to unblock Phase 5."
+    exit 0
+fi
+
 echo "Kiosk mode: $KIOSK_MODE"
 
 INSTALL_DIR="/opt/hamclock-lite"

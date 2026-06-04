@@ -8,15 +8,25 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Parse mode flag
 KIOSK_MODE="pygame"   # default — native client, no browser, <=200ms p99 clicks
+PROBE_ONLY=0
 for arg in "$@"; do
     case "$arg" in
         --pygame)  KIOSK_MODE="pygame" ;;
         --tkinter) KIOSK_MODE="tkinter" ;;
         --browser) KIOSK_MODE="browser" ;;
-        --help|-h) echo "Usage: $0 [--browser|--pygame|--tkinter]"; exit 0 ;;
+        --probe)   PROBE_ONLY=1 ;;
+        --help|-h) echo "Usage: $0 [--browser|--pygame|--tkinter] [--probe]"; exit 0 ;;
         *) echo "Unknown arg: $arg (try --help)"; exit 1 ;;
     esac
 done
+
+# --probe: run the Phase 0/2 evidence-gathering script and exit without
+# touching the system. The operator runs this on a real Pi 1B to produce
+# docs/sdl-backend.md and docs/muf-source.md, which then unblocks Phase 5.
+if [ "$PROBE_ONLY" = "1" ]; then
+    exec "${SCRIPT_DIR}/scripts/gather_pi1_evidence.sh"
+fi
+
 echo "Kiosk mode: $KIOSK_MODE"
 
 echo "=== HamClock Pi1 Kiosk Mode Installer ==="
