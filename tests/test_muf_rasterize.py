@@ -227,3 +227,31 @@ def test_muf_map_503_when_neither_cached(monkeypatch):
     server.CACHE['muf_image_png'] = None
     rec = _invoke_muf_map(_Recorder())
     assert rec.status == 503
+
+
+# ---------------------------------------------------------------------------
+# Tier 1b perf: pre-encoded JSON byte cache for /api/solar, /api/bands,
+# /api/dxspots. The CACHE must declare the three byte slots, and send_json
+# must accept pre-encoded bytes verbatim so we skip the per-request dumps.
+# ---------------------------------------------------------------------------
+
+
+def test_cache_has_prebaked_bytes_slots():
+    assert 'solar_bytes' in server.CACHE
+    assert 'bands_bytes' in server.CACHE
+    assert 'dxspots_bytes' in server.CACHE
+
+
+def test_send_json_accepts_prebaked_bytes(monkeypatch):
+    body_seen = {'b': None}
+
+    class FakeW:
+        def write(self, b):
+            body_seen['b'] = b
+
+    h = type('H', (), {'wfile': FakeW(), 'command': 'GET'})()
+    h.send_response = lambda code: None
+    h.send_header = lambda k, v: None
+    h.end_headers = lambda: None
+    server.Handler.send_json(h, b'{"x":1}')
+    assert body_seen['b'] == b'{"x":1}'

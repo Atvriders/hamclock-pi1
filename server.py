@@ -23,6 +23,12 @@ CACHE = {
     'solar': None,
     'bands': None,
     'dxspots': None,
+    # Tier 1b perf: pre-encoded JSON bytes for the three hot polling endpoints.
+    # Populated alongside the dict so /api/solar, /api/bands, /api/dxspots can
+    # write straight to the socket without re-running json.dumps every ~60 s.
+    'solar_bytes': None,
+    'bands_bytes': None,
+    'dxspots_bytes': None,
     'solar_image': None,
     'solar_updated': 0,
     'bands_updated': 0,
@@ -152,7 +158,9 @@ def fetch_hamqsl():
     """Fetch solar and band data from HamQSL XML"""
     try:
         req = Request('https://www.hamqsl.com/solarxml.php', headers={'User-Agent': UA})
-        with urlopen(req, timeout=15) as resp:
+        # Tier 1b perf: 8 s is well above HamQSL's median response (~1 s);
+        # the prior 15 s pinned the fetcher on a transient upstream stall.
+        with urlopen(req, timeout=8) as resp:
             xml_data = resp.read().decode('utf-8')
 
         root = ElementTree.fromstring(xml_data)
@@ -197,6 +205,10 @@ def fetch_hamqsl():
         CACHE['solar_updated'] = time.time()
         CACHE['bands'] = bands
         CACHE['bands_updated'] = time.time()
+        # Tier 1b perf: pre-encode once per fetch so /api/solar + /api/bands
+        # can write the cached bytes straight to the socket.
+        CACHE['solar_bytes'] = json.dumps(solar, separators=(',', ':')).encode('utf-8')
+        CACHE['bands_bytes'] = json.dumps(bands, separators=(',', ':')).encode('utf-8')
         print(f'[{time.strftime("%H:%M:%S")}] Solar/bands updated: SFI={solar["sfi"]} Kp={solar["kIndex"]}')
     except Exception as e:
         print(f'[{time.strftime("%H:%M:%S")}] HamQSL fetch failed: {e}')
@@ -232,10 +244,15 @@ def freq_to_band(freq_khz):
 
 
 def fetch_dx():
-    """Fetch DX spots from HamQTH or fallback"""
+    """Fetch DX spots from HamQTH or fallback.
+
+    Tier 1b perf: limit=15 (was 30) is enough for the pygame client
+    (5 rows in draw_dx_spots + band-activity histogram which only needs
+    counts per band). Halves the upstream CSV and the cached payload.
+    """
     urls = [
-        'https://www.hamqth.com/dxc_csv.php?limit=30',
-        'https://www.ha8tks.hu/dx/dxc_csv.php?limit=30',
+        'https://www.hamqth.com/dxc_csv.php?limit=15',
+        'https://www.ha8tks.hu/dx/dxc_csv.php?limit=15',
     ]
     for url in urls:
         try:
@@ -256,6 +273,8 @@ def fetch_dx():
                     freq_khz = float(freq)
                     country = parts[10].strip() if len(parts) > 10 else ''
                     coords = COUNTRY_COORDS.get(country)
+                    # Tier 1b perf: drop the 'country' field — nothing downstream
+                    # reads it; only lat/lng are used to plot on the map.
                     spot = {
                         'frequency': freq,
                         'spotter': parts[0].strip(),
@@ -263,7 +282,6 @@ def fetch_dx():
                         'comment': parts[3].strip() if len(parts) > 3 else '',
                         'time': parts[4].strip() if len(parts) > 4 else '',
                         'band': freq_to_band(freq_khz),
-                        'country': country,
                         'lat': coords[0] if coords else None,
                         'lng': coords[1] if coords else None,
                     }
@@ -274,6 +292,10 @@ def fetch_dx():
             if spots:
                 CACHE['dxspots'] = spots
                 CACHE['dx_updated'] = time.time()
+                # Tier 1b perf: pre-encode the dxspots payload once per fetch.
+                CACHE['dxspots_bytes'] = json.dumps(
+                    spots, separators=(',', ':')
+                ).encode('utf-8')
                 print(f'[{time.strftime("%H:%M:%S")}] DX spots updated: {len(spots)} spots from {url.split("/")[2]}')
                 return
         except Exception as e:
@@ -538,11 +560,13 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == '/api/solar':
-            self.send_json(CACHE.get('solar') or {})
+            # Tier 1b perf: prefer the pre-encoded bytes; fall back to the dict
+            # (and let send_json re-encode) until the first fetch completes.
+            self.send_json(CACHE.get('solar_bytes') or (CACHE.get('solar') or {}))
         elif path == '/api/bands':
-            self.send_json(CACHE.get('bands') or {})
+            self.send_json(CACHE.get('bands_bytes') or (CACHE.get('bands') or {}))
         elif path == '/api/dxspots':
-            self.send_json(CACHE.get('dxspots') or [])
+            self.send_json(CACHE.get('dxspots_bytes') or (CACHE.get('dxspots') or []))
         elif path == '/api/solar-image':
             # Fetch/cache SDO solar image (15 min cache)
             now = time.time()
@@ -620,7 +644,15 @@ class Handler(SimpleHTTPRequestHandler):
                 super().do_GET()
 
     def send_json(self, data):
-        body = json.dumps(data).encode('utf-8')
+        # Tier 1b perf: accept pre-encoded JSON bytes directly so the hot
+        # polling endpoints (/api/solar, /api/bands, /api/dxspots) can skip
+        # json.dumps on every request. The cached bytes are built once per
+        # fetch in fetch_hamqsl / fetch_dx. Live dicts still re-encode here
+        # (e.g. /api/health which has dynamic age fields).
+        if isinstance(data, (bytes, bytearray)):
+            body = data
+        else:
+            body = json.dumps(data, separators=(',', ':')).encode('utf-8')
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', len(body))
