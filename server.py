@@ -53,6 +53,18 @@ UA = 'HamClockLite/1.0'
 PHASE2_TIMEOUT_S = 45
 
 
+def _etag_for(key_updated):
+    """Format an ETag header value from a CACHE['..._updated'] timestamp.
+
+    Tier 2c perf: the fetchers stamp CACHE['{solar,bands,dx}_updated'] every
+    time they pre-encode the payload. Reusing that epoch as a quoted
+    millisecond-resolution string gives us a stable, free ETag — no hashing,
+    no extra state. RFC 7232 requires the quoted-string form.
+    """
+    ts = CACHE.get(key_updated) or 0
+    return '"%.3f"' % float(ts)
+
+
 def _rasterize_muf(svg_bytes):
     """Render the KC2G MUF SVG to PNG in a subprocess so the multi-second
     render does not block the request thread or the background fetcher.
@@ -561,13 +573,46 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == '/api/solar':
+            # Tier 2c perf: 304 conditional GET. ~80% of polls land on
+            # unchanged data (5 min upstream cadence vs ~60 s client poll);
+            # a 304 + empty body lets the client skip json.loads entirely.
+            etag = _etag_for('solar_updated')
+            inm = self.headers.get('If-None-Match', '')
+            if inm == etag and etag != '"0.000"':
+                self.send_response(304)
+                self.send_header('ETag', etag)
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                return
             # Tier 1b perf: prefer the pre-encoded bytes; fall back to the dict
             # (and let send_json re-encode) until the first fetch completes.
-            self.send_json(CACHE.get('solar_bytes') or (CACHE.get('solar') or {}))
+            self.send_json_with_etag(
+                CACHE.get('solar_bytes') or (CACHE.get('solar') or {}),
+                etag)
         elif path == '/api/bands':
-            self.send_json(CACHE.get('bands_bytes') or (CACHE.get('bands') or {}))
+            etag = _etag_for('bands_updated')
+            inm = self.headers.get('If-None-Match', '')
+            if inm == etag and etag != '"0.000"':
+                self.send_response(304)
+                self.send_header('ETag', etag)
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                return
+            self.send_json_with_etag(
+                CACHE.get('bands_bytes') or (CACHE.get('bands') or {}),
+                etag)
         elif path == '/api/dxspots':
-            self.send_json(CACHE.get('dxspots_bytes') or (CACHE.get('dxspots') or []))
+            etag = _etag_for('dx_updated')
+            inm = self.headers.get('If-None-Match', '')
+            if inm == etag and etag != '"0.000"':
+                self.send_response(304)
+                self.send_header('ETag', etag)
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                return
+            self.send_json_with_etag(
+                CACHE.get('dxspots_bytes') or (CACHE.get('dxspots') or []),
+                etag)
         elif path == '/api/solar-image':
             # Fetch/cache SDO solar image (15 min cache)
             now = time.time()
@@ -657,6 +702,27 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', len(body))
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        if self.command != 'HEAD':
+            self.wfile.write(body)
+
+    def send_json_with_etag(self, data, etag):
+        """Like send_json, but also emit an ETag header.
+
+        Tier 2c perf: used by /api/{solar,bands,dxspots} so the client can
+        replay it as If-None-Match on the next poll and short-circuit to
+        304 when nothing has changed.
+        """
+        if isinstance(data, (bytes, bytearray)):
+            body = data
+        else:
+            body = json.dumps(data, separators=(',', ':')).encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', len(body))
+        self.send_header('ETag', etag)
+        self.send_header('Cache-Control', 'no-store')
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         if self.command != 'HEAD':

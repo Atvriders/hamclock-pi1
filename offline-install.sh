@@ -278,6 +278,13 @@ def _rasterize_muf(svg_bytes):
         print('[muf] rasterize failed: %s' % e, file=sys.stderr)
         return None
 
+
+def _etag_for(key_updated):
+    """Tier 2c: format an ETag from a CACHE['..._updated'] epoch timestamp."""
+    ts = CACHE.get(key_updated) or 0
+    return '"%.3f"' % float(ts)
+
+
 # Solar image proxy (NASA SDO)
 SDO_URL = 'https://sdo.gsfc.nasa.gov/assets/img/latest/latest_256_HMIIC.jpg'
 
@@ -725,11 +732,37 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == '/api/solar':
-            self.send_json(CACHE.get('solar') or {})
+            # Tier 2c perf: 304 conditional GET — client skips json.loads
+            # ~80% of polls (5 min upstream vs 60 s client cadence).
+            etag = _etag_for('solar_updated')
+            inm = self.headers.get('If-None-Match', '')
+            if inm == etag and etag != '"0.000"':
+                self.send_response(304)
+                self.send_header('ETag', etag)
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                return
+            self.send_json_with_etag(CACHE.get('solar') or {}, etag)
         elif path == '/api/bands':
-            self.send_json(CACHE.get('bands') or {})
+            etag = _etag_for('bands_updated')
+            inm = self.headers.get('If-None-Match', '')
+            if inm == etag and etag != '"0.000"':
+                self.send_response(304)
+                self.send_header('ETag', etag)
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                return
+            self.send_json_with_etag(CACHE.get('bands') or {}, etag)
         elif path == '/api/dxspots':
-            self.send_json(CACHE.get('dxspots') or [])
+            etag = _etag_for('dx_updated')
+            inm = self.headers.get('If-None-Match', '')
+            if inm == etag and etag != '"0.000"':
+                self.send_response(304)
+                self.send_header('ETag', etag)
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                return
+            self.send_json_with_etag(CACHE.get('dxspots') or [], etag)
         elif path == '/api/solar-image':
             # Fetch/cache SDO solar image (15 min cache)
             now = time.time()
@@ -806,6 +839,22 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', len(body))
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        if self.command != 'HEAD':
+            self.wfile.write(body)
+
+    def send_json_with_etag(self, data, etag):
+        """Tier 2c: send_json + ETag header for /api/{solar,bands,dxspots}."""
+        if isinstance(data, (bytes, bytearray)):
+            body = data
+        else:
+            body = json.dumps(data).encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', len(body))
+        self.send_header('ETag', etag)
+        self.send_header('Cache-Control', 'no-store')
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         if self.command != 'HEAD':

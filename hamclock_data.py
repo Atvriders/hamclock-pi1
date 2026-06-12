@@ -9,6 +9,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
+# Re-exported so tests can monkeypatch 'hamclock_data.urlopen' / 'Request'
+# and _fetch_json picks up the fake — keeps the patch site stable across
+# refactors of the request helper.
+from urllib.request import Request, urlopen
 
 
 class HamClockData:
@@ -63,6 +67,10 @@ class HamClockData:
         self.image_fetched_at = {}
         # Errors (most recent error per key, None if last fetch succeeded)
         self.errors = {}
+        # Tier 2c perf: ETags by path so we can replay If-None-Match on the
+        # next poll. ~80% of /api/{solar,bands,dxspots} polls land on
+        # unchanged data; a 304 short-circuits the read+json.loads here.
+        self._etags = {}
         # Internal
         self._lock = threading.Lock()
         self._running = False
@@ -74,13 +82,35 @@ class HamClockData:
         return urllib.request.urlopen(req, timeout=timeout)
 
     def _fetch_json(self, path):
-        """HTTP GET path and parse as JSON. Returns dict/list or None on failure."""
+        """HTTP GET path and parse as JSON. Returns dict/list or None on failure.
+
+        Tier 2c perf: sends If-None-Match when we have a prior ETag for
+        this path. Returns None on 304 (caller should keep its cached
+        value — same semantics as the existing error path).
+        """
+        url = self.server_url + path
+        req = Request(url, headers={'User-Agent': self.USER_AGENT})
+        prev_etag = self._etags.get(path)
+        if prev_etag:
+            req.add_header('If-None-Match', prev_etag)
         try:
-            with self._request(path, self.JSON_TIMEOUT) as resp:
+            with urlopen(req, timeout=self.JSON_TIMEOUT) as resp:
+                new_etag = resp.headers.get('ETag')
+                if new_etag:
+                    self._etags[path] = new_etag
                 data = json.loads(resp.read().decode('utf-8'))
             self.errors[path] = None
             return data
-        except (urllib.error.URLError, urllib.error.HTTPError, ValueError, OSError) as e:
+        except urllib.error.HTTPError as e:
+            if e.code == 304:
+                # Server says: no change since prev_etag. Skip parse;
+                # caller keeps its cached value (existing 'None means
+                # don't overwrite' contract in refresh_data).
+                self.errors[path] = None
+                return None
+            self.errors[path] = '{}: {}'.format(type(e).__name__, e)
+            return None
+        except (urllib.error.URLError, ValueError, OSError) as e:
             self.errors[path] = '{}: {}'.format(type(e).__name__, e)
             return None
 
