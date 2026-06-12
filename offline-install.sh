@@ -4061,6 +4061,15 @@ HCTKEOF
 # ── Step 5: Create hamclock-lite systemd service ────────────────────
 echo "Creating HamClock server service..."
 if ! systemctl is-enabled hamclock-lite &>/dev/null; then
+    # Tier 1c: pygame-mode only — reduce glibc arena fragmentation, strip
+    # asserts/docstrings, and pre-compile .pyc once at service start so
+    # subsequent imports skip the bytecode compile path on a 512 MB Pi.
+    LITE_PYGAME_ENV=""
+    LITE_PYGAME_PRE=""
+    if [ "$KIOSK_MODE" = "pygame" ]; then
+        LITE_PYGAME_ENV="Environment=MALLOC_ARENA_MAX=1 PYTHONOPTIMIZE=1 PYTHONDONTWRITEBYTECODE=1"
+        LITE_PYGAME_PRE="ExecStartPre=/usr/bin/python3 -O -m compileall -q /opt/hamclock-lite"
+    fi
     sudo tee /etc/systemd/system/hamclock-lite.service > /dev/null <<EOF
 [Unit]
 Description=HamClock Lite Server
@@ -4071,6 +4080,8 @@ Wants=network-online.target
 Type=simple
 User=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR
+$LITE_PYGAME_ENV
+$LITE_PYGAME_PRE
 ExecStart=/usr/bin/python3 $INSTALL_DIR/server.py
 Restart=always
 RestartSec=5
@@ -4098,6 +4109,64 @@ if [ "$KIOSK_MODE" = "pygame" ]; then
     # Phase 2: python3-cairosvg for MUF SVG->PNG rasterize; cpulimit caps
     # the subprocess to 50% of one core so the render loop keeps its budget.
     sudo apt install -y python3-pygame python3-cairosvg cpulimit
+
+    # Tier 1c: free RAM + boot time on a 512 MB Pi by masking kiosk-irrelevant daemons.
+    # All four are non-essential for a wired-Ethernet HDMI kiosk.
+    sudo systemctl mask bluetooth hciuart ModemManager avahi-daemon triggerhappy 2>/dev/null || true
+
+    # Tier 1c: config.txt trims — free RAM, disable kiosk-irrelevant subsystems.
+    BOOT_CFG="/boot/firmware/config.txt"
+    [ -f "$BOOT_CFG" ] || BOOT_CFG="/boot/config.txt"
+    if [ -f "$BOOT_CFG" ]; then
+        add_cfg() {
+            # add_cfg <key>=<value>
+            local kv="$1" key="${1%%=*}"
+            if ! grep -qE "^${key}=" "$BOOT_CFG"; then
+                echo "$kv" | sudo tee -a "$BOOT_CFG" > /dev/null
+            fi
+        }
+        add_cfg "gpu_mem=16"               # min split; pygame is software, frees ~48 MB
+        add_cfg "dtparam=audio=off"        # no audio on a kiosk
+        add_cfg "camera_auto_detect=0"     # no camera probe
+        add_cfg "display_auto_detect=0"    # no extra display probe
+        add_cfg "disable_overscan=1"       # full HDMI canvas
+        add_cfg "hdmi_blanking=0"          # never DPMS the display
+    fi
+
+    # Tier 1c: quieter boot, no fsck at boot, no cursor on the TTY before kiosk paints.
+    CMDLINE="/boot/firmware/cmdline.txt"
+    [ -f "$CMDLINE" ] || CMDLINE="/boot/cmdline.txt"
+    if [ -f "$CMDLINE" ]; then
+        for tok in "quiet" "loglevel=3" "logo.nologo" "vt.global_cursor_default=0" "fsck.mode=skip"; do
+            grep -q "$tok" "$CMDLINE" || sudo sed -i "s|\$| $tok|" "$CMDLINE"
+        done
+    fi
+
+    # Tier 1c: journald in RAM + capped to keep SD writes low.
+    sudo mkdir -p /etc/systemd/journald.conf.d
+    sudo tee /etc/systemd/journald.conf.d/hamclock-kiosk.conf > /dev/null <<'JEOF'
+[Journal]
+Storage=volatile
+RuntimeMaxUse=32M
+RuntimeMaxFileSize=8M
+JEOF
+    sudo systemctl restart systemd-journald 2>/dev/null || true
+
+    # Tier 1c: ext4 mount opts — fewer SD writes on read-heavy workload.
+    if grep -qE '^[^#].* / +ext4 +[^ ]+ +' /etc/fstab; then
+        if ! grep -qE '^[^#].* / +ext4 +[^ ]*noatime' /etc/fstab; then
+            sudo sed -i -E 's|^([^#].* / +ext4 +)([^ ]+)( +)|\1\2,noatime,commit=60\3|' /etc/fstab
+        fi
+    fi
+
+    # Tier 1c: low-pressure swap + low dirty thresholds for a 512 MB Pi.
+    sudo tee /etc/sysctl.d/99-hamclock-kiosk.conf > /dev/null <<'SEOF'
+vm.swappiness=10
+vm.vfs_cache_pressure=50
+vm.dirty_background_ratio=5
+vm.dirty_ratio=10
+SEOF
+    sudo sysctl --system > /dev/null 2>&1 || true
 elif [ "$KIOSK_MODE" = "tkinter" ]; then
     sudo apt install -y python3-tk python3-pil python3-pil.imagetk
 fi
