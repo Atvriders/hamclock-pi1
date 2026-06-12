@@ -1436,7 +1436,19 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                             break
 
             sw, sh = screen.get_size()
-            screen.fill(theme['bg'])
+            # Tier-0 perf: only memset the whole 1440x900 framebuffer when this
+            # frame will end in a full display.flip(). The dirty-rect helper
+            # signals "full flip" on first frame, tab change, or pending flag;
+            # peek at the same predicate here (without mutating state) so we
+            # can gate the fill. On partial-update frames each panel's
+            # draw_panel paints over its own pixels, so the bg fill is dead
+            # work that negates the dirty-rect win.
+            will_full_flip = (
+                dirty_state.get('full_flip_pending')
+                or dirty_state.get('prev_active_tab') != active_tab
+            )
+            if will_full_flip:
+                screen.fill(theme['bg'])
 
             # Phase 1b item 5: panel rects are cached and rebuilt only on
             # screen-size change. Per-frame pygame.Rect allocations are gone

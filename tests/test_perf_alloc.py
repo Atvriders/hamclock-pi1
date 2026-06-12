@@ -343,6 +343,44 @@ def test_render_loop_30_frame_alloc_budget(monkeypatch):
         pygame.quit()
 
 
+def test_no_full_screen_fill_on_steady_state_frames():
+    """Tier-0 perf bug: an unconditional `screen.fill(theme['bg'])` near the
+    top of _run_render_loop's body memsets the entire 1440x900 framebuffer
+    every frame, defeating the dirty-rect partial-update path.
+
+    Catch the regression statically: the render body must NOT contain a
+    bare-line `screen.fill(theme['bg'])` (or "bg" with double quotes) at
+    the per-frame indent level. The fill is allowed only inside an `if`
+    block gating on the full-flip predicate.
+    """
+    import inspect
+    import re
+    import hamclock_pygame as hp
+
+    src = inspect.getsource(hp._run_render_loop)
+
+    # The render body sits at 12 spaces of indent (inside `while running:`
+    # then inside `try:`). Reject any `screen.fill(theme['bg'])` line that
+    # appears at exactly that indent — i.e. not gated by an enclosing `if`.
+    bare_fill_re = re.compile(
+        r"\n {12}screen\.fill\(theme\[['\"]bg['\"]\]\)\s*\n"
+    )
+    assert not bare_fill_re.search(src), (
+        "screen.fill(theme['bg']) appears unconditionally in the render "
+        "body — Tier 0 perf bug. It must be gated on a full-flip predicate."
+    )
+
+    # Positive check: a gated fill must exist somewhere in the body so we
+    # still clear the framebuffer on the full-flip path.
+    assert re.search(r"screen\.fill\(theme\[['\"]bg['\"]\]\)", src), (
+        "render body never fills the bg — full-flip frames would render "
+        "on top of stale pixels."
+    )
+    assert re.search(r"if\s+will_full_flip\b", src) or re.search(
+        r"if\s+.*full_flip", src
+    ), "expected the bg fill to be gated by a full-flip predicate"
+
+
 def test_render_loop_recovery_overlay_renders(monkeypatch):
     """The RECOVERING label must be drawn when the helper runs, using
     cached fonts (no per-call Font allocation)."""
