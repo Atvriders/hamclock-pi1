@@ -7,6 +7,7 @@ Pygame/SDL for a ~50 MB RAM and ~10% CPU win over the browser stack.
 
 import argparse
 import collections
+import gc
 import io
 import json
 import os
@@ -780,6 +781,13 @@ def _font_key(font):
 _SCALED_CACHE_CAP = 16
 _scaled_cache = collections.OrderedDict()
 
+# ---- Per-font AA flag (Tier-1a perf) ----
+# pygame.font.Font is a C-extension type that rejects arbitrary attribute
+# assignment, so we side-channel the AA flag through a module-level dict
+# keyed by id(font_obj). _make_fonts populates it; _blit_text reads it.
+# The dict is cleared in _make_fonts alongside _glyph_cache.
+_font_aa = {}
+
 
 def _make_fonts():
     """Build the fonts dict. Falls back to default font if SysFont fails.
@@ -805,7 +813,8 @@ def _make_fonts():
         except Exception:
             return pygame.font.Font(None, size + 4)
     _glyph_cache.clear()
-    return {
+    _font_aa.clear()
+    fonts = {
         'title': mk(22),
         'panel': mk(14),
         'body': mk(14),
@@ -813,6 +822,14 @@ def _make_fonts():
         'small': mk(11),
         'tiny': mk(11),
     }
+    # Tier-1a perf: AA only on 'title' (22 px). On a 700 MHz armv6 the AA
+    # glyph path is 5-10x flat render; body/panel/label/small/tiny (<=14 px)
+    # look acceptable without it and AA-off compositing is much cheaper.
+    # Side-channel via id() because pygame.font.Font rejects attribute
+    # assignment.
+    for _name, _f in fonts.items():
+        _font_aa[id(_f)] = (_name == 'title')
+    return fonts
 
 
 def _safe(d, key, default='--'):
@@ -833,7 +850,22 @@ def _blit_text(screen, font, text, color, x, y):
         key = (_font_key(font), s, color)
         surf = _glyph_cache.get(key)
         if surf is None:
-            surf = font.render(s, True, color)
+            # Tier-1a perf: per-font AA flag (set in _make_fonts) read via
+            # the _font_aa side-channel dict (pygame Font rejects attr set).
+            # AA only for 'title' at 22 px; smaller fonts render flat to
+            # dodge the 5-10x AA cost on armv6. Default True for fonts not
+            # registered (e.g. ad-hoc fonts in recovery overlay).
+            aa = _font_aa.get(id(font), True)
+            surf = font.render(s, aa, color)
+            # Tier-1a perf: convert glyph to the display's pixel format once
+            # at cache-insert time so subsequent blits skip the per-pixel
+            # format-conversion the blitter would otherwise pay.
+            try:
+                disp = pygame.display.get_surface()
+                if disp is not None:
+                    surf = surf.convert(disp)
+            except Exception:
+                pass
             _glyph_cache[key] = surf
             if len(_glyph_cache) > _GLYPH_CACHE_CAP:
                 _glyph_cache.popitem(last=False)
@@ -1030,7 +1062,10 @@ def draw_muf_text(screen, rect, solar, fonts, theme):
 def draw_dx_spots(screen, rect, dxspots, fonts, theme):
     if not isinstance(dxspots, list):
         dxspots = []
-    band_lut = dict(zip(HF_BANDS, theme['band_palette']))
+    # Tier-1a perf: read the band-palette LUT cached on the theme dict by
+    # _run_render_loop; fall back to building it inline so callers that
+    # short-circuit the loop (tests, recovery overlay) still work.
+    band_lut = theme.get('_band_lut') or dict(zip(HF_BANDS, theme['band_palette']))
     _blit_text(screen, fonts['label'], 'FREQ',    theme['label'], rect.x, rect.y)
     _blit_text(screen, fonts['label'], 'BND',     theme['label'], rect.x + 90, rect.y)
     _blit_text(screen, fonts['label'], 'DX',      theme['label'], rect.x + 140, rect.y)
@@ -1068,7 +1103,8 @@ def draw_band_activity(screen, rect, dxspots, fonts, theme):
                 if b in HF_BANDS:
                     _band_counts[HF_BANDS.index(b)] += 1
     vmax = max(_band_counts) if any(_band_counts) else 1
-    band_lut = dict(zip(HF_BANDS, theme['band_palette']))
+    # Tier-1a perf: same theme-cached LUT as draw_dx_spots.
+    band_lut = theme.get('_band_lut') or dict(zip(HF_BANDS, theme['band_palette']))
     label_w = 40
     count_w = 36
     row_h = max(14, (rect.h - 4) // len(HF_BANDS))
@@ -1330,6 +1366,12 @@ def main(argv=None):
         os.environ.setdefault('SDL_FBDEV', '/dev/fb0')
 
     pygame.init()
+    # Tier-1a perf: relax the gen-0 GC threshold from the default 700 to
+    # 50000 so short-lived per-frame allocations don't trigger a sweep mid
+    # render. We still collect gen-1/gen-2 normally so long-lived churn is
+    # cleaned. The Pi 1's 256 MB RAM tolerates this comfortably given our
+    # working set is dominated by SDL surfaces, not Python objects.
+    gc.set_threshold(50_000, 10, 10)
     try:
         pygame.mouse.set_visible(True)
     except Exception:
@@ -1390,6 +1432,10 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
     """The dashboard render loop, factored out of main() so that the
     Phase-4 first-boot wizard can run beforehand and tests can patch this
     entry point to assert ordering without spinning up real rendering."""
+    # Tier-1a perf: stash the {band: color} LUT on the theme so draw_dx_spots
+    # and draw_band_activity don't rebuild dict(zip(...)) every frame.
+    if '_band_lut' not in theme:
+        theme['_band_lut'] = dict(zip(HF_BANDS, theme['band_palette']))
     data = HamClockData()
     try:
         data.start_background(data_interval=60, image_interval=900)

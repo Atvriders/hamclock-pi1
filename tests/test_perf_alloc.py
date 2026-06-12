@@ -47,6 +47,28 @@ def test_make_fonts_includes_tiny():
         pygame.quit()
 
 
+def test_make_fonts_aa_flag_only_on_title():
+    """Tier-1a perf: _make_fonts must register each Font in _font_aa with
+    AA only enabled for 'title' (22 px). The smaller fonts render flat to
+    dodge the 5-10x AA cost on the Pi 1 armv6 CPU. _blit_text reads the
+    flag via the side-channel because pygame.font.Font rejects attribute
+    assignment. Regression guard: a flip in either direction is a perf bug.
+    """
+    import pygame
+    pygame.init()
+    try:
+        import hamclock_pygame
+        fonts = hamclock_pygame._make_fonts()
+        aa_map = hamclock_pygame._font_aa
+        assert aa_map.get(id(fonts['title'])) is True, \
+            "'title' font must be registered with AA=True (22 px needs it)"
+        for name in ('panel', 'body', 'label', 'small', 'tiny'):
+            assert aa_map.get(id(fonts[name])) is False, \
+                "'%s' font must be registered with AA=False (perf)" % name
+    finally:
+        pygame.quit()
+
+
 def test_draw_image_loading_branch_no_inline_font_construction():
     """draw_image's loading branch must not allocate a fresh Font per frame.
 
