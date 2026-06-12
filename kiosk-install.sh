@@ -85,6 +85,8 @@ if [ "$KIOSK_MODE" = "pygame" ]; then
         add_cfg "display_auto_detect=0"    # no extra display probe
         add_cfg "disable_overscan=1"       # full HDMI canvas
         add_cfg "hdmi_blanking=0"          # never DPMS the display
+        add_cfg "framebuffer_width=720"    # Tier 2a: half-res framebuffer, HVS upscales free
+        add_cfg "framebuffer_height=450"   # Tier 2a: pygame renders at 720x450; HDMI scanout stays 1440x900
     fi
 
     # Tier 1c: quieter boot, no fsck at boot, no cursor on the TTY before kiosk paints.

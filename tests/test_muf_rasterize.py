@@ -58,7 +58,7 @@ def test_rasterize_muf_happy_path(monkeypatch):
     assert captured['argv'][6] == '-c'
     one_liner = captured['argv'][7]
     assert 'cairosvg.svg2png' in one_liner
-    assert 'output_width=720' in one_liner
+    assert 'output_width=360' in one_liner
     assert 'sys.stdin.buffer.read()' in one_liner
     assert 'sys.stdout.buffer' in one_liner
     # stdin contains the SVG bytes

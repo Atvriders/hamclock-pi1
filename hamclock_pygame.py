@@ -596,8 +596,8 @@ THEMES = {
 
 HF_BANDS = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m', '12m', '10m']
 
-SCREEN_W = 1440
-SCREEN_H = 900
+SCREEN_W = 720    # Tier 2a: native render at 720x450; BCM2835 HVS upscales to 1440x900 in firmware
+SCREEN_H = 450
 
 # ---- Phase 1b: layout / counts / string / solar caches ----
 # Item 5: panel rect grid is recomputed only when screen size changes; every
@@ -792,10 +792,9 @@ _font_aa = {}
 def _make_fonts():
     """Build the fonts dict. Falls back to default font if SysFont fails.
 
-    Includes 'tiny' (size 11) used by draw_image's loading placeholder so
-    the inline pygame.font.Font(None, 18) per-frame allocation is gone.
-    Also clears the module-level _glyph_cache so stale renders from a
-    previous font set cannot leak through (Task 1.3).
+    Sizes are tuned for the Tier 2a 720x450 native framebuffer (HVS upscales
+    to 1440x900 on Pi 1 / VideoCore IV). A 'tiny' font at 8 px renders
+    pleasantly at 16 px effective on the HDMI output.
     """
     # Ensure font subsystem is up; callers (incl. recovery-overlay tests) may
     # only have initialized pygame.display, leaving pygame.font uninitialized.
@@ -815,20 +814,19 @@ def _make_fonts():
     _glyph_cache.clear()
     _font_aa.clear()
     fonts = {
-        'title': mk(22),
-        'panel': mk(14),
-        'body': mk(14),
-        'label': mk(12),
-        'small': mk(11),
-        'tiny': mk(11),
+        'title': mk(13),    # was 22
+        'panel': mk(9),     # was 14
+        'body':  mk(9),     # was 14
+        'label': mk(8),     # was 12
+        'small': mk(7),     # was 11
+        'tiny':  mk(7),     # was 11
     }
-    # Tier-1a perf: AA only on 'title' (22 px). On a 700 MHz armv6 the AA
-    # glyph path is 5-10x flat render; body/panel/label/small/tiny (<=14 px)
-    # look acceptable without it and AA-off compositing is much cheaper.
-    # Side-channel via id() because pygame.font.Font rejects attribute
-    # assignment.
-    for _name, _f in fonts.items():
-        _font_aa[id(_f)] = (_name == 'title')
+    # Tier-1a perf: AA only on 'title'. On a 700 MHz armv6 the AA glyph path
+    # is 5-10x flat render; body/panel/label/small/tiny look acceptable
+    # without it and AA-off compositing is much cheaper. Side-channel via
+    # id() because pygame.font.Font rejects attribute assignment.
+    for name, f in fonts.items():
+        _font_aa[id(f)] = (name == 'title')
     return fonts
 
 
@@ -1482,7 +1480,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                             break
 
             sw, sh = screen.get_size()
-            # Tier-0 perf: only memset the whole 1440x900 framebuffer when this
+            # Tier-0 perf: only memset the whole 720x450 framebuffer when this
             # frame will end in a full display.flip(). The dirty-rect helper
             # signals "full flip" on first frame, tab change, or pending flag;
             # peek at the same predicate here (without mutating state) so we

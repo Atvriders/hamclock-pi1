@@ -118,7 +118,7 @@ def _run_30_frame_headless():
             for k in list(cache.keys()):
                 cache[k] = None if k in ("size", "ts", "key") else cache[k]
 
-    screen = pygame.display.set_mode((1440, 900))
+    screen = pygame.display.set_mode((720, 450))
     raw_fonts = hp._make_fonts()
 
     render_counter = [0]

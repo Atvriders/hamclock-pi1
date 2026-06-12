@@ -57,10 +57,11 @@ def _rasterize_muf(svg_bytes):
     """Render the KC2G MUF SVG to PNG in a subprocess so the multi-second
     render does not block the request thread or the background fetcher.
 
-    output_width=720 because the MUF panel is ~720x420 in the 1440x900
-    layout; rendering at native panel width halves cairo's CPU cost vs.
-    full screen. cairosvg.svg2png preserves aspect ratio when only
-    output_width is given — the 1526x905 SVG becomes 720x427 PNG.
+    output_width=360 because the MUF panel is ~360x210 in the Tier 2a
+    720x450 native framebuffer (HVS upscales to 1440x900); rendering at
+    native panel width halves cairo's CPU cost vs. the prior 720 width.
+    cairosvg.svg2png preserves aspect ratio when only output_width is
+    given — the 1526x905 SVG becomes 360x213 PNG.
 
     cpulimit caps the subprocess to 50% of one core so the render loop
     keeps its frame budget even mid-rasterize. nice -n 19 alone is
@@ -77,7 +78,7 @@ def _rasterize_muf(svg_bytes):
              'python3', '-c',
              'import sys, cairosvg; cairosvg.svg2png('
              'bytestring=sys.stdin.buffer.read(), '
-             'output_width=720, write_to=sys.stdout.buffer)'],
+             'output_width=360, write_to=sys.stdout.buffer)'],
             input=svg_bytes,
             capture_output=True,
             timeout=PHASE2_TIMEOUT_S,

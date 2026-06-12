@@ -44,7 +44,7 @@ for drv in ('fbcon', 'kmsdrm', 'x11', 'dummy'):
     print('--- trying', drv, '---')
     try:
         pygame.display.init()
-        scr = pygame.display.set_mode((1440, 900), pygame.FULLSCREEN)
+        scr = pygame.display.set_mode((720, 450), pygame.FULLSCREEN)
         scr.fill((40, 20, 80))
         pygame.display.flip()
         time.sleep(1)

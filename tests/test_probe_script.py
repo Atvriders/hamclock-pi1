@@ -38,7 +38,7 @@ def test_probe_script_calls_set_mode_and_flip():
     assert "set_mode" in body, "probe must call set_mode (init alone gives false positives)"
     assert "pygame.display.flip" in body or ".flip()" in body, "probe must call flip"
     assert "FULLSCREEN" in body
-    assert "1440, 900" in body
+    assert "720, 450" in body
 
 
 def test_probe_script_logs_keyboard_layout():

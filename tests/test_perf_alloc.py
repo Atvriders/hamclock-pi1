@@ -240,9 +240,9 @@ def test_compute_dirty_rects_full_on_first_frame():
                  'prev_data_refresh': 0.0, 'prev_image_refresh': 0.0,
                  'full_flip_pending': True}
         panel_rects = {
-            'header': pygame.Rect(0, 0, 1440, 30),
-            'status': pygame.Rect(0, 880, 1440, 20),
-            'solar': pygame.Rect(0, 30, 280, 200),
+            'header': pygame.Rect(0, 0, 720, 30),
+            'status': pygame.Rect(0, 430, 720, 20),
+            'solar': pygame.Rect(0, 30, 140, 100),
         }
         dirty = hamclock_pygame._compute_dirty_rects(
             state, panel_rects, active_tab='drap',
@@ -263,9 +263,9 @@ def test_compute_dirty_rects_second_tick_only_redraws_clock_panels():
                  'prev_data_refresh': 0.0, 'prev_image_refresh': 0.0,
                  'full_flip_pending': False}
         panel_rects = {
-            'header': pygame.Rect(0, 0, 1440, 30),
-            'status': pygame.Rect(0, 880, 1440, 20),
-            'solar': pygame.Rect(0, 30, 280, 200),
+            'header': pygame.Rect(0, 0, 720, 30),
+            'status': pygame.Rect(0, 430, 720, 20),
+            'solar': pygame.Rect(0, 30, 140, 100),
         }
         dirty = hamclock_pygame._compute_dirty_rects(
             state, panel_rects, active_tab='drap',
@@ -286,7 +286,7 @@ def test_compute_dirty_rects_tab_change_forces_full_flip():
         state = {'prev_active_tab': 'drap', 'prev_second': 1000,
                  'prev_data_refresh': 0.0, 'prev_image_refresh': 0.0,
                  'full_flip_pending': False}
-        panel_rects = {'header': pygame.Rect(0, 0, 1440, 30)}
+        panel_rects = {'header': pygame.Rect(0, 0, 720, 30)}
         dirty = hamclock_pygame._compute_dirty_rects(
             state, panel_rects, active_tab='aurora',
             now_sec=1000, data_refresh=0.0, image_refresh=0.0)
@@ -335,10 +335,10 @@ def test_render_loop_30_frame_alloc_budget(monkeypatch):
         hamclock_pygame._glyph_cache.clear()
         raw_fonts = hamclock_pygame._make_fonts()
         fonts = {k: _CountingFont(v) for k, v in raw_fonts.items()}
-        screen = pygame.Surface((1440, 900))
+        screen = pygame.Surface((720, 450))
         src_img = pygame.Surface((800, 600))
-        rect_sdo = pygame.Rect(0, 30, 280, 250)
-        rect_prop = pygame.Rect(1100, 600, 340, 280)
+        rect_sdo = pygame.Rect(0, 30, 140, 125)
+        rect_prop = pygame.Rect(550, 300, 170, 140)
 
         # Reset render counter AFTER fonts built (SysFont init may call render).
         calls['render'] = 0
@@ -367,7 +367,7 @@ def test_render_loop_30_frame_alloc_budget(monkeypatch):
 
 def test_no_full_screen_fill_on_steady_state_frames():
     """Tier-0 perf bug: an unconditional `screen.fill(theme['bg'])` near the
-    top of _run_render_loop's body memsets the entire 1440x900 framebuffer
+    top of _run_render_loop's body memsets the entire 720x450 framebuffer
     every frame, defeating the dirty-rect partial-update path.
 
     Catch the regression statically: the render body must NOT contain a
@@ -408,7 +408,7 @@ def test_render_loop_recovery_overlay_renders(monkeypatch):
     cached fonts (no per-call Font allocation)."""
     import pygame
     pygame.display.init()
-    screen = pygame.display.set_mode((1440, 900))
+    screen = pygame.display.set_mode((720, 450))
     import hamclock_pygame as hp
 
     seen = {"recovering": 0}
