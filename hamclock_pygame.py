@@ -596,6 +596,30 @@ THEMES = {
 
 HF_BANDS = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m', '12m', '10m']
 
+# Tier 2b: per-panel redraw cadence (seconds). The render loop still ticks at
+# 10 FPS so click latency stays bounded (<= ~200 ms p99), but each draw_<x>
+# function only runs when its panel's cadence has elapsed since the last
+# redraw. Clock-driven panels (header, status) tick every second; data panels
+# poll for a refresh every 60 s — the underlying data layer refreshes every
+# 5 min (solar/bands) or 2 min (DX), so 60 s here is "check whether the data
+# changed", not "force a redraw on stale data". Tab clicks trigger a full
+# flip on the next frame via dirty_state['full_flip_pending'], which bypasses
+# this table.
+_CADENCE_S = {
+    'header': 1.0,
+    'status': 1.0,
+    'solar': 60.0,
+    'bands': 60.0,
+    'geomag': 60.0,
+    'xray': 60.0,
+    'open_bands': 60.0,
+    'muf_text': 60.0,
+    'sdo': 60.0,
+    'dx_spots': 60.0,
+    'band_activity': 60.0,
+    'propagation': 60.0,
+}
+
 SCREEN_W = 720    # Tier 2a: native render at 720x450; BCM2835 HVS upscales to 1440x900 in firmware
 SCREEN_H = 450
 
@@ -897,6 +921,16 @@ def draw_panel(screen, rect, title, fonts, theme):
     pygame.draw.rect(screen, theme['border'], bar)
     _blit_text(screen, fonts['panel'], title, theme['bright'],
                rect.x + 6, rect.y + 2)
+    return _panel_inner_rect(rect)
+
+
+def _panel_inner_rect(rect):
+    """Compute the inner content rect for a panel without painting the chrome.
+
+    Tier 2b uses this on frames where a panel's cadence has NOT elapsed,
+    so we can still hand its inner rect to a no-op skip path while not
+    re-blitting the title bar and border. Keep this formula in lockstep
+    with draw_panel's return value above."""
     return pygame.Rect(rect.x + 6, rect.y + 22, rect.w - 12, rect.h - 26)
 
 
@@ -1452,6 +1486,11 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
         'prev_image_refresh': 0.0,
         'full_flip_pending': True,
     }
+    # Tier 2b: per-panel next-due-at clock. 0.0 means "draw on the very next
+    # frame" so first-paint catches every panel. After each panel's draw, we
+    # bump its entry by _CADENCE_S[name]. A tab change or pending full flip
+    # forces all panels to redraw regardless of due time.
+    _panel_due_at = {name: 0.0 for name in _CADENCE_S}
 
     clock = pygame.time.Clock()
     running = True
@@ -1500,13 +1539,35 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
             layout = _get_layout((sw, sh))
             data_ts = data.last_data_refresh
 
+            # Tier 2b: cadence gate. On a full-flip frame (first paint or
+            # tab change) every panel redraws; otherwise each panel only
+            # redraws when its _panel_due_at has elapsed. Panels that ran
+            # this frame land in redrawn_this_frame so we can build the
+            # display.update() rect list from the actual draws, instead of
+            # the speculative dirty-rect helper.
+            now_ts = time.time()
+            force_all = will_full_flip
+
+            def _panel_due(name):
+                if force_all:
+                    return True
+                return _panel_due_at[name] <= now_ts
+
+            redrawn_this_frame = set()
+
             header = layout["header"]
             callsign = settings.get('callsign') or os.environ.get(
                 'HAMCLOCK_CALLSIGN', 'N0CALL')
-            draw_header(screen, header, callsign, fonts, theme, data=data)
+            if _panel_due('header'):
+                draw_header(screen, header, callsign, fonts, theme, data=data)
+                redrawn_this_frame.add('header')
+                _panel_due_at['header'] = now_ts + _CADENCE_S['header']
 
             status = layout["status"]
-            draw_status_bar(screen, status, data, fonts, theme)
+            if _panel_due('status'):
+                draw_status_bar(screen, status, data, fonts, theme)
+                redrawn_this_frame.add('status')
+                _panel_due_at['status'] = now_ts + _CADENCE_S['status']
 
             panel_gap = 4
 
@@ -1515,81 +1576,117 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                       'GEOMAGNETIC', 'X-RAY FLUX', 'OPEN BANDS']
             layout_keys = ['solar', 'bands', 'sdo',
                            'geomag', 'xray', 'open_bands']
+            # Compute inner rects without re-issuing draw_panel chrome on
+            # frames where no left-column panel is due (chrome blit is
+            # cheap but pointless if nothing inside changed).
             panel_rects = []
             for key, t in zip(layout_keys, titles):
-                inner = draw_panel(screen, layout[key], t, fonts, theme)
+                if _panel_due(key):
+                    inner = draw_panel(screen, layout[key], t, fonts, theme)
+                else:
+                    inner = _panel_inner_rect(layout[key])
                 panel_rects.append(inner)
 
-            try:
-                draw_solar(screen, panel_rects[0], data.solar or {},
-                           fonts, theme, data_refresh_ts=data_ts)
-            except Exception:
-                pass
-            try:
-                draw_bands(screen, panel_rects[1], data.bands or {}, fonts, theme)
-            except Exception:
-                pass
-            try:
-                sdo_surf = _get_cached_image(data, 'solar-image', image_cache, image_cache_ts)
-                draw_image(screen, panel_rects[2], sdo_surf, fonts, theme,
-                           image_key='solar-image',
-                           fetched_at=data.image_fetched_at.get('solar-image', 0.0))
-            except Exception:
-                pass
-            try:
-                draw_geomag(screen, panel_rects[3], data.solar or {},
-                            fonts, theme, data_refresh_ts=data_ts)
-            except Exception:
-                pass
-            try:
-                draw_xray(screen, panel_rects[4], data.solar or {},
-                          fonts, theme, data_refresh_ts=data_ts)
-            except Exception:
-                pass
-            try:
-                draw_open_bands(screen, panel_rects[5], data.bands or {},
+            if _panel_due('solar'):
+                try:
+                    draw_solar(screen, panel_rects[0], data.solar or {},
+                               fonts, theme, data_refresh_ts=data_ts)
+                except Exception:
+                    pass
+                redrawn_this_frame.add('solar')
+                _panel_due_at['solar'] = now_ts + _CADENCE_S['solar']
+            if _panel_due('bands'):
+                try:
+                    draw_bands(screen, panel_rects[1], data.bands or {}, fonts, theme)
+                except Exception:
+                    pass
+                redrawn_this_frame.add('bands')
+                _panel_due_at['bands'] = now_ts + _CADENCE_S['bands']
+            if _panel_due('sdo'):
+                try:
+                    sdo_surf = _get_cached_image(data, 'solar-image', image_cache, image_cache_ts)
+                    draw_image(screen, panel_rects[2], sdo_surf, fonts, theme,
+                               image_key='solar-image',
+                               fetched_at=data.image_fetched_at.get('solar-image', 0.0))
+                except Exception:
+                    pass
+                redrawn_this_frame.add('sdo')
+                _panel_due_at['sdo'] = now_ts + _CADENCE_S['sdo']
+            if _panel_due('geomag'):
+                try:
+                    draw_geomag(screen, panel_rects[3], data.solar or {},
                                 fonts, theme, data_refresh_ts=data_ts)
-            except Exception:
-                pass
+                except Exception:
+                    pass
+                redrawn_this_frame.add('geomag')
+                _panel_due_at['geomag'] = now_ts + _CADENCE_S['geomag']
+            if _panel_due('xray'):
+                try:
+                    draw_xray(screen, panel_rects[4], data.solar or {},
+                              fonts, theme, data_refresh_ts=data_ts)
+                except Exception:
+                    pass
+                redrawn_this_frame.add('xray')
+                _panel_due_at['xray'] = now_ts + _CADENCE_S['xray']
+            if _panel_due('open_bands'):
+                try:
+                    draw_open_bands(screen, panel_rects[5], data.bands or {},
+                                    fonts, theme, data_refresh_ts=data_ts)
+                except Exception:
+                    pass
+                redrawn_this_frame.add('open_bands')
+                _panel_due_at['open_bands'] = now_ts + _CADENCE_S['open_bands']
 
             # ---- MIDDLE COLUMN ----
             mid_rect = layout["muf"]
-            mid_inner = draw_panel(screen, mid_rect, 'MUF STATUS', fonts, theme)
-            try:
-                draw_muf_text(screen, mid_inner, data.solar or {}, fonts, theme)
-            except Exception:
-                pass
+            if _panel_due('muf_text'):
+                mid_inner = draw_panel(screen, mid_rect, 'MUF STATUS', fonts, theme)
+                try:
+                    draw_muf_text(screen, mid_inner, data.solar or {}, fonts, theme)
+                except Exception:
+                    pass
+                redrawn_this_frame.add('muf_text')
+                _panel_due_at['muf_text'] = now_ts + _CADENCE_S['muf_text']
 
             # ---- RIGHT COLUMN ----
             dx_r = layout["dx_spots"]
-            dx_inner = draw_panel(screen, dx_r, 'DX SPOTS', fonts, theme)
-            try:
-                draw_dx_spots(screen, dx_inner, data.dxspots or [], fonts, theme)
-            except Exception:
-                pass
+            if _panel_due('dx_spots'):
+                dx_inner = draw_panel(screen, dx_r, 'DX SPOTS', fonts, theme)
+                try:
+                    draw_dx_spots(screen, dx_inner, data.dxspots or [], fonts, theme)
+                except Exception:
+                    pass
+                redrawn_this_frame.add('dx_spots')
+                _panel_due_at['dx_spots'] = now_ts + _CADENCE_S['dx_spots']
 
             ba_r = layout["band_activity"]
-            ba_inner = draw_panel(screen, ba_r, 'BAND ACTIVITY', fonts, theme)
-            try:
-                draw_band_activity(screen, ba_inner, data.dxspots or [], fonts, theme)
-            except Exception:
-                pass
+            if _panel_due('band_activity'):
+                ba_inner = draw_panel(screen, ba_r, 'BAND ACTIVITY', fonts, theme)
+                try:
+                    draw_band_activity(screen, ba_inner, data.dxspots or [], fonts, theme)
+                except Exception:
+                    pass
+                redrawn_this_frame.add('band_activity')
+                _panel_due_at['band_activity'] = now_ts + _CADENCE_S['band_activity']
 
             prop_r = layout["propagation"]
-            prop_inner = draw_panel(screen, prop_r, 'PROPAGATION', fonts, theme)
-            tab_bar = pygame.Rect(prop_inner.x, prop_inner.y, prop_inner.w, 20)
-            tab_regions = draw_tabs(screen, tab_bar, ['drap', 'aurora', 'enlil'],
-                                    active_tab, fonts, theme)
-            img_rect = pygame.Rect(prop_inner.x, prop_inner.y + 24,
-                                   prop_inner.w, prop_inner.h - 24)
-            try:
-                key = tab_image_key.get(active_tab, 'real-drap')
-                surf = _get_cached_image(data, key, image_cache, image_cache_ts)
-                draw_image(screen, img_rect, surf, fonts, theme,
-                           image_key=key,
-                           fetched_at=data.image_fetched_at.get(key, 0.0))
-            except Exception:
-                pass
+            if _panel_due('propagation'):
+                prop_inner = draw_panel(screen, prop_r, 'PROPAGATION', fonts, theme)
+                tab_bar = pygame.Rect(prop_inner.x, prop_inner.y, prop_inner.w, 20)
+                tab_regions = draw_tabs(screen, tab_bar, ['drap', 'aurora', 'enlil'],
+                                        active_tab, fonts, theme)
+                img_rect = pygame.Rect(prop_inner.x, prop_inner.y + 24,
+                                       prop_inner.w, prop_inner.h - 24)
+                try:
+                    key = tab_image_key.get(active_tab, 'real-drap')
+                    surf = _get_cached_image(data, key, image_cache, image_cache_ts)
+                    draw_image(screen, img_rect, surf, fonts, theme,
+                               image_key=key,
+                               fetched_at=data.image_fetched_at.get(key, 0.0))
+                except Exception:
+                    pass
+                redrawn_this_frame.add('propagation')
+                _panel_due_at['propagation'] = now_ts + _CADENCE_S['propagation']
 
             panel_rects_map = {
                 'header': header,
@@ -1605,15 +1702,20 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 'band_activity': ba_r,
                 'propagation': prop_r,
             }
-            dirty = _compute_dirty_rects(
-                dirty_state, panel_rects_map, active_tab,
-                int(time.time()),
-                data.last_data_refresh,
-                data.last_image_refresh)
-            if dirty is None:
+            # Tier 2b: present this frame. Full-flip path matches the legacy
+            # _compute_dirty_rects contract (first frame, tab change, pending
+            # flag). Otherwise we update only the rects of panels actually
+            # redrawn this frame; if nothing was due, we present nothing.
+            if (dirty_state.get('full_flip_pending')
+                    or dirty_state.get('prev_active_tab') != active_tab):
+                dirty_state['full_flip_pending'] = False
+                dirty_state['prev_active_tab'] = active_tab
                 pygame.display.flip()
-            elif dirty:
-                pygame.display.update(dirty)
+            else:
+                rects = [panel_rects_map[n] for n in redrawn_this_frame
+                         if n in panel_rects_map]
+                if rects:
+                    pygame.display.update(rects)
             clock.tick(10)
             consecutive_errors = 0
         except Exception as e:
