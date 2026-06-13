@@ -76,6 +76,7 @@ def test_textfield_validator_sets_error():
 
 
 def test_textfield_draw_does_not_raise():
+    pygame.font.init()  # full-suite ordering may have left font subsystem deinit'd
     surf = pygame.Surface((400, 100))
     tf = TextField(pygame.Rect(0, 0, 200, 40), initial="W1ABC", label="Call")
     tf.draw(surf, THEME, focused=True)
