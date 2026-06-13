@@ -87,6 +87,10 @@ from hamclock_pygame import setup_screen
 
 
 def _make_fake_fonts():
+    # An earlier test in the full suite may have called pygame.quit() (which
+    # also deinitialises the font subsystem). Re-init here so Font() succeeds
+    # regardless of ordering.
+    pygame.font.init()
     return {
         "tiny": pygame.font.Font(None, 14),
         "small": pygame.font.Font(None, 18),
