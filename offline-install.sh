@@ -162,24 +162,22 @@ SERVICE_USER="${SUDO_USER:-${USER:-root}}"
 # ---- Phase 4: settings directory + hamclock-setup wrapper ----
 sudo install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 /etc/hamclock-lite
 
-# Reinstall detection: if settings already exist, don't overwrite. If a
-# pygame service already exists but settings don't, write a default file.
+# Always seed a default settings.json so the wizard never auto-launches
+# on first boot — a headless Pi 1B has no USB keyboard to drive it.
+# User runs `sudo hamclock-setup --callsign W1ABC ...` later to personalize.
 if [ ! -f /etc/hamclock-lite/settings.json ]; then
-    if systemctl list-unit-files | grep -q '^hamclock-kiosk\.service'; then
-        sudo -u "$SERVICE_USER" tee /etc/hamclock-lite/settings.json >/dev/null <<'SETTINGSEOF'
+    sudo tee /etc/hamclock-lite/settings.json > /dev/null <<'SETTINGSEOF'
 {
-  "callsign": "",
+  "callsign": "N0CALL",
   "timezone": "UTC",
   "theme": "kstate",
   "ntp": ""
 }
 SETTINGSEOF
-        sudo chmod 0644 /etc/hamclock-lite/settings.json
-        echo "Existing pygame install detected; wrote default settings.json."
-        echo "Run 'sudo hamclock-setup --callsign YOUR_CALL --timezone YOUR_TZ --theme kstate' to personalize."
-    fi
-    # Truly fresh install (no service unit yet) leaves settings.json absent
-    # so the wizard auto-launches on first kiosk boot.
+    sudo chown $SERVICE_USER:$SERVICE_USER /etc/hamclock-lite/settings.json
+    sudo chmod 0644 /etc/hamclock-lite/settings.json
+    echo "Wrote default /etc/hamclock-lite/settings.json (callsign=N0CALL)."
+    echo "Run 'sudo hamclock-setup --callsign YOUR_CALL --timezone YOUR_TZ --theme kstate' to personalize."
 fi
 
 # Install the hamclock-setup wrapper.
@@ -3092,6 +3090,39 @@ def _render_recovering_overlay(screen, fonts, theme):
         pass
 
 
+def _init_display():
+    """SDL driver ladder. Bookworm SDL2 may lack fbcon (Phase 0 risk).
+    Try fbcon -> kmsdrm -> x11 -> dummy; honor a pre-set SDL_VIDEODRIVER
+    first if it's in the ladder. Logs every attempt to stderr so
+    journalctl captures the actual reason on the Pi."""
+    import pygame
+    preset = os.environ.get('SDL_VIDEODRIVER')
+    ladder = ['fbcon', 'kmsdrm', 'x11', 'dummy']
+    if preset:
+        ladder = [preset] + [d for d in ladder if d != preset]
+    os.environ.setdefault('SDL_FBDEV', '/dev/fb0')
+    pygame.init()
+    last_err = None
+    for drv in ladder:
+        os.environ['SDL_VIDEODRIVER'] = drv
+        try:
+            pygame.display.quit()
+        except Exception:
+            pass
+        try:
+            pygame.display.init()
+            scr = pygame.display.set_mode(
+                (SCREEN_W, SCREEN_H), pygame.FULLSCREEN)
+            print('[display] SDL driver=%s mode=%s'
+                  % (drv, scr.get_size()), file=sys.stderr)
+            return scr
+        except Exception as e:
+            print('[display] %s failed: %s' % (drv, e), file=sys.stderr)
+            last_err = e
+    raise RuntimeError(
+        'No SDL video driver succeeded; last error: %s' % last_err)
+
+
 def main(argv=None):
     # Use parse_known_args so stray runner args (e.g. pytest) don't kill us
     # when a caller invokes main() directly without scrubbing sys.argv.
@@ -3102,24 +3133,12 @@ def main(argv=None):
         injected_iter = _inject_event_iter(
             _load_injected_events(args.inject_events))
 
-    if 'DISPLAY' not in os.environ:
-        os.environ.setdefault('SDL_VIDEODRIVER', 'fbcon')
-        os.environ.setdefault('SDL_FBDEV', '/dev/fb0')
-
-    pygame.init()
+    screen = _init_display()
+    pygame.display.set_caption('HamClock Lite')
     try:
         pygame.mouse.set_visible(True)
     except Exception:
         pass
-
-    try:
-        screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.FULLSCREEN)
-    except pygame.error:
-        try:
-            screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
-        except pygame.error:
-            screen = pygame.display.set_mode((800, 600))
-    pygame.display.set_caption('HamClock Lite')
 
     fonts = _make_fonts()
 
@@ -4368,7 +4387,10 @@ for i in $(seq 1 120); do
     fi
     sleep 1
 done
-export SDL_VIDEODRIVER=fbcon
+# Pygame framebuffer mode: no X server, SDL draws directly to /dev/fb0.
+# Driver selection is owned by the Python ladder in hamclock_pygame._init_display
+# (fbcon -> kmsdrm -> x11 -> dummy). We keep SDL_FBDEV as a hint for the fbcon
+# rung of the ladder.
 export SDL_FBDEV=/dev/fb0
 # Relaunch the client if it ever exits so the kiosk never falls back to the
 # bare console (e.g. an SDL/framebuffer error after an HDMI hotplug).
@@ -4414,18 +4436,25 @@ if [ "$KIOSK_MODE" = "pygame" ]; then
         echo ""
     fi
 
-    if [ "$REINSTALL_DECISION" = "seed-defaults" ]; then
+    if [ "$REINSTALL_DECISION" = "seed-defaults" ] \
+        || [ "$REINSTALL_DECISION" = "fresh-install" ]; then
+        # Always seed a default settings.json so the wizard never
+        # auto-launches on first boot — a headless Pi 1B has no USB
+        # keyboard to drive it. User runs `sudo hamclock-setup` later.
         sudo install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 /etc/hamclock-lite
-        sudo -u "$SERVICE_USER" tee "$SETTINGS_FILE" >/dev/null <<'JSON'
+        if [ ! -f "$SETTINGS_FILE" ]; then
+            sudo tee "$SETTINGS_FILE" >/dev/null <<'SETTINGSEOF'
 {
-  "callsign": "",
+  "callsign": "N0CALL",
   "timezone": "UTC",
   "theme": "kstate",
   "ntp": ""
 }
-JSON
-        sudo chmod 0644 "$SETTINGS_FILE"
-        echo "Run 'sudo hamclock-setup' to personalize your settings."
+SETTINGSEOF
+            sudo chown $SERVICE_USER:$SERVICE_USER "$SETTINGS_FILE"
+            sudo chmod 0644 "$SETTINGS_FILE"
+        fi
+        echo "Run 'sudo hamclock-setup --callsign W1ABC ...' to personalize your settings."
     fi
 fi
 # --- end Phase 5 reinstall detection -------------------------------------
@@ -4449,6 +4478,9 @@ StandardOutput=tty
 TTYPath=/dev/tty7
 TTYReset=yes
 TTYVHangup=yes
+# Force the kernel to switch to tty7 BEFORE the kiosk launches so the
+# pygame client can't paint invisibly while tty1 stays foreground.
+ExecStartPre=/usr/bin/chvt 7
 ExecStart=/opt/hamclock-lite/kiosk.sh
 # Restart on ANY exit (including clean exit 0), not just failures.
 Restart=always
@@ -4479,6 +4511,9 @@ StandardOutput=tty
 TTYPath=/dev/tty7
 TTYReset=yes
 TTYVHangup=yes
+# Force the kernel to switch to tty7 BEFORE the kiosk launches so the
+# X server can't paint invisibly while tty1 stays foreground.
+ExecStartPre=/usr/bin/chvt 7
 ExecStart=/usr/bin/xinit /opt/hamclock-lite/kiosk.sh -- :0 vt7
 # Restart on ANY exit (including clean exit 0), not just failures.
 Restart=always

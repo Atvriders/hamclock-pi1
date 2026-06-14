@@ -1383,6 +1383,39 @@ def _render_recovering_overlay(screen, fonts, theme):
         pass
 
 
+def _init_display():
+    """SDL driver ladder. Bookworm SDL2 may lack fbcon (Phase 0 risk).
+    Try fbcon -> kmsdrm -> x11 -> dummy; honor a pre-set SDL_VIDEODRIVER
+    first if it's in the ladder. Logs every attempt to stderr so
+    journalctl captures the actual reason on the Pi."""
+    import pygame
+    preset = os.environ.get('SDL_VIDEODRIVER')
+    ladder = ['fbcon', 'kmsdrm', 'x11', 'dummy']
+    if preset:
+        ladder = [preset] + [d for d in ladder if d != preset]
+    os.environ.setdefault('SDL_FBDEV', '/dev/fb0')
+    pygame.init()
+    last_err = None
+    for drv in ladder:
+        os.environ['SDL_VIDEODRIVER'] = drv
+        try:
+            pygame.display.quit()
+        except Exception:
+            pass
+        try:
+            pygame.display.init()
+            scr = pygame.display.set_mode(
+                (SCREEN_W, SCREEN_H), pygame.FULLSCREEN)
+            print('[display] SDL driver=%s mode=%s'
+                  % (drv, scr.get_size()), file=sys.stderr)
+            return scr
+        except Exception as e:
+            print('[display] %s failed: %s' % (drv, e), file=sys.stderr)
+            last_err = e
+    raise RuntimeError(
+        'No SDL video driver succeeded; last error: %s' % last_err)
+
+
 def main(argv=None):
     # Use parse_known_args so stray runner args (e.g. pytest) don't kill us
     # when a caller invokes main() directly without scrubbing sys.argv.
@@ -1393,30 +1426,19 @@ def main(argv=None):
         injected_iter = _inject_event_iter(
             _load_injected_events(args.inject_events))
 
-    if 'DISPLAY' not in os.environ:
-        os.environ.setdefault('SDL_VIDEODRIVER', 'fbcon')
-        os.environ.setdefault('SDL_FBDEV', '/dev/fb0')
-
-    pygame.init()
     # Tier-1a perf: relax the gen-0 GC threshold from the default 700 to
     # 50000 so short-lived per-frame allocations don't trigger a sweep mid
     # render. We still collect gen-1/gen-2 normally so long-lived churn is
     # cleaned. The Pi 1's 256 MB RAM tolerates this comfortably given our
     # working set is dominated by SDL surfaces, not Python objects.
     gc.set_threshold(50_000, 10, 10)
+
+    screen = _init_display()
+    pygame.display.set_caption('HamClock Lite')
     try:
         pygame.mouse.set_visible(True)
     except Exception:
         pass
-
-    try:
-        screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.FULLSCREEN)
-    except pygame.error:
-        try:
-            screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
-        except pygame.error:
-            screen = pygame.display.set_mode((800, 600))
-    pygame.display.set_caption('HamClock Lite')
 
     fonts = _make_fonts()
 

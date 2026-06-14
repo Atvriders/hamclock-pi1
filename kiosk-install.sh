@@ -318,8 +318,10 @@ for i in $(seq 1 120); do
     fi
     sleep 1
 done
-# Pygame framebuffer mode: no X server, SDL draws directly to /dev/fb0
-export SDL_VIDEODRIVER=fbcon
+# Pygame framebuffer mode: no X server, SDL draws directly to /dev/fb0.
+# Driver selection is owned by the Python ladder in hamclock_pygame._init_display
+# (fbcon -> kmsdrm -> x11 -> dummy). We keep SDL_FBDEV as a hint for the fbcon
+# rung of the ladder.
 export SDL_FBDEV=/dev/fb0
 # Relaunch the client if it ever exits so the kiosk never falls back to the
 # bare console (e.g. an SDL/framebuffer error after an HDMI hotplug).
@@ -369,22 +371,26 @@ if [ "$KIOSK_MODE" = "pygame" ]; then
         echo ""
     fi
 
-    if [ "$REINSTALL_DECISION" = "seed-defaults" ]; then
+    if [ "$REINSTALL_DECISION" = "seed-defaults" ] \
+        || [ "$REINSTALL_DECISION" = "fresh-install" ]; then
+        # Always seed a default settings.json so the wizard never
+        # auto-launches on first boot — a headless Pi 1B has no USB
+        # keyboard to drive it. User runs `sudo hamclock-setup` later.
         sudo install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 /etc/hamclock-lite
-        sudo -u "$SERVICE_USER" tee "$SETTINGS_FILE" >/dev/null <<'JSON'
+        if [ ! -f "$SETTINGS_FILE" ]; then
+            sudo tee "$SETTINGS_FILE" >/dev/null <<'SETTINGSEOF'
 {
-  "callsign": "",
+  "callsign": "N0CALL",
   "timezone": "UTC",
   "theme": "kstate",
   "ntp": ""
 }
-JSON
-        sudo chmod 0644 "$SETTINGS_FILE"
-        echo "Run 'sudo hamclock-setup' to personalize your settings."
+SETTINGSEOF
+            sudo chown $SERVICE_USER:$SERVICE_USER "$SETTINGS_FILE"
+            sudo chmod 0644 "$SETTINGS_FILE"
+        fi
+        echo "Run 'sudo hamclock-setup --callsign W1ABC ...' to personalize your settings."
     fi
-    # Fresh-install case: do nothing here. /etc/hamclock-lite is created
-    # later by the Phase 4 installer block; the wizard auto-launches on
-    # first boot because settings.json is absent.
     # Keep-settings case: do nothing — wizard will not run.
 fi
 # --- end Phase 5 reinstall detection -------------------------------------
@@ -408,6 +414,9 @@ StandardOutput=tty
 TTYPath=/dev/tty7
 TTYReset=yes
 TTYVHangup=yes
+# Force the kernel to switch to tty7 BEFORE the kiosk launches so the
+# pygame client can't paint invisibly while tty1 stays foreground.
+ExecStartPre=/usr/bin/chvt 7
 ExecStart=/opt/hamclock-lite/kiosk.sh
 # Restart on ANY exit (including clean exit 0), not just failures.
 Restart=always
@@ -438,6 +447,9 @@ StandardOutput=tty
 TTYPath=/dev/tty7
 TTYReset=yes
 TTYVHangup=yes
+# Force the kernel to switch to tty7 BEFORE the kiosk launches so the
+# X server can't paint invisibly while tty1 stays foreground.
+ExecStartPre=/usr/bin/chvt 7
 ExecStart=/usr/bin/xinit /opt/hamclock-lite/kiosk.sh -- :0 vt7
 # Restart on ANY exit (including clean exit 0), not just failures.
 Restart=always
