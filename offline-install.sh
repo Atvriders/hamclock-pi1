@@ -2545,6 +2545,17 @@ HF_BANDS = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m', '12m', '10m
 SCREEN_W = 1440
 SCREEN_H = 900
 
+# Propagation panel tabs (module-level so the wiring is testable and lives in
+# one place). 'muf' surfaces the KC2G MUF map the server rasterizes to PNG for
+# /api/muf-map — decoded lazily only when the tab is selected.
+PROP_TABS = ['drap', 'aurora', 'enlil', 'muf']
+PROP_TAB_IMAGE_KEY = {
+    'drap': 'real-drap',
+    'aurora': 'drap',
+    'enlil': 'enlil',
+    'muf': 'muf-map',
+}
+
 # ---- Glyph cache (Phase 1 perf fix #3) ----
 # Keyed by (font_name_or_None, font_size, text, color); explicitly NOT id(font)
 # because CPython reuses id() after GC. _make_fonts() clears this dict on
@@ -3196,7 +3207,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
     image_cache = {}
     image_cache_ts = {}
     tab_regions = {}
-    tab_image_key = {'drap': 'real-drap', 'aurora': 'drap', 'enlil': 'enlil'}
+    tab_image_key = PROP_TAB_IMAGE_KEY
     dirty_state = {
         'prev_active_tab': None,
         'prev_second': -1,
@@ -3333,7 +3344,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                                  right_w - 4, rh_prop)
             prop_inner = draw_panel(screen, prop_r, 'PROPAGATION', fonts, theme)
             tab_bar = pygame.Rect(prop_inner.x, prop_inner.y, prop_inner.w, 20)
-            tab_regions = draw_tabs(screen, tab_bar, ['drap', 'aurora', 'enlil'],
+            tab_regions = draw_tabs(screen, tab_bar, PROP_TABS,
                                     active_tab, fonts, theme)
             img_rect = pygame.Rect(prop_inner.x, prop_inner.y + 24,
                                    prop_inner.w, prop_inner.h - 24)

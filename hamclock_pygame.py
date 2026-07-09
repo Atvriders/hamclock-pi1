@@ -623,6 +623,20 @@ _CADENCE_S = {
 SCREEN_W = 720    # Tier 2a: native render at 720x450; BCM2835 HVS upscales to 1440x900 in firmware
 SCREEN_H = 450
 
+# Propagation panel tabs (module-level so the wiring is testable and lives in
+# one place). Each tab maps to one of hamclock_data's _IMAGE_ENDPOINTS keys;
+# the render loop resolves the active tab through PROP_TAB_IMAGE_KEY and blits
+# data.images[key]. 'muf' surfaces the KC2G MUF map the server already fetches
+# and rasterizes to PNG for /api/muf-map — decoded lazily only when selected,
+# so idle RAM/FPS on the Pi 1B are unchanged.
+PROP_TABS = ['drap', 'aurora', 'enlil', 'muf']
+PROP_TAB_IMAGE_KEY = {
+    'drap': 'real-drap',
+    'aurora': 'drap',
+    'enlil': 'enlil',
+    'muf': 'muf-map',
+}
+
 # ---- Phase 1b: layout / counts / string / solar caches ----
 # Item 5: panel rect grid is recomputed only when screen size changes; every
 # per-frame pygame.Rect(...) panel allocation now reads from this dict.
@@ -1500,7 +1514,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
     image_cache = {}
     image_cache_ts = {}
     tab_regions = {}
-    tab_image_key = {'drap': 'real-drap', 'aurora': 'drap', 'enlil': 'enlil'}
+    tab_image_key = PROP_TAB_IMAGE_KEY
     dirty_state = {
         'prev_active_tab': None,
         'prev_second': -1,
@@ -1695,7 +1709,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
             if _panel_due('propagation'):
                 prop_inner = draw_panel(screen, prop_r, 'PROPAGATION', fonts, theme)
                 tab_bar = pygame.Rect(prop_inner.x, prop_inner.y, prop_inner.w, 20)
-                tab_regions = draw_tabs(screen, tab_bar, ['drap', 'aurora', 'enlil'],
+                tab_regions = draw_tabs(screen, tab_bar, PROP_TABS,
                                         active_tab, fonts, theme)
                 img_rect = pygame.Rect(prop_inner.x, prop_inner.y + 24,
                                        prop_inner.w, prop_inner.h - 24)
