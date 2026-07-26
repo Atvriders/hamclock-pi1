@@ -6214,6 +6214,22 @@ cleanup_stale_install() {
 echo "Checking for stale files from earlier versions..."
 cleanup_stale_install
 
+# ---- Pre-compile bytecode as root, here, not at service start --------------
+# The hamclock-lite unit runs as User=$SERVICE_USER (non-root) while
+# $INSTALL_DIR is root-owned, so the service user cannot CREATE
+# $INSTALL_DIR/__pycache__. The unit's `compileall` ExecStartPre only ever
+# worked because that directory already happened to exist; once the cleanup
+# above removes it, ExecStartPre dies with PermissionError and systemd refuses
+# to start the service ("control process exited with error code").
+#
+# Compiling here, as root, is also simply the right place: the .py files change
+# only at install time, so there is nothing for a per-start pass to discover.
+# Both variants are produced because PYTHONOPTIMIZE=1 (pygame mode) looks for
+# .opt-1.pyc while browser/tkinter mode looks for the plain .pyc.
+echo "Pre-compiling bytecode..."
+sudo python3 -m compileall -q "$INSTALL_DIR" >/dev/null 2>&1 || true
+sudo python3 -O -m compileall -q "$INSTALL_DIR" >/dev/null 2>&1 || true
+
 # ── Step 5: Create hamclock-lite systemd service ────────────────────
 echo "Creating HamClock server service..."
 # The unit is rewritten on EVERY run (it used to sit inside
@@ -6227,7 +6243,11 @@ LITE_PYGAME_ENV=""
 LITE_PYGAME_PRE=""
 if [ "$KIOSK_MODE" = "pygame" ]; then
     LITE_PYGAME_ENV="Environment=MALLOC_ARENA_MAX=1 PYTHONOPTIMIZE=1 PYTHONDONTWRITEBYTECODE=1"
-    LITE_PYGAME_PRE="ExecStartPre=/usr/bin/python3 -O -m compileall -q /opt/hamclock-lite"
+    # Leading '-': failure here must never block startup. The install already
+    # compiled this as root; the service user cannot write $INSTALL_DIR, so a
+    # non-zero exit is expected whenever anything is genuinely out of date and
+    # is not a reason to refuse to run — worst case Python compiles in memory.
+    LITE_PYGAME_PRE="ExecStartPre=-/usr/bin/python3 -O -m compileall -q /opt/hamclock-lite"
 fi
 # CacheDirectory= makes systemd create/chown /var/cache/hamclock-lite for the
 # service user, which is where server.py persists the fetched images so a warm
