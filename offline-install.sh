@@ -4461,7 +4461,10 @@ def draw_muf_text(screen, rect, solar, fonts, theme):
                   val_x, y + (glyph_h - val_h) // 2, val_w)
         y += pitch
     if foot_h:
-        _blit_fit(screen, foot_f, '(Map available in web UI)', theme['label'],
+        # Was '(Map available in web UI)', which stopped being true once the
+        # native client grew a MUF tab — it sent operators to a browser this
+        # hardware cannot usefully run. Point at the tab that now has the map.
+        _blit_fit(screen, foot_f, 'Map: PROPAGATION > MUF', theme['label'],
                   lab_x, rect.bottom - foot_h, rect.right - lab_x)
 
 
