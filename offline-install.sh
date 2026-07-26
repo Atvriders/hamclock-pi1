@@ -6155,6 +6155,65 @@ if __name__ == '__main__':
     main()
 HCTKEOF
 
+# ── Step 4b: Remove stale files left by earlier versions ────────────
+# $INSTALL_DIR is owned exclusively by this installer, so any program file in it
+# that we no longer ship is a leftover from an older version.
+#
+# Bytecode is the case that actually bites. The pygame unit runs
+# `python3 -O -m compileall` as an ExecStartPre (Tier 1c), and compileall only
+# ever ADDS .pyc files — it never prunes them. A module dropped in a later
+# release therefore leaves an importable orphan in __pycache__ forever, which
+# can shadow a since-renamed import long after the .py is gone. Wiping the cache
+# here costs nothing: the next service start rebuilds it with -O.
+#
+# User state is deliberately out of reach — settings live in /etc/hamclock-lite
+# and cached images in /var/cache/hamclock-lite, both outside $INSTALL_DIR.
+# The systemd units are rewritten unconditionally every run, so they cannot go
+# stale and are not touched here.
+#
+# Set HAMCLOCK_SKIP_CLEAN=1 to skip this step.
+HAMCLOCK_SHIPPED_FILES="server.py index.html hamclock_data.py hamclock_pygame.py hamclock_tkinter.py kiosk.sh"
+
+cleanup_stale_install() {
+    if [ "${HAMCLOCK_SKIP_CLEAN:-0}" = "1" ]; then
+        echo "Skipping stale-file cleanup (HAMCLOCK_SKIP_CLEAN=1)"
+        return 0
+    fi
+    [ -d "$INSTALL_DIR" ] || return 0
+
+    _hc_cleaned=0
+
+    if [ -d "$INSTALL_DIR/__pycache__" ]; then
+        sudo rm -rf "$INSTALL_DIR/__pycache__"
+        echo "  removed stale bytecode cache (__pycache__/)"
+        _hc_cleaned=$((_hc_cleaned + 1))
+    fi
+
+    # Only file types we have ever shipped, so a file the operator deliberately
+    # parked here is left alone rather than silently deleted.
+    for _hc_stale in "$INSTALL_DIR"/*.py "$INSTALL_DIR"/*.pyc "$INSTALL_DIR"/*.pyo \
+                     "$INSTALL_DIR"/*.html "$INSTALL_DIR"/*.sh "$INSTALL_DIR"/*.bak \
+                     "$INSTALL_DIR"/*.orig "$INSTALL_DIR"/*.rej "$INSTALL_DIR"/*.tmp \
+                     "$INSTALL_DIR"/*~; do
+        [ -f "$_hc_stale" ] || continue
+        _hc_base=$(basename "$_hc_stale")
+        case " $HAMCLOCK_SHIPPED_FILES " in
+            *" $_hc_base "*) continue ;;
+        esac
+        sudo rm -f "$_hc_stale"
+        echo "  removed stale file: $_hc_base"
+        _hc_cleaned=$((_hc_cleaned + 1))
+    done
+
+    if [ "$_hc_cleaned" -gt 0 ]; then
+        echo "Cleaned $_hc_cleaned stale item(s) from $INSTALL_DIR"
+    fi
+    return 0
+}
+
+echo "Checking for stale files from earlier versions..."
+cleanup_stale_install
+
 # ── Step 5: Create hamclock-lite systemd service ────────────────────
 echo "Creating HamClock server service..."
 # The unit is rewritten on EVERY run (it used to sit inside
