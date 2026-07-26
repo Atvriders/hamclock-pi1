@@ -620,6 +620,21 @@ _CADENCE_S = {
     'propagation': 60.0,
 }
 
+# Tier 2.5: cadence for the two image panels while they have NO decoded image
+# to show. Their body is then a status line ("fetching...", "feed down /
+# retry 15s"), and a countdown that only moves once a minute reads as a hang —
+# which is the exact confusion this tier exists to remove.
+# Deliberately 15 s and not 5 s: "no image" is a *persistent* state during an
+# outage, not a transient, so a 5 s cadence would be a 12x idle-CPU and
+# glyph/redraw amplifier on a single-core ARMv6 box for precisely the hours
+# when the box is least able to spare it. 15 s also lines up with the fastest
+# rung of hamclock_data.IMAGE_RETRY_BACKOFF once the streak is a few deep.
+# Never faster than its _CADENCE_S entry, and only for keys that have one.
+_CADENCE_S_NO_IMAGE = {
+    'sdo': 15.0,
+    'propagation': 15.0,
+}
+
 SCREEN_W = 720    # Tier 2a: native render at 720x450; BCM2835 HVS upscales to 1440x900 in firmware
 SCREEN_H = 450
 
@@ -657,12 +672,26 @@ def _get_layout(screen_size):
     mid_w = int(sw * (936 - 288) / 1440)
     right_w = sw - left_w - mid_w
     panel_gap = 4
+    # Tier 1.1: the left column's six panels share content_h minus 6x26 px of
+    # panel chrome (title bar + padding, see _panel_inner_rect) and 5x4 px of
+    # gap — at 720x450 that is 396 - 176 = 220 px of usable content for the
+    # whole column. The old split gave BANDS 12 % (a 21 px inner rect) which
+    # cannot hold its header row plus four band rows at ANY font size, and
+    # gave GEOMAG/X-RAY 10 % (13 px) for a text row plus a bar. These weights
+    # size each panel to what its draw function actually needs at the 8-11 px
+    # fonts _make_fonts builds for the 720x450 framebuffer:
+    #   solar  53 px = 5 rows x 10 px pitch + 11 px glyph (2 columns of 5)
+    #   bands  53 px = header + 4 band rows, same pitch
+    #   sdo    53 px of image (letterboxed square)
+    #   geomag 17 px = 11 px value row + 6 px bar   (x-ray identical)
+    #   open   27 px = 2 wrapped label rows
+    # Everything stays fractional, so 1440x900 scales up unchanged in shape.
     heights = [
         int(content_h * 0.20),  # solar
-        int(content_h * 0.12),  # bands
-        int(content_h * 0.28),  # sdo
-        int(content_h * 0.10),  # geomag
-        int(content_h * 0.10),  # xray
+        int(content_h * 0.20),  # bands
+        int(content_h * 0.20),  # sdo
+        int(content_h * 0.11),  # geomag
+        int(content_h * 0.11),  # xray
     ]
     heights.append(content_h - sum(heights) - panel_gap * 5)
     titles = ['solar', 'bands', 'sdo', 'geomag', 'xray', 'open_bands']
@@ -899,7 +928,18 @@ def _blit_text(screen, font, text, color, x, y):
             try:
                 disp = pygame.display.get_surface()
                 if disp is not None:
-                    surf = surf.convert(disp)
+                    # An antialiased render (the 'title' font, see _make_fonts)
+                    # comes back as a 32-bit SRCALPHA surface whose RGB is the
+                    # text colour EVERYWHERE — the glyph shape lives entirely
+                    # in the alpha channel. Surface.convert() drops that
+                    # channel, so every AA'd string painted as a solid filled
+                    # rectangle: the 'HAMCLOCK LITE' banner and all five MUF
+                    # STATUS values were unreadable blocks on the real display
+                    # as well as headless. Keep the alpha for those.
+                    if surf.get_flags() & pygame.SRCALPHA:
+                        surf = surf.convert_alpha(disp)
+                    else:
+                        surf = surf.convert(disp)
             except Exception:
                 pass
             _glyph_cache[key] = surf
@@ -913,10 +953,85 @@ def _blit_text(screen, font, text, color, x, y):
         return 0
 
 
+def _fit_text(font, text, max_w):
+    """Return `text` truncated so it renders within `max_w` px.
+
+    Tier 1.1: at the 720x450 native framebuffer the narrowest panel content
+    rect is 128 px, so a long value ('Very Unsettled', a 10-char spotter)
+    would otherwise paint straight over the panel border and into its
+    neighbour. Fast path is a single Font.size() and the original string back
+    (no allocation); the binary search only runs when the text overflows, and
+    only on a panel's cadence tick, not per frame.
+    """
+    try:
+        if max_w <= 0:
+            return ''
+        if font.size(text)[0] <= max_w:
+            return text
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font.size(text[:mid])[0] <= max_w:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo]
+    except Exception:
+        return text
+
+
+def _blit_fit(screen, font, text, color, x, y, max_w):
+    """_blit_text with a hard width clamp. See _fit_text."""
+    return _blit_text(screen, font, _fit_text(font, text, max_w), color, x, y)
+
+
+def _smoothscale_safe(surface, size):
+    """smoothscale that cannot raise on a sub-24-bit source surface.
+
+    pygame.transform.smoothscale accepts only 24- and 32-bit surfaces and
+    raises ValueError("Only 24-bit or 32-bit surfaces can be smoothly
+    scaled") on 8bpp AND 16bpp (verified, pygame 2.6.1). Both depths occur on
+    the shipped Pi: 10-monitor.conf sets DefaultDepth 16, and /api/real-drap
+    — the DEFAULT propagation tab — decodes as an 8bpp palettised PNG. Every
+    image panel would then silently paint nothing via draw_image's bare
+    `except Exception: pass`.
+
+    Promote to 24-bit and retry; if even that fails, fall back to
+    transform.scale, which is nearest-neighbour but depth-agnostic (a coarse
+    image beats a blank panel). Deliberately NOT a convert() against a
+    template built from pygame.display.get_surface().get_flags(): the display
+    is created with pygame.FULLSCREEN, so get_flags() returns 2164260864
+    (> INT32_MAX) and Surface((w, h), flags, ...) raises OverflowError.
+    """
+    try:
+        if surface.get_bitsize() < 24:
+            try:
+                surface = surface.convert(24)
+            except Exception:
+                return pygame.transform.scale(surface, size)
+        return pygame.transform.smoothscale(surface, size)
+    except Exception:
+        return pygame.transform.scale(surface, size)
+
+
 def _load_image(data_bytes):
     """Decode JPEG/PNG bytes into a Pygame surface, or None on failure."""
     if not data_bytes:
         return None
+    # Tier 1.5: never hand SVG to SDL_image. nanosvg happily "succeeds" on the
+    # 365 KB KC2G MUF vector in 104-193 ms on x86 (3.1-5.2 s on ARMv6) and
+    # yields a 1526x905 / 5,524,120-byte surface — ~11 MB peak once .convert()
+    # copies it — on a 512 MB box, in pure greyscale because nanosvg ignores
+    # the CSS that carries the contour colours. That is a multi-second
+    # render-loop freeze every 900 s for a panel that is 236x102 px and would
+    # be unreadable anyway. The server is meant to send PNG; if it ever falls
+    # back to the raw vector we want a blank panel, not a stall.
+    try:
+        head = data_bytes[:256].lstrip()
+        if head[:5] == b'<?xml' or head[:4] == b'<svg':
+            return None
+    except Exception:
+        pass
     for hint in ('x.jpg', 'x.png'):
         try:
             return pygame.image.load_extended(io.BytesIO(data_bytes), hint).convert()
@@ -954,11 +1069,18 @@ def draw_header(screen, rect, callsign, fonts, theme, data=None):
     frame, eliminating per-frame strftime + Font.render churn."""
     pygame.draw.rect(screen, theme['card'], rect)
     pygame.draw.rect(screen, theme['border'], rect, 1)
-    _blit_text(screen, fonts['title'], 'HAMCLOCK LITE', theme['accent'],
-               rect.x + 8, rect.y + 4)
+    # Tier 1.1: columns are fractions of rect.w so the header keeps its shape
+    # at the 720x450 framebuffer instead of assuming the old 1440 px width.
+    title_x = rect.x + 8
+    call_x = rect.x + int(rect.w * 0.30)
+    utc_x = rect.x + int(rect.w * 0.53)
+    loc_x = rect.x + int(rect.w * 0.75)
+    dot_x = rect.x + rect.w - 18
+    _blit_fit(screen, fonts['title'], 'HAMCLOCK LITE', theme['accent'],
+              title_x, rect.y + 4, call_x - title_x - 4)
     if callsign:
-        _blit_text(screen, fonts['body'], str(callsign), theme['bright'],
-                   rect.x + 220, rect.y + 8)
+        _blit_fit(screen, fonts['body'], str(callsign), theme['bright'],
+                  call_x, rect.y + 8, utc_x - call_x - 4)
     if data is not None:
         cached = _formatted_strings(data)
         utc_str = cached["utc"]
@@ -969,13 +1091,12 @@ def draw_header(screen, rect, callsign, fonts, theme, data=None):
             local_str = 'LOC ' + time.strftime('%H:%M:%S')
         except Exception:
             utc_str = local_str = '--:--:--'
-    _blit_text(screen, fonts['body'], utc_str, theme['fg'],
-               rect.x + rect.w - 340, rect.y + 8)
-    _blit_text(screen, fonts['body'], local_str, theme['fg'],
-               rect.x + rect.w - 180, rect.y + 8)
+    _blit_fit(screen, fonts['body'], utc_str, theme['fg'],
+              utc_x, rect.y + 8, loc_x - utc_x - 4)
+    _blit_fit(screen, fonts['body'], local_str, theme['fg'],
+              loc_x, rect.y + 8, dot_x - 6 - loc_x)
     dot_color = theme['good'] if (int(time.time()) % 2 == 0) else theme['fair']
-    pygame.draw.circle(screen, dot_color,
-                       (rect.x + rect.w - 18, rect.y + 14), 5)
+    pygame.draw.circle(screen, dot_color, (dot_x, rect.y + 14), 5)
 
 
 def draw_solar(screen, rect, solar, fonts, theme, data_refresh_ts=None):
@@ -1003,12 +1124,36 @@ def draw_solar(screen, rect, solar, fonts, theme, data_refresh_ts=None):
             ('S/N', _safe(solar, 'signalNoise')),
             ('foF2', _safe(solar, 'fof2')),
         ]
-    y = rect.y
-    for label, value in rows:
-        _blit_text(screen, fonts['label'], label, theme['label'], rect.x, y)
-        _blit_text(screen, fonts['body'], str(value), theme['bright'],
-                   rect.x + 70, y - 1)
-        y += 16
+    # Tier 1.1: ten label/value rows at the old fixed pitch 16 needed 160 px;
+    # the SOLAR content rect at 720x450 is 128x53. Derive the pitch from the
+    # font and wrap into as many columns as it takes to fit, so the panel
+    # degrades by getting narrower cells rather than by painting over its
+    # neighbours. Values are clamped to their cell width.
+    lab_f, val_f = fonts['label'], fonts['body']
+    lab_h, val_h = lab_f.get_height(), val_f.get_height()
+    glyph_h = max(lab_h, val_h)
+    n = len(rows)
+    if n == 0 or rect.w <= 0 or rect.h < glyph_h:
+        return
+    ncols, per_col = 1, n
+    for ncols in range(1, 5):
+        per_col = -(-n // ncols)
+        if (per_col - 1) * lab_h + glyph_h <= rect.h:
+            break
+    pitch = lab_h if per_col < 2 else max(
+        lab_h, min(lab_h + 4, (rect.h - glyph_h) // (per_col - 1)))
+    col_w = rect.w // ncols
+    val_x = min(col_w // 2, lab_f.size('MMMMMM')[0] + 4)
+    lab_w = val_x - 2
+    val_w = col_w - val_x - 2
+    for i, (label, value) in enumerate(rows):
+        y = rect.y + (i % per_col) * pitch
+        if y + glyph_h > rect.bottom:
+            continue
+        cx = rect.x + (i // per_col) * col_w
+        _blit_fit(screen, lab_f, label, theme['label'], cx, y, lab_w)
+        _blit_fit(screen, val_f, str(value), theme['bright'],
+                  cx + val_x, y, val_w)
 
 
 def draw_bands(screen, rect, bands, fonts, theme):
@@ -1022,55 +1167,152 @@ def draw_bands(screen, rect, bands, fonts, theme):
         'Good': theme['good'], 'Fair': theme['fair'],
         'Poor': theme['poor'], 'N/A': theme['na'],
     }
-    _blit_text(screen, fonts['label'], 'BAND',  theme['label'], rect.x, rect.y)
-    _blit_text(screen, fonts['label'], 'DAY',   theme['label'], rect.x + 100, rect.y)
-    _blit_text(screen, fonts['label'], 'NIGHT', theme['label'], rect.x + 160, rect.y)
-    y = rect.y + 16
+    # Tier 1.1: DAY at +100 and NIGHT at +160 were absolute pixels for the
+    # 1440x900 dashboard; the BANDS content rect at 720x450 is 128 px wide, so
+    # NIGHT was drawn 32 px past the panel's right border. Columns are now
+    # fractions of rect.w and the row pitch comes from the font.
+    lab_f, val_f = fonts['label'], fonts['body']
+    lab_h, glyph_h = lab_f.get_height(), max(fonts['label'].get_height(),
+                                             val_f.get_height())
+    if rect.w <= 0 or rect.h < glyph_h:
+        return
+    n = len(groups) + 1                       # header row + one row per group
+    pitch = max(lab_h, min(lab_h + 4, (rect.h - glyph_h) // max(1, n - 1)))
+    name_x = rect.x
+    day_x = rect.x + int(rect.w * 0.42)
+    night_x = rect.x + int(rect.w * 0.71)
+    name_w = day_x - name_x - 2
+    day_w = night_x - day_x - 2
+    night_w = rect.right - night_x
+    _blit_fit(screen, lab_f, 'BAND', theme['label'], name_x, rect.y, name_w)
+    _blit_fit(screen, lab_f, 'DAY', theme['label'], day_x, rect.y, day_w)
+    _blit_fit(screen, lab_f, 'NIGHT', theme['label'], night_x, rect.y, night_w)
+    y = rect.y + pitch
     for name, keys in groups:
+        if y + glyph_h > rect.bottom:
+            break
         entry = bands.get(keys[0], {}) if isinstance(bands, dict) else {}
         day = entry.get('day', 'N/A') if isinstance(entry, dict) else 'N/A'
         night = entry.get('night', 'N/A') if isinstance(entry, dict) else 'N/A'
-        _blit_text(screen, fonts['body'], name, theme['fg'], rect.x, y)
-        _blit_text(screen, fonts['body'], str(day),
-                   cond.get(day, theme['fg']), rect.x + 100, y)
-        _blit_text(screen, fonts['body'], str(night),
-                   cond.get(night, theme['fg']), rect.x + 160, y)
-        y += 16
+        _blit_fit(screen, val_f, name, theme['fg'], name_x, y, name_w)
+        _blit_fit(screen, val_f, str(day),
+                  cond.get(day, theme['fg']), day_x, y, day_w)
+        _blit_fit(screen, val_f, str(night),
+                  cond.get(night, theme['fg']), night_x, y, night_w)
+        y += pitch
+
+
+def _draw_status_lines(screen, rect, text, font, color,
+                       top=True, backdrop=None):
+    """Paint up to two short status lines inside rect. Never raises.
+
+    Tier 2.5. `text` may carry a single '\\n' to split a status into a head
+    ("D-layer: feed down") and a detail ("retry 15s"); at the 128x53 SDO
+    content rect a 7 px monospace font fits ~25 characters, so two short
+    lines read where one long one is truncated to noise.
+
+    Allocation stays bounded: the vocabulary is a handful of fixed strings
+    plus one coarse ETA/age token, all absorbed by _blit_text's glyph cache,
+    and this only runs on a cadenced redraw (>= 15 s apart), never per frame.
+    Every write is clamped inside rect so tests/test_panel_containment.py
+    stays green at 720x450.
+    """
+    try:
+        if not text or rect.w <= 8 or rect.h <= 0:
+            return
+        gh = font.get_height()
+        if gh <= 0 or rect.h < gh:
+            return
+        lines = text.split('\n') if '\n' in text else (text,)
+        n = max(1, min(2, len(lines), rect.h // gh))
+        if top:
+            y = rect.y + min(6, rect.h - n * gh)
+        else:
+            # Bottom-anchored, over a painted image: lay a card-coloured bar
+            # first or the text fights the pixels underneath it.
+            y = max(rect.y, rect.bottom - n * gh - 1)
+            if backdrop is not None:
+                bar = pygame.Rect(rect.x, y, rect.w,
+                                  min(rect.bottom - y, n * gh + 1))
+                if bar.h > 0:
+                    pygame.draw.rect(screen, backdrop, bar)
+        for i in range(n):
+            _blit_fit(screen, font, lines[i], color,
+                      rect.x + 6, y, rect.w - 8)
+            y += gh
+    except Exception:
+        pass
 
 
 def draw_image(screen, rect, surface, fonts=None, theme=None,
-               image_key=None, fetched_at=None):
+               image_key=None, fetched_at=None, status=None):
+    """Blit `surface` into `rect`, with an honest status line.
+
+    Tier 2.5. `status` is appended LAST on purpose — tests/test_perf_alloc.py
+    and tests/test_themes.py:277 call this with up to five positional
+    arguments. It is the (possibly None) return of _image_status_text; None
+    means "nothing worth saying" and the panel renders exactly as it did
+    before this tier.
+
+    Two placements, because both states are real on a Pi:
+      * no decoded image -> the status IS the panel body, so an operator can
+        tell "fetching, retry in ~15 s" from "feed is down" from "bytes
+        arrived but will not decode" instead of staring at a permanent
+        "image loading..." that means all three;
+      * an image is painted but the status is non-empty -> label it over the
+        bottom of the image. _get_cached_image keeps serving the last good
+        surface, so a stale or newly-undecodable payload would otherwise be
+        invisible; serve-stale without an age label is worse than blank for
+        someone making a band decision.
+    """
     if surface is None:
         if fonts is not None and 'tiny' in fonts:
             label_color = theme['label'] if theme is not None else (184, 160, 216)
-            _blit_text(screen, fonts['tiny'], 'image loading...',
-                       label_color, rect.x + 6, rect.y + 6)
+            # Tier 1.1: the SDO content rect is 128x53 at 720x450 — clamp the
+            # placeholder to it instead of trusting a 1440-wide panel.
+            _draw_status_lines(
+                screen, rect,
+                status if isinstance(status, str) and status
+                else 'image loading...',
+                fonts['tiny'], label_color, top=True)
         return
     try:
         iw, ih = surface.get_size()
-        if iw == 0 or ih == 0:
+        if iw == 0 or ih == 0 or rect.w <= 0 or rect.h <= 0:
             return
         scale = min(rect.w / iw, rect.h / ih)
         nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+        if nw > rect.w or nh > rect.h:
+            # Rounding at extreme aspect ratios can push the 1 px floor past
+            # the rect; a panel too small to show anything shows nothing.
+            return
         if scale >= 1.0:
             scaled = surface
         elif image_key is not None and fetched_at is not None:
             key = (image_key, float(fetched_at), (nw, nh))
             scaled = _scaled_cache.get(key)
             if scaled is None:
-                scaled = pygame.transform.smoothscale(surface, (nw, nh))
+                scaled = _smoothscale_safe(surface, (nw, nh))
                 _scaled_cache[key] = scaled
                 if len(_scaled_cache) > _SCALED_CACHE_CAP:
                     _scaled_cache.popitem(last=False)
             else:
                 _scaled_cache.move_to_end(key)
         else:
-            scaled = pygame.transform.smoothscale(surface, (nw, nh))
+            scaled = _smoothscale_safe(surface, (nw, nh))
         x = rect.x + (rect.w - nw) // 2
         y = rect.y + (rect.h - nh) // 2
         screen.blit(scaled, (x, y))
     except Exception:
         pass
+    # Outside the try above: a scale/blit failure must not also silence the
+    # label that explains what the operator is (or is not) looking at.
+    if isinstance(status, str) and status and fonts is not None and 'tiny' in fonts:
+        _draw_status_lines(
+            screen, rect, status, fonts['tiny'],
+            theme['accent'] if theme is not None else (244, 197, 92),
+            top=False,
+            backdrop=theme['card'] if theme is not None else (0, 0, 0))
 
 
 def draw_bar(screen, rect, value, vmax, color, theme):
@@ -1086,6 +1328,38 @@ def draw_bar(screen, rect, value, vmax, color, theme):
         pygame.draw.rect(screen, color, inner)
 
 
+def _draw_value_and_bar(screen, rect, text, value, vmax, color, fonts, theme):
+    """Shared GEOMAGNETIC / X-RAY FLUX body: a value row plus a gauge bar.
+
+    Tier 1.1: both panels used to blit the value at rect.y + 2 and the bar at
+    a fixed rect.y + 20 with a fixed height of 10 — 30 px of content in a
+    content rect that is 17 px tall at 720x450, so the bar was painted over
+    the panel border and into the next panel. The bar now stacks below the
+    value when there is room and sits beside it when there is not.
+    """
+    f = fonts['body']
+    gh = f.get_height()
+    if rect.w <= 0 or rect.h <= 0:
+        return
+    if rect.h >= gh + 4:
+        _blit_fit(screen, f, text, theme['bright'], rect.x, rect.y, rect.w)
+        bar_x, bar_w = rect.x, rect.w
+        bar_y = rect.y + gh + 1
+        bar_h = min(10, rect.bottom - bar_y)
+    else:
+        # No room to stack: value on the left, gauge filling what is left.
+        if rect.h >= gh:
+            _blit_fit(screen, f, text, theme['bright'], rect.x, rect.y,
+                      max(0, int(rect.w * 0.45) - 4))
+        bar_x = rect.x + int(rect.w * 0.45)
+        bar_w = rect.right - bar_x
+        bar_h = min(10, rect.h)
+        bar_y = rect.y + (rect.h - bar_h) // 2
+    if bar_w > 0 and bar_h >= 2:
+        draw_bar(screen, pygame.Rect(bar_x, bar_y, bar_w, bar_h),
+                 value, vmax, color, theme)
+
+
 def draw_muf_text(screen, rect, solar, fonts, theme):
     rows = [
         ('FOF2',   '{} MHz'.format(_safe(solar, 'fof2'))),
@@ -1094,15 +1368,35 @@ def draw_muf_text(screen, rect, solar, fonts, theme):
         ('SFI',    _safe(solar, 'sfi')),
         ('SSN',    _safe(solar, 'ssn')),
     ]
-    y = rect.y + 20
+    # Tier 1.1: pitch 44 and the +20/+140 columns were absolute pixels. Keep
+    # the same look where there is room (the MUF panel is the roomy one, 308
+    # px wide at 720x450) but derive both from the rect so a smaller panel
+    # compresses instead of overflowing.
+    lab_f, val_f, foot_f = fonts['panel'], fonts['title'], fonts['small']
+    val_h = val_f.get_height()
+    glyph_h = max(lab_f.get_height(), val_h)
+    if rect.w <= 0 or rect.h < glyph_h:
+        return
+    foot_h = foot_f.get_height() + 4 if rect.h >= glyph_h * 2 + 12 else 0
+    n = len(rows)
+    top = rect.y + min(20, max(0, (rect.h - foot_h - glyph_h) // 4))
+    avail = rect.bottom - foot_h - top - glyph_h
+    pitch = max(glyph_h + 1, min(44, avail // max(1, n - 1)))
+    lab_x = rect.x + int(rect.w * 0.06)
+    val_x = rect.x + int(rect.w * 0.45)
+    lab_w = val_x - lab_x - 2
+    val_w = rect.right - val_x
+    y = top
     for label, value in rows:
-        _blit_text(screen, fonts['panel'], label, theme['label'],
-                   rect.x + 20, y)
-        _blit_text(screen, fonts['title'], str(value), theme['bright'],
-                   rect.x + 140, y - 4)
-        y += 44
-    _blit_text(screen, fonts['small'], '(Map available in web UI)',
-               theme['label'], rect.x + 20, rect.y + rect.h - 20)
+        if y + glyph_h > rect.bottom - foot_h:
+            break
+        _blit_fit(screen, lab_f, label, theme['label'], lab_x, y, lab_w)
+        _blit_fit(screen, val_f, str(value), theme['bright'],
+                  val_x, y + (glyph_h - val_h) // 2, val_w)
+        y += pitch
+    if foot_h:
+        _blit_fit(screen, foot_f, '(Map available in web UI)', theme['label'],
+                  lab_x, rect.bottom - foot_h, rect.right - lab_x)
 
 
 def draw_dx_spots(screen, rect, dxspots, fonts, theme):
@@ -1112,29 +1406,42 @@ def draw_dx_spots(screen, rect, dxspots, fonts, theme):
     # _run_render_loop; fall back to building it inline so callers that
     # short-circuit the loop (tests, recovery overlay) still work.
     band_lut = theme.get('_band_lut') or dict(zip(HF_BANDS, theme['band_palette']))
-    _blit_text(screen, fonts['label'], 'FREQ',    theme['label'], rect.x, rect.y)
-    _blit_text(screen, fonts['label'], 'BND',     theme['label'], rect.x + 90, rect.y)
-    _blit_text(screen, fonts['label'], 'DX',      theme['label'], rect.x + 140, rect.y)
-    _blit_text(screen, fonts['label'], 'SPOTTER', theme['label'], rect.x + 230, rect.y)
-    _blit_text(screen, fonts['label'], 'TIME',    theme['label'], rect.x + 340, rect.y)
-    y = rect.y + 16
+    # Tier 1.1: the +90/+140/+230/+340 columns assumed a 488 px panel; the DX
+    # SPOTS content rect at 720x450 is 236 px wide, so SPOTTER and TIME landed
+    # outside it entirely. Column starts are now fractions of rect.w (the same
+    # proportions the 1440 layout had) and every cell is width-clamped.
+    lab_f, val_f = fonts['label'], fonts['body']
+    glyph_h = max(lab_f.get_height(), val_f.get_height())
+    if rect.w <= 0 or rect.h < glyph_h:
+        return
+    fracs = (0.0, 0.26, 0.40, 0.60, 0.85)
+    xs = [rect.x + int(rect.w * f) for f in fracs]
+    ws = [xs[i + 1] - xs[i] - 4 for i in range(4)] + [rect.right - xs[4]]
+    n_rows = 1 + 5
+    pitch = max(lab_f.get_height(),
+                min(lab_f.get_height() + 4,
+                    (rect.h - glyph_h) // max(1, n_rows - 1)))
+    for i, head in enumerate(('FREQ', 'BND', 'DX', 'SPOTTER', 'TIME')):
+        _blit_fit(screen, lab_f, head, theme['label'], xs[i], rect.y, ws[i])
+    y = rect.y + pitch
     for spot in dxspots[:5]:
         if not isinstance(spot, dict):
             continue
+        if y + glyph_h > rect.bottom:
+            break
         freq = _safe(spot, 'frequency')
         band = _safe(spot, 'band')
         dx = _safe(spot, 'dxCall')
         spotter = _safe(spot, 'spotter')
         tm = _safe(spot, 'time')
-        _blit_text(screen, fonts['body'], str(freq), theme['accent'], rect.x, y)
-        _blit_text(screen, fonts['body'], str(band),
-                   band_lut.get(str(band), theme['fg']), rect.x + 90, y)
-        _blit_text(screen, fonts['body'], str(dx), theme['bright'], rect.x + 140, y)
-        _blit_text(screen, fonts['body'], str(spotter)[:10], theme['fg'],
-                   rect.x + 230, y)
-        _blit_text(screen, fonts['body'], str(tm), theme['label'],
-                   rect.x + 340, y)
-        y += 16
+        _blit_fit(screen, val_f, str(freq), theme['accent'], xs[0], y, ws[0])
+        _blit_fit(screen, val_f, str(band),
+                  band_lut.get(str(band), theme['fg']), xs[1], y, ws[1])
+        _blit_fit(screen, val_f, str(dx), theme['bright'], xs[2], y, ws[2])
+        _blit_fit(screen, val_f, str(spotter)[:10], theme['fg'],
+                  xs[3], y, ws[3])
+        _blit_fit(screen, val_f, str(tm), theme['label'], xs[4], y, ws[4])
+        y += pitch
 
 
 def draw_band_activity(screen, rect, dxspots, fonts, theme):
@@ -1151,36 +1458,65 @@ def draw_band_activity(screen, rect, dxspots, fonts, theme):
     vmax = max(_band_counts) if any(_band_counts) else 1
     # Tier-1a perf: same theme-cached LUT as draw_dx_spots.
     band_lut = theme.get('_band_lut') or dict(zip(HF_BANDS, theme['band_palette']))
-    label_w = 40
-    count_w = 36
-    row_h = max(14, (rect.h - 4) // len(HF_BANDS))
-    y = rect.y + 2
+    # Tier 1.1: `row_h = max(14, ...)` forced 10 x 14 = 140 px of rows into a
+    # content rect that is 100 px tall at 720x450 — the floor was the bug, not
+    # the divisor. Pitch is now the rect's share per band (capped so a tall
+    # 1440 panel does not stretch the bars absurdly) and the label/count
+    # gutters are fractions of rect.w rather than 40/36 absolute px.
+    lab_f = fonts['label']
+    glyph_h = lab_f.get_height()
+    n = len(HF_BANDS)
+    if rect.w <= 0 or rect.h < glyph_h:
+        return
+    row_h = max(1, min(rect.h // n, glyph_h + 10))
+    label_w = min(rect.w, max(glyph_h * 2, int(rect.w * 0.17)))
+    count_w = max(0, min(rect.w - label_w, max(glyph_h * 2,
+                                               int(rect.w * 0.15))))
+    bar_w = rect.w - label_w - count_w
+    count_pad = 2 if count_w > 4 else 0
+    count_x = rect.right - count_w + count_pad
+    y = rect.y
     for i, band in enumerate(HF_BANDS):
+        if y + glyph_h > rect.bottom:
+            break
         c = _band_counts[i]
-        _blit_text(screen, fonts['label'], band, theme['label'], rect.x, y + 1)
-        bar_rect = pygame.Rect(rect.x + label_w, y + 2,
-                               max(1, rect.w - label_w - count_w), row_h - 4)
-        draw_bar(screen, bar_rect, c, vmax,
-                 band_lut.get(band, theme['fg']), theme)
-        _blit_text(screen, fonts['label'], str(c), theme['bright'],
-                   rect.x + rect.w - count_w + 4, y + 1)
+        _blit_fit(screen, lab_f, band, theme['label'], rect.x, y,
+                  label_w - 2)
+        bar_h = min(max(2, row_h - 3), rect.bottom - y - 1)
+        if bar_w > 2 and bar_h >= 2:
+            bar_rect = pygame.Rect(rect.x + label_w, y + 1, bar_w, bar_h)
+            draw_bar(screen, bar_rect, c, vmax,
+                     band_lut.get(band, theme['fg']), theme)
+        _blit_fit(screen, lab_f, str(c), theme['bright'],
+                  count_x, y, count_w - 2)
         y += row_h
 
 
 def draw_tabs(screen, rect, tabs, active, fonts, theme):
     """Draw a tab bar across rect.y (height 20). Returns {name: Rect}."""
     regions = {}
-    if not tabs:
+    if not tabs or rect.w <= 0 or rect.h <= 0:
         return regions
     tw = rect.w // len(tabs)
+    if tw < 4:
+        # Tier 1.1: `tw - 2` goes negative below two tabs' worth of width and
+        # pygame normalises a negative-width Rect by moving its left edge, so
+        # the chrome would be painted to the LEFT of the bar.
+        return regions
+    f = fonts['panel']
+    fh = f.get_height()
+    th = min(20, rect.h)
+    pad = min(8, max(1, tw // 6))
+    ty = rect.y + min(2, max(0, th - fh))
     for i, name in enumerate(tabs):
-        tab_rect = pygame.Rect(rect.x + i * tw, rect.y, tw - 2, 20)
+        tab_rect = pygame.Rect(rect.x + i * tw, rect.y, max(1, tw - 2), th)
         color = theme['border'] if name == active else theme['card']
         pygame.draw.rect(screen, color, tab_rect)
         pygame.draw.rect(screen, theme['border'], tab_rect, 1)
         text_color = theme['accent'] if name == active else theme['label']
-        _blit_text(screen, fonts['panel'], name.upper(), text_color,
-                   tab_rect.x + 8, tab_rect.y + 2)
+        if th >= fh:
+            _blit_fit(screen, f, name.upper(), text_color,
+                      tab_rect.x + pad, ty, tab_rect.w - pad - 1)
         regions[name] = tab_rect
     return regions
 
@@ -1200,10 +1536,8 @@ def draw_geomag(screen, rect, solar, fonts, theme, data_refresh_ts=None):
     color = (theme['good'] if kp_val < 4
              else theme['fair'] if kp_val < 6
              else theme['poor'])
-    _blit_text(screen, fonts['body'], 'Kp {}'.format(kp), theme['bright'],
-               rect.x, rect.y + 2)
-    bar_rect = pygame.Rect(rect.x, rect.y + 20, rect.w, 10)
-    draw_bar(screen, bar_rect, kp_val, 9.0, color, theme)
+    _draw_value_and_bar(screen, rect, 'Kp {}'.format(kp), kp_val, 9.0,
+                        color, fonts, theme)
 
 
 def draw_xray(screen, rect, solar, fonts, theme, data_refresh_ts=None):
@@ -1225,17 +1559,27 @@ def draw_xray(screen, rect, solar, fonts, theme, data_refresh_ts=None):
     color = (theme['good'] if value < 2
              else theme['fair'] if value < 3
              else theme['poor'])
-    _blit_text(screen, fonts['body'], s, theme['bright'], rect.x, rect.y + 2)
-    bar_rect = pygame.Rect(rect.x, rect.y + 20, rect.w, 10)
-    draw_bar(screen, bar_rect, value, 5.0, color, theme)
+    _draw_value_and_bar(screen, rect, s, value, 5.0, color, fonts, theme)
 
 
 def draw_open_bands(screen, rect, bands, fonts, theme, data_refresh_ts=None):
     """Item 7: build the OPEN / CLOSED labels once per data refresh; until
     the next refresh tick we just read the cached strings."""
     o, c = _open_bands_strings(bands, data_refresh_ts)
-    _blit_text(screen, fonts['label'], o, theme['good'], rect.x, rect.y)
-    _blit_text(screen, fonts['label'], c, theme['poor'], rect.x, rect.y + 16)
+    # Tier 1.1: 'OPEN: 80m-40m, 30m-20m, 17m-15m' is 31 chars — 155 px in the
+    # label font, in a content rect 128 px wide at 720x450. Step down to the
+    # smaller face before truncating so the band list survives, and derive the
+    # second row's offset from the font instead of a fixed 16 px.
+    f = fonts['label']
+    if rect.w > 0 and (f.size(o)[0] > rect.w or f.size(c)[0] > rect.w):
+        f = fonts['small']
+    gh = f.get_height()
+    if rect.h < gh:
+        return
+    pitch = min(gh + 6, rect.h - gh)
+    _blit_fit(screen, f, o, theme['good'], rect.x, rect.y, rect.w)
+    if pitch > 0:
+        _blit_fit(screen, f, c, theme['poor'], rect.x, rect.y + pitch, rect.w)
 
 
 def draw_status_bar(screen, rect, data, fonts, theme):
@@ -1244,24 +1588,223 @@ def draw_status_bar(screen, rect, data, fonts, theme):
     pygame.draw.rect(screen, theme['card'], rect)
     pygame.draw.rect(screen, theme['border'], rect, 1)
     text = _formatted_strings(data)["status"]
-    _blit_text(screen, fonts['small'], text, theme['label'],
-               rect.x + 6, rect.y + 4)
-    _blit_text(screen, fonts['small'], 'ESC/Q to quit', theme['label'],
-               rect.x + rect.w - 110, rect.y + 4)
+    f = fonts['small']
+    # Tier 1.1: the quit hint was pinned 110 px from the right edge, which is
+    # a different fraction of a 720 px bar than of a 1440 px one; place it by
+    # its measured width and give the status string the rest.
+    hint = 'ESC/Q to quit'
+    hint_x = max(rect.x, rect.right - 6 - f.size(hint)[0])
+    ty = rect.y + max(0, min(4, rect.h - f.get_height()))
+    _blit_fit(screen, f, text, theme['label'], rect.x + 6, ty,
+              hint_x - rect.x - 12)
+    _blit_fit(screen, f, hint, theme['label'], hint_x, ty,
+              rect.right - hint_x)
+
+
+# Tier 1.2: keys whose payload failed to decode, stamped with the fetch ts
+# that produced them. _load_image makes up to three SDL probes per call and
+# pygame offers no cheap "is this decodable" test, so without this memo an
+# undecodable payload (a 503 body, a truncated JPEG, an SVG the Tier 1.5 guard
+# refuses) is re-probed on every redraw of its panel instead of once per
+# refresh. Bounded by the five _IMAGE_ENDPOINTS keys.
+_decode_failed_ts: dict = {}
+
+
+def _image_stamp(data, key):
+    """Per-key fetch timestamp, falling back to the global refresh tick.
+
+    The getattr/isinstance guard is load-bearing: HamClockData grew
+    image_fetched_at in Tier 1a but stand-ins that predate it (e.g.
+    tests/test_themes.py's _StubData) do not have the attribute at all, and an
+    AttributeError here is swallowed by the render loop's per-panel
+    `except Exception: pass` — which is exactly how the installer-embedded
+    client ended up with two permanently blank image panels.
+    """
+    _fa = getattr(data, 'image_fetched_at', None)
+    return (_fa.get(key, data.last_image_refresh)
+            if isinstance(_fa, dict) else data.last_image_refresh)
 
 
 def _get_cached_image(data, key, image_cache, image_cache_ts):
-    """Return a pygame Surface for data.images[key], rebuilt when refresh ts changes."""
+    """Return a pygame Surface for data.images[key], rebuilt when THAT key's
+    fetch timestamp changes.
+
+    Tier 1.2: the stamp used to be the global data.last_image_refresh, so one
+    endpoint arriving invalidated the decoded surfaces of all five and the
+    render thread paid 3-4 redundant full JPEG/PNG decodes per retry during
+    cold boot (~36-165 ms each, ARMv6 extrapolated). A decode that fails is
+    now remembered against the same stamp so it is retried once per refresh,
+    not once per redraw; the previously decoded surface (if any) keeps being
+    served meanwhile.
+    """
     raw = data.images.get(key) if isinstance(data.images, dict) else None
     if raw is None:
         return None
-    ts = data.last_image_refresh
+    ts = _image_stamp(data, key)
     if image_cache_ts.get(key) != ts or key not in image_cache:
+        if _decode_failed_ts.get(key) == ts:
+            return image_cache.get(key)
         surf = _load_image(raw)
         if surf is not None:
             image_cache[key] = surf
             image_cache_ts[key] = ts
+            _decode_failed_ts.pop(key, None)
+        else:
+            _decode_failed_ts[key] = ts
     return image_cache.get(key)
+
+
+# Tier 2.5: what to call each feed on screen. The panel titles ("SDO IMAGE")
+# and the propagation tab labels ("drap", "aurora") do not name the upstream
+# product, and during an outage the feed name is most of the information.
+_IMAGE_LABEL = {
+    'solar-image': 'SDO',
+    'muf-map': 'MUF map',
+    'enlil': 'Enlil',
+    'drap': 'Aurora',
+    'real-drap': 'D-layer',
+}
+
+# Optional per-key content-age fields on /api/health. Client-side fetch time
+# cannot see that the server answered from its persisted disk cache (Tier
+# 2.1), so when the server publishes a real content age we prefer it. Absent
+# or -1 (the existing "unknown" convention at server.py's /api/health) falls
+# back to the client's own last-successful-fetch stamp.
+_HEALTH_AGE_FIELD = {
+    'solar-image': 'sdo_age',
+    'muf-map': 'muf_age',
+    'enlil': 'enlil_age',
+    'drap': 'drap_age',
+    'real-drap': 'real_drap_age',
+}
+
+# Consecutive failed attempts before a feed is called "down" rather than
+# "no data yet". With hamclock_data.IMAGE_RETRY_BACKOFF = (5, 10, 20, 40, 60)
+# the 4th failure lands ~75 s in, which is long enough that a slow server or a
+# boot-time race has been ruled out.
+_IMAGE_DOWN_AFTER_FAILS = 4
+
+# Show an age label once a displayed image is this old. Below it the label is
+# clutter (the feeds refresh every 900 s); above it the picture may no longer
+# describe the band conditions in front of the operator.
+_IMAGE_STALE_S = 3600.0
+
+
+def _fmt_eta(secs):
+    """Coarse 'retry in ...' token. Never raises; never returns ''."""
+    try:
+        s = float(secs)
+        if s != s:          # NaN
+            return '?'
+        if s <= 1:
+            return 'now'
+        # Round UP: a countdown that reads 0s while nothing has happened yet
+        # is the same lie this tier exists to remove. Ceil first, then pick
+        # the unit, so 59.9 s reads "1m" rather than "60s".
+        s = int(s) + (1 if s > int(s) else 0)
+        if s < 60:
+            return '%ds' % s
+        if s < 3600:
+            return '%dm' % ((s + 59) // 60)
+        if s < 86400:
+            return '%dh' % (s // 3600)
+        return '%dd' % (s // 86400)
+    except Exception:
+        return '?'
+
+
+def _fmt_age(secs):
+    """Coarse '... old' token. Never raises; never returns ''."""
+    try:
+        s = float(secs)
+        if s != s or s < 0:
+            return '?'
+        if s < 60:
+            return '%ds' % int(s)
+        if s < 3600:
+            return '%dm' % int(s // 60)
+        if s < 86400:
+            return '%dh' % int(s // 3600)
+        return '%dd' % int(s // 86400)
+    except Exception:
+        return '?'
+
+
+def _image_status_text(data, key):
+    """Honest one/two-line status for image panel `key`, or None.
+
+    TOTAL by construction. The render loop evaluates this as an *argument* to
+    draw_image, inside the per-panel `except Exception: pass`, so an exception
+    escaping here does not merely lose the status — it skips the draw_image
+    call entirely and leaves the panel blank, which is strictly worse than the
+    string it was meant to replace. Hence .get() on every dict lookup (getattr
+    guards the attribute, never the key), isinstance checks on everything that
+    came off the wire, and a blanket except returning None.
+
+    Returning None means "say nothing", which is the right answer for a fresh
+    image and for any data object this function does not understand.
+
+    Deliberately NOT sourced from `data.images.get(key) is not None`: that
+    cannot tell a decode failure from a decode success, and data.images is
+    cumulative (refresh_images does new_images.update(fetched) and never
+    deletes), so it stays truthy forever after one good cycle. The decode
+    verdict comes from _decode_failed_ts (Tier 1.2) and the liveness verdict
+    from the per-key retry state (Tier 1.4).
+    """
+    try:
+        name = _IMAGE_LABEL.get(key, 'image')
+        now = time.time()
+
+        images = getattr(data, 'images', None)
+        raw = images.get(key) if isinstance(images, dict) else None
+
+        fa = getattr(data, 'image_fetched_at', None)
+        stamp = fa.get(key) if isinstance(fa, dict) else None
+        if stamp is None:
+            stamp = getattr(data, 'last_image_refresh', None)
+
+        # 1) Bytes in hand that SDL refused. Checked first and against the
+        #    stamp that produced them, so a *newly* bad payload is reported
+        #    even while _get_cached_image is still showing the last good
+        #    surface underneath.
+        failed = _decode_failed_ts.get(key)
+        if (raw is not None and failed is not None and stamp is not None
+                and failed == stamp):
+            return '%s: image data\nnot readable' % name
+
+        fs = getattr(data, 'image_fail_streak', None)
+        streak = fs.get(key, 0) if isinstance(fs, dict) else 0
+        if not isinstance(streak, int) or isinstance(streak, bool):
+            streak = 0
+
+        # 2) Nothing to draw at all.
+        if raw is None:
+            if streak <= 0:
+                return '%s: fetching...' % name
+            nd = getattr(data, 'image_next_due', None)
+            due = nd.get(key) if isinstance(nd, dict) else None
+            head = ('%s: feed down' % name if streak >= _IMAGE_DOWN_AFTER_FAILS
+                    else '%s: no data yet' % name)
+            if isinstance(due, (int, float)) and not isinstance(due, bool):
+                return '%s\nretry %s' % (head, _fmt_eta(due - now))
+            return head
+
+        # 3) An image is on screen. Say how old it is once that matters.
+        age = None
+        health = getattr(data, 'health', None)
+        if isinstance(health, dict):
+            hv = health.get(_HEALTH_AGE_FIELD.get(key) or '\x00')
+            if (isinstance(hv, (int, float)) and not isinstance(hv, bool)
+                    and hv >= 0):
+                age = float(hv)
+        if (age is None and isinstance(stamp, (int, float))
+                and not isinstance(stamp, bool) and stamp > 0):
+            age = now - float(stamp)
+        if age is not None and age >= _IMAGE_STALE_S:
+            return '%s %s old' % (name, _fmt_age(age))
+        return None
+    except Exception:
+        return None
 
 
 def _compute_dirty_rects(state, panel_rects, active_tab,
@@ -1639,15 +2182,23 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 redrawn_this_frame.add('bands')
                 _panel_due_at['bands'] = now_ts + _CADENCE_S['bands']
             if _panel_due('sdo'):
+                # Tier 2.5: hoisted out of the try. The cadence line below
+                # reads it, and a NameError there would land in the render
+                # loop's consecutive_errors counter instead of this panel's
+                # own except.
+                sdo_surf = None
                 try:
                     sdo_surf = _get_cached_image(data, 'solar-image', image_cache, image_cache_ts)
                     draw_image(screen, panel_rects[2], sdo_surf, fonts, theme,
                                image_key='solar-image',
-                               fetched_at=data.image_fetched_at.get('solar-image', 0.0))
+                               fetched_at=_image_stamp(data, 'solar-image'),
+                               status=_image_status_text(data, 'solar-image'))
                 except Exception:
                     pass
                 redrawn_this_frame.add('sdo')
-                _panel_due_at['sdo'] = now_ts + _CADENCE_S['sdo']
+                _panel_due_at['sdo'] = now_ts + (
+                    _CADENCE_S['sdo'] if sdo_surf is not None
+                    else _CADENCE_S_NO_IMAGE.get('sdo', _CADENCE_S['sdo']))
             if _panel_due('geomag'):
                 try:
                     draw_geomag(screen, panel_rects[3], data.solar or {},
@@ -1713,16 +2264,22 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                                         active_tab, fonts, theme)
                 img_rect = pygame.Rect(prop_inner.x, prop_inner.y + 24,
                                        prop_inner.w, prop_inner.h - 24)
+                # Tier 2.5: hoisted out of the try — see the sdo panel above.
+                surf = None
                 try:
                     key = tab_image_key.get(active_tab, 'real-drap')
                     surf = _get_cached_image(data, key, image_cache, image_cache_ts)
                     draw_image(screen, img_rect, surf, fonts, theme,
                                image_key=key,
-                               fetched_at=data.image_fetched_at.get(key, 0.0))
+                               fetched_at=_image_stamp(data, key),
+                               status=_image_status_text(data, key))
                 except Exception:
                     pass
                 redrawn_this_frame.add('propagation')
-                _panel_due_at['propagation'] = now_ts + _CADENCE_S['propagation']
+                _panel_due_at['propagation'] = now_ts + (
+                    _CADENCE_S['propagation'] if surf is not None
+                    else _CADENCE_S_NO_IMAGE.get('propagation',
+                                                 _CADENCE_S['propagation']))
 
             panel_rects_map = {
                 'header': header,

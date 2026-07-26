@@ -159,21 +159,38 @@ if [ "$KIOSK_MODE" = "browser" ]; then
     echo "Browser installed: $BROWSER"
 fi
 
-# Install HamClock service if not already done
+# Install / refresh the HamClock application files.
+#
+# This used to be `if [ ! -f "$INSTALL_DIR/server.py" ]`, which meant a
+# re-run on an existing Pi NEVER refreshed server.py or index.html — upgraders
+# silently kept a months-old server while the native clients were updated
+# underneath them, so client/server contract fixes never reached hardware.
+# Every shipped file is now refreshed unconditionally on every run.
+#
+# Nothing here touches user state: settings live in /etc/hamclock-lite
+# (settings.json, seeded separately below and never overwritten) and cached
+# images live in /var/cache/hamclock-lite. $INSTALL_DIR holds program files only.
 INSTALL_DIR="/opt/hamclock-lite"
-if [ ! -f "$INSTALL_DIR/server.py" ]; then
-    echo "Installing HamClock server..."
-    sudo mkdir -p "$INSTALL_DIR"
-    sudo cp "$SCRIPT_DIR/server.py" "$INSTALL_DIR/"
-    sudo cp "$SCRIPT_DIR/index.html" "$INSTALL_DIR/"
-    sudo chmod +x "$INSTALL_DIR/server.py"
-fi
+FIRST_INSTALL=0
+[ -f "$INSTALL_DIR/server.py" ] || FIRST_INSTALL=1
 
-# Always copy the native Python clients so users can switch modes later
+# First-run-only: create the program directory.
+if [ "$FIRST_INSTALL" = "1" ]; then
+    echo "Installing HamClock server and native clients..."
+    sudo mkdir -p "$INSTALL_DIR"
+else
+    echo "Refreshing HamClock server and native clients (existing install detected)..."
+fi
 sudo mkdir -p "$INSTALL_DIR"
-sudo cp "$SCRIPT_DIR/hamclock_data.py" "$INSTALL_DIR/"
-sudo cp "$SCRIPT_DIR/hamclock_pygame.py" "$INSTALL_DIR/"
-sudo cp "$SCRIPT_DIR/hamclock_tkinter.py" "$INSTALL_DIR/"
+
+for _hc_file in server.py index.html hamclock_data.py hamclock_pygame.py hamclock_tkinter.py; do
+    if [ -f "$SCRIPT_DIR/$_hc_file" ]; then
+        sudo cp "$SCRIPT_DIR/$_hc_file" "$INSTALL_DIR/$_hc_file"
+    else
+        echo "WARNING: $SCRIPT_DIR/$_hc_file not found — leaving the installed copy alone" >&2
+    fi
+done
+sudo chmod +x "$INSTALL_DIR/server.py" 2>/dev/null || true
 
 # Copy X11 monitor config for auto-detect resolution (16-bit saves RAM on Pi 1)
 sudo cp "$SCRIPT_DIR/10-monitor.conf" /usr/share/X11/xorg.conf.d/10-monitor.conf 2>/dev/null || true
@@ -215,18 +232,24 @@ sudo chmod 0755 /usr/local/bin/hamclock-setup
 # Add user to video and tty groups for X server access
 sudo usermod -aG video,tty,input "$SERVICE_USER"
 
-# Create the hamclock service if not exists
-if ! systemctl is-enabled hamclock-lite &>/dev/null; then
-    # Tier 1c: pygame-mode only — reduce glibc arena fragmentation, strip
-    # asserts/docstrings, and pre-compile .pyc once at service start so
-    # subsequent imports skip the bytecode compile path on a 512 MB Pi.
-    LITE_PYGAME_ENV=""
-    LITE_PYGAME_PRE=""
-    if [ "$KIOSK_MODE" = "pygame" ]; then
-        LITE_PYGAME_ENV="Environment=MALLOC_ARENA_MAX=1 PYTHONOPTIMIZE=1 PYTHONDONTWRITEBYTECODE=1"
-        LITE_PYGAME_PRE="ExecStartPre=/usr/bin/python3 -O -m compileall -q /opt/hamclock-lite"
-    fi
-    sudo tee /etc/systemd/system/hamclock-lite.service > /dev/null <<EOF
+# Write the hamclock-lite unit. This is rewritten on EVERY run (it used to sit
+# inside `if ! systemctl is-enabled hamclock-lite`, so an existing box never
+# picked up unit changes such as CacheDirectory=). Only enable/start is
+# first-run behaviour; a re-run is covered by the explicit restart further down.
+# Tier 1c: pygame-mode only — reduce glibc arena fragmentation, strip
+# asserts/docstrings, and pre-compile .pyc once at service start so
+# subsequent imports skip the bytecode compile path on a 512 MB Pi.
+LITE_PYGAME_ENV=""
+LITE_PYGAME_PRE=""
+if [ "$KIOSK_MODE" = "pygame" ]; then
+    LITE_PYGAME_ENV="Environment=MALLOC_ARENA_MAX=1 PYTHONOPTIMIZE=1 PYTHONDONTWRITEBYTECODE=1"
+    LITE_PYGAME_PRE="ExecStartPre=/usr/bin/python3 -O -m compileall -q /opt/hamclock-lite"
+fi
+# CacheDirectory= makes systemd create/chown /var/cache/hamclock-lite for the
+# service user, which is where server.py persists the fetched images so a warm
+# boot paints immediately instead of waiting on the network. Needs systemd>=235
+# (Buster 241, Bullseye 247, Bookworm 252).
+sudo tee /etc/systemd/system/hamclock-lite.service > /dev/null <<EOF
 [Unit]
 Description=HamClock Lite Server
 After=network-online.target
@@ -236,6 +259,7 @@ Wants=network-online.target
 Type=simple
 User=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR
+CacheDirectory=hamclock-lite
 $LITE_PYGAME_ENV
 $LITE_PYGAME_PRE
 ExecStart=/usr/bin/python3 $INSTALL_DIR/server.py
@@ -245,7 +269,8 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-    sudo systemctl daemon-reload
+sudo systemctl daemon-reload
+if ! systemctl is-enabled hamclock-lite &>/dev/null; then
     sudo systemctl enable hamclock-lite
     sudo systemctl start hamclock-lite
 fi

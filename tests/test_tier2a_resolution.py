@@ -34,9 +34,16 @@ def test_installer_sets_framebuffer_720x450():
 
 
 def test_muf_rasterize_width_is_360():
-    """MUF panel at 720x450 layout is ~360 px wide; rasterize narrower."""
+    """MUF panel at 720x450 layout is ~360 px wide; rasterize narrower.
+
+    Targets the cairosvg one-liner, not a bare 'output_width=360' substring:
+    _rasterize_muf's docstring also contains that phrase, so the old grep read
+    green even when the argv it describes had drifted. The argv itself is
+    additionally pinned in tests/test_tier2_slim_muf.py by driving
+    _rasterize_muf against a stubbed Popen.
+    """
     body = (REPO / "server.py").read_text()
-    assert 'output_width=360' in body, \
+    assert 'output_width=360, write_to=sys.stdout.buffer)' in body, \
         'Tier 2a: server.py _rasterize_muf must use output_width=360'
     obody = (REPO / "offline-install.sh").read_text()
     assert 'output_width=360' in obody, \

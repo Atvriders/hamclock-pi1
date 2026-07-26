@@ -156,7 +156,7 @@ class HamClockTkApp:
         )
 
         self._value_labels = {}
-        self._last_image_ts = 0
+        self._last_image_ts = {}  # Tier 1.2: per-image-key fetch stamps
         self._image_refs = {}  # hold refs to prevent GC
 
         self._build_ui()
@@ -576,20 +576,43 @@ class HamClockTkApp:
             text='CLOSED: ' + (', '.join(closed_list) if closed_list else '—'),
         )
 
-    def _update_images(self):
-        ts = self.data.last_image_refresh
-        if ts == self._last_image_ts:
-            return
-        self._last_image_ts = ts
-        imgs = self.data.images or {}
+    def _image_stamp(self, key):
+        """Per-key fetch timestamp, falling back to the global refresh tick.
 
-        sdo = self._load_image(imgs.get('solar-image'), 360, 220)
-        if sdo is not None:
-            self._set_image(self.sdo_label, 'sdo', sdo)
-        elif not HAS_PIL:
-            self.sdo_label.configure(text='(PIL missing)')
+        The getattr/isinstance guard is load-bearing: image_fetched_at arrived
+        with Tier 1a and older HamClockData copies (notably the one embedded
+        in the installers) do not have it at all.
+        """
+        fa = getattr(self.data, 'image_fetched_at', None)
+        if isinstance(fa, dict):
+            return fa.get(key, self.data.last_image_refresh)
+        return self.data.last_image_refresh
+
+    def _update_images(self):
+        # Tier 1.2: gate each image on ITS OWN fetch timestamp. The single
+        # last_image_refresh gate re-decoded and re-thumbnailed all five
+        # payloads whenever any one of them arrived (PIL LANCZOS resize is the
+        # expensive part), and a refresh cycle that fetched nothing at all
+        # still bumped the stamp. The per-key stamp is recorded whether or not
+        # the decode succeeds, so an undecodable payload costs one attempt per
+        # refresh rather than one per UI tick.
+        imgs = self.data.images or {}
+        seen = self._last_image_ts
+
+        ts = self._image_stamp('solar-image')
+        if seen.get('solar-image') != ts:
+            seen['solar-image'] = ts
+            sdo = self._load_image(imgs.get('solar-image'), 360, 220)
+            if sdo is not None:
+                self._set_image(self.sdo_label, 'sdo', sdo)
+            elif not HAS_PIL:
+                self.sdo_label.configure(text='(PIL missing)')
 
         for key, label in self.prop_tabs.items():
+            ts = self._image_stamp(key)
+            if seen.get(key) == ts:
+                continue
+            seen[key] = ts
             photo = self._load_image(imgs.get(key), 380, 260)
             if photo is not None:
                 self._set_image(label, 'prop_' + key, photo)

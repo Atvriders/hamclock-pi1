@@ -33,6 +33,14 @@ class HamClockData:
     JSON_TIMEOUT = 10
     IMAGE_TIMEOUT = 20
 
+    # Tier 1.4: per-key retry backoff. Index N is the delay (seconds) after
+    # the Nth consecutive failure of that key; the last entry repeats
+    # forever. Retries therefore land at cumulative 5/15/35/75/135 s and
+    # then once a minute, instead of the old "one shot, then nothing for
+    # 900 s" behaviour that left the propagation panel blank for 15 minutes
+    # after a single cold-boot miss.
+    IMAGE_RETRY_BACKOFF = (5, 10, 20, 40, 60)
+
     _JSON_ENDPOINTS = {
         'solar': '/api/solar',
         'bands': '/api/bands',
@@ -65,6 +73,20 @@ class HamClockData:
         # to the epoch-second when that key's bytes last refreshed.
         # Used by the pygame client's _scaled_cache to invalidate per-image.
         self.image_fetched_at = {}
+        # Tier 1.4 retry scheduling, both keyed by image_key.
+        #   image_next_due[key]    epoch second at/after which key may be
+        #                          attempted again (missing => due now)
+        #   image_fail_streak[key] consecutive failures; indexes
+        #                          IMAGE_RETRY_BACKOFF
+        # Written only by the fetch thread; single-key reads are atomic
+        # under the GIL, so GUI code may sample them without the lock.
+        self.image_next_due = {}
+        self.image_fail_streak = {}
+        # Slow (healthy) image cadence in seconds. _run() overwrites this
+        # with the caller's image_interval; the default matches
+        # start_background()'s so a manual refresh_images() before the
+        # thread starts schedules sanely.
+        self._image_interval = 900
         # Errors (most recent error per key, None if last fetch succeeded)
         self.errors = {}
         # Tier 2c perf: ETags by path so we can replay If-None-Match on the
@@ -146,25 +168,91 @@ class HamClockData:
             self.last_data_refresh = time.time()
         return results
 
-    def refresh_images(self):
-        """Fetch the 5 image endpoints synchronously."""
+    def _next_image_delay(self, key):
+        """Seconds to wait before the next attempt of image `key`.
+
+        Healthy keys get the slow cadence; failing keys walk
+        IMAGE_RETRY_BACKOFF and saturate on its last entry.
+        """
+        streak = self.image_fail_streak.get(key, 0)
+        if streak <= 0:
+            return self._image_interval
+        idx = min(streak, len(self.IMAGE_RETRY_BACKOFF)) - 1
+        return self.IMAGE_RETRY_BACKOFF[idx]
+
+    def _reschedule_image(self, key, ok, now):
+        """Record the outcome of one image attempt and set its next due time.
+
+        Called from a `finally`, so it must not raise for any input.
+        """
+        if ok:
+            self.image_fail_streak[key] = 0
+        else:
+            self.image_fail_streak[key] = self.image_fail_streak.get(key, 0) + 1
+        self.image_next_due[key] = now + self._next_image_delay(key)
+
+    def _due_image_keys(self, now):
+        """Image keys whose next-due time has passed, or None if none are.
+
+        Returns None rather than [] in the common case: the 1 s tick calls
+        this every second on a single-core ARMv6 box and the quiescent path
+        must not allocate.
+        """
+        due = None
+        for key in self._IMAGE_ENDPOINTS:
+            if now >= self.image_next_due.get(key, 0.0):
+                if due is None:
+                    due = []
+                due.append(key)
+        return due
+
+    def refresh_images(self, keys=None):
+        """Fetch image endpoints synchronously. keys=None means all five.
+
+        Every attempted key is rescheduled unconditionally (in a `finally`),
+        including on an exception _fetch_binary does not catch — a
+        MemoryError escaping the except clause at _fetch_binary would
+        otherwise leave the key permanently due and hot-spin the 1 s tick.
+
+        last_image_refresh is stamped only when at least one key came back
+        with bytes. Stamping it after a total failure is what used to buy a
+        blank panel for a full image_interval.
+        """
+        if keys is None:
+            keys = self._IMAGE_ENDPOINTS
         results = {}
         fetched = {}
-        for key, path in self._IMAGE_ENDPOINTS.items():
-            data = self._fetch_binary(path)
-            results[key] = data is not None
-            if data is not None:
-                fetched[key] = data
-        now = time.time()
-        with self._lock:
-            new_images = dict(self.images)
-            new_images.update(fetched)
-            self.images = new_images
-            new_ts = dict(self.image_fetched_at)
-            for key in fetched:
-                new_ts[key] = now
-            self.image_fetched_at = new_ts
-            self.last_image_refresh = now
+        try:
+            for key in keys:
+                path = self._IMAGE_ENDPOINTS.get(key)
+                if path is None:
+                    continue
+                ok = False
+                try:
+                    data = self._fetch_binary(path)
+                    ok = data is not None
+                    results[key] = ok
+                    if ok:
+                        fetched[key] = data
+                finally:
+                    self._reschedule_image(key, ok, time.time())
+        finally:
+            # Also a `finally` so bytes already in hand are published even if
+            # a later key blows up — those keys are rescheduled 900 s out and
+            # dropping their payload here would recreate the blank-panel bug.
+            if fetched:
+                # Read the clock after the fetches, not before: image ages
+                # should reflect when the bytes landed.
+                now = time.time()
+                with self._lock:
+                    new_images = dict(self.images)
+                    new_images.update(fetched)
+                    self.images = new_images
+                    new_ts = dict(self.image_fetched_at)
+                    for key in fetched:
+                        new_ts[key] = now
+                    self.image_fetched_at = new_ts
+                    self.last_image_refresh = now
         return results
 
     def start_background(self, data_interval=60, image_interval=900):
@@ -178,6 +266,7 @@ class HamClockData:
         self._thread.start()
 
     def _run(self, data_interval, image_interval):
+        self._image_interval = image_interval
         # Immediate initial fetch
         try:
             self.refresh_data()
@@ -187,21 +276,28 @@ class HamClockData:
             self.refresh_images()
         except Exception as e:
             self.errors['_run_images'] = '{}: {}'.format(type(e).__name__, e)
-        # Sleep-and-check loop
+        # 1 s tick: image retries need second-resolution scheduling, the JSON
+        # cadence does not, so the data check stays on a 5-tick (5 s) grid.
+        tick = 0
         while self._running:
-            for _ in range(5):
-                if not self._running:
-                    return
-                time.sleep(1)
+            time.sleep(1)
+            if not self._running:
+                return
+            tick = (tick + 1) % 5
             now = time.time()
-            if now - self.last_data_refresh >= data_interval:
+            if tick == 0 and now - self.last_data_refresh >= data_interval:
                 try:
                     self.refresh_data()
                 except Exception as e:
                     self.errors['_run_data'] = '{}: {}'.format(type(e).__name__, e)
-            if now - self.last_image_refresh >= image_interval:
+                # refresh_data can block for up to 4 x JSON_TIMEOUT; re-read
+                # the clock so image due-times aren't judged against a stale
+                # `now`.
+                now = time.time()
+            due = self._due_image_keys(now)
+            if due:
                 try:
-                    self.refresh_images()
+                    self.refresh_images(due)
                 except Exception as e:
                     self.errors['_run_images'] = '{}: {}'.format(type(e).__name__, e)
 

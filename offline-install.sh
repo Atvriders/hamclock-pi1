@@ -136,7 +136,7 @@ PYINLINE
         echo
         echo "date: $DATE_UTC"
         echo
-        echo "## Measurements (cairosvg rasterize of KC2G mufd-normal-now.svg, width=720)"
+        echo "## Measurements (cairosvg rasterize of KC2G mufd-normal-now.svg, output_width=360)"
         i=1; for t in "${TIMES[@]}"; do echo "  run $i: ${t}s"; i=$((i+1)); done
         echo "median: ${MEDIAN}s"
         echo
@@ -213,7 +213,10 @@ sudo tee "$INSTALL_DIR/server.py" > /dev/null << 'SERVEREOF'
 #!/usr/bin/env python3
 """HamClock Lite — Lightweight server for Raspberry Pi 1"""
 
+import gzip
 import json
+import signal
+import tempfile
 import time
 import threading
 import subprocess
@@ -224,8 +227,14 @@ try:
 except ImportError:
     from http.server import HTTPServer  # Python < 3.7 fallback
 from urllib.request import urlopen, Request
-from urllib.error import URLError
-from urllib.parse import urlparse
+# HTTPError as well as URLError: Tier 2.2 uses conditional GETs, and urllib
+# raises HTTPError for a 304. Importing the NAME here matters — writing
+# `except urllib.error.HTTPError` would raise NameError *while evaluating the
+# except clause* (server.py has no `import urllib`), which escapes the
+# trailing `except Exception` and kills background_fetcher on the first
+# network blip.
+from urllib.error import URLError, HTTPError
+from urllib.parse import urlparse, parse_qs
 from xml.etree import ElementTree
 import os
 import sys
@@ -235,6 +244,12 @@ CACHE = {
     'solar': None,
     'bands': None,
     'dxspots': None,
+    # Tier 1b perf: pre-encoded JSON bytes for the three hot polling endpoints.
+    # Populated alongside the dict so /api/solar, /api/bands, /api/dxspots can
+    # write straight to the socket without re-running json.dumps every ~60 s.
+    'solar_bytes': None,
+    'bands_bytes': None,
+    'dxspots_bytes': None,
     'solar_image': None,
     'solar_updated': 0,
     'bands_updated': 0,
@@ -243,6 +258,9 @@ CACHE = {
     'muf_image': None,
     'muf_image_png': None,
     'muf_image_updated': 0,
+    # Stamped only when a rasterize actually SUCCEEDS, so the keep-last-good
+    # logic in fetch_muf can age the PNG independently of the SVG fetch.
+    'muf_image_png_updated': 0,
     'enlil_image': None,
     'enlil_image_updated': 0,
     'drap_image': None,
@@ -254,33 +272,689 @@ CACHE = {
 
 UA = 'HamClockLite/1.0'
 
+# Phase 2: raised by installer if pre-merge cairosvg benchmark > 20 s
+# (see docs/muf-source.md for the recorded measurement).
 PHASE2_TIMEOUT_S = 45
 
+# Tier 2.4: PHASE2_TIMEOUT_S above is the FLOOR. A render that is merely slow
+# (ARMv6 under cpulimit's 50 % duty cycle) used to be indistinguishable from a
+# render that is hung, and the 45 s cap turned "slow" into "blank panel
+# forever". The ceiling is deliberately below the 120 s fetch_dx cadence so a
+# pathological render can never starve the DX spot refresh.
+PHASE2_TIMEOUT_MAX_S = 110
+# Budget = 4x the smoothed cost of the last successful render.
+MUF_TIMEOUT_FACTOR = 4.0
+MUF_EWMA_ALPHA = 0.3
 
-def _rasterize_muf(svg_bytes):
-    """See server.py — Phase 2 MUF SVG -> PNG rasterizer (Pi 1 offline mirror)."""
-    try:
-        p = subprocess.run(
-            ['cpulimit', '-l', '50', '-q', '--',
-             'python3', '-c',
-             'import sys, cairosvg; cairosvg.svg2png('
-             'bytestring=sys.stdin.buffer.read(), '
-             'output_width=360, write_to=sys.stdout.buffer)'],
-            input=svg_bytes,
-            capture_output=True,
-            timeout=PHASE2_TIMEOUT_S,
-            check=True,
-        )
-        return p.stdout
-    except (subprocess.SubprocessError, FileNotFoundError) as e:
-        print('[muf] rasterize failed: %s' % e, file=sys.stderr)
+# RAM ONLY — deliberately never persisted. It recalibrates inside one 15 min
+# image cycle, and writing it to disk would make the rasterize tests
+# non-idempotent across runs (and let one pathological boot raise the budget
+# permanently).
+_muf_render_ewma = None
+
+# Tier 1.5: how long a successfully rendered MUF PNG may keep being served
+# after a later rasterize fails. Beyond this the slot is cleared rather than
+# handing the client a map whose terminator is a day out of date.
+MUF_STALE_MAX_S = 24 * 3600
+
+MUF_URL = 'https://prop.kc2g.com/renders/current/mufd-normal-now.svg'
+
+
+# ---------------------------------------------------------------------------
+# Tier 2.1 — disk persistence for the five image products
+#
+# CACHE is RAM-only, so every restart (and every power cut on a box with no
+# RTC and no shutdown) starts from zero: five upstream round trips plus a
+# multi-second rasterize before the first pixel, and nothing at all when the
+# Pi boots without a network. Persisting the decoded payloads makes every
+# boot after the first answer 200 to the client's very first image request.
+#
+# This is a design-intent change: the rootfs is deliberately quiescent
+# (journald Storage=volatile, noatime,commit=60, PYTHONDONTWRITEBYTECODE=1).
+# PERSIST_MIN_INTERVAL_S keeps it to ~7 MB/day of SD writes.
+# ---------------------------------------------------------------------------
+
+CACHE_DIR = os.environ.get('HAMCLOCK_CACHE_DIR', '/var/cache/hamclock-lite')
+
+# At most one write per key per hour. The image cadence is 900 s, so this is a
+# 4:1 throttle: ~319 KB x 24 = ~7.5 MB/day worst case.
+PERSIST_MIN_INTERVAL_S = 3600
+
+# Anything older than this is not loaded back. Matched to MUF_STALE_MAX_S on
+# purpose: being *stricter* on disk than the running process is with its own
+# in-RAM keep-last-good would mean a warm reboot throws away an image the
+# server would happily have kept serving.
+PERSIST_MAX_AGE_S = 24 * 3600
+
+_MANIFEST_NAME = 'manifest.json'
+
+# CACHE key -> (filename, the *_updated CACHE key that carries its real epoch)
+_PERSIST_KEYS = {
+    'muf_image_png': ('muf.png', 'muf_image_png_updated'),
+    'solar_image': ('sdo.img', 'solar_image_updated'),
+    'enlil_image': ('enlil.img', 'enlil_image_updated'),
+    'drap_image': ('drap.img', 'drap_image_updated'),
+    'real_drap_image': ('real-drap.img', 'real_drap_image_updated'),
+}
+
+# key -> epoch of the last persist ATTEMPT (success or failure). Seeding it
+# from the manifest on load stops us rewriting bytes we just read back, and
+# stamping it on failure keeps a read-only rootfs from retrying every 900 s.
+_PERSIST_LAST = {}
+
+# 2020-01-01. The Pi 1 has no RTC: before NTP syncs, time.time() is whatever
+# fake-hwclock last wrote (or the epoch). Age-based eviction is only applied
+# when the clock is past this, or a Pi powered off for a week would nuke its
+# cache on exactly the boot where it is most valuable.
+_CLOCK_SANITY_EPOCH = 1577836800.0
+
+# Where the currently-served MUF PNG came from: 'live' (rendered in this
+# process), 'disk' (restored from the cache dir at boot) or 'none'. Exposed
+# via /api/health so the client can label a persisted-stale map honestly —
+# serve-stale without a label is worse than blank for an operator making a
+# band decision.
+_MUF_PNG_SOURCE = 'none'
+
+
+def _sniff_image(data):
+    """Return 'png'/'jpeg'/'gif' for a recognised payload, else None."""
+    if not data:
         return None
+    head = bytes(data[:8])
+    if head[:8] == b'\x89PNG\r\n\x1a\n':
+        return 'png'
+    if head[:3] == b'\xff\xd8\xff':
+        return 'jpeg'
+    if head[:6] in (b'GIF87a', b'GIF89a'):
+        return 'gif'
+    return None
+
+
+def _image_is_complete(data):
+    """True only if `data` carries a full, correctly terminated image.
+
+    Guards the load path against a truncated or SD-corrupted file: the atomic
+    write below makes a half-written file impossible, but flash wear is not.
+    """
+    fmt = _sniff_image(data)
+    tail = bytes(data[-8:]) if data else b''
+    if fmt == 'png':
+        # ...IEND + 4-byte CRC
+        return len(data) > 16 and tail[-8:-4] == b'IEND'
+    if fmt == 'jpeg':
+        return len(data) > 4 and tail[-2:] == b'\xff\xd9'
+    if fmt == 'gif':
+        return len(data) > 6 and tail[-1:] == b'\x3b'
+    return False
+
+
+def _fsync_dir(path):
+    """fsync a directory so a rename is durable.
+
+    The rootfs is mounted noatime,commit=60 (offline-install.sh), so
+    os.replace() alone only guarantees atomicity, not durability — a power cut
+    inside the commit window can leave the directory entry pointing at
+    nothing. Persisted images are only useful across an unclean restart, which
+    is precisely the case os.replace() does not cover on its own.
+    """
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_atomic(path, data):
+    """tempfile -> flush -> fsync -> os.replace -> fsync(dir)."""
+    directory = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix='.tmp-')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    _fsync_dir(directory)
+
+
+def _read_manifest():
+    try:
+        with open(os.path.join(CACHE_DIR, _MANIFEST_NAME), 'rb') as f:
+            man = json.loads(f.read().decode('utf-8'))
+        if isinstance(man, dict) and isinstance(man.get('entries'), dict):
+            return man
+    except Exception:
+        pass
+    return {'version': 1, 'entries': {}}
+
+
+def _persist(key):
+    """Best-effort write-through of CACHE[key] to the cache dir.
+
+    MUST NOT RAISE, ever. In fetch_enlil/fetch_drap/fetch_real_drap the
+    `return` is the last statement of the `try` inside `for url in urls`, so
+    an OSError escaping from here would skip that return, be logged as a bogus
+    fetch failure, and fall through to the fallback URL — re-downloading the
+    same product on every cycle, forever.
+    """
+    try:
+        meta = _PERSIST_KEYS.get(key)
+        if meta is None:
+            return
+        data = CACHE.get(key)
+        # Falsy is legitimate, not an error: muf_image_png is None whenever a
+        # rasterize has failed. Never write an empty file over a good one.
+        if not data:
+            return
+        now = time.time()
+        if now - (_PERSIST_LAST.get(key) or 0.0) < PERSIST_MIN_INTERVAL_S:
+            return
+        if _sniff_image(data) is None:
+            # Not an image we recognise (an upstream HTML error page, say).
+            return
+        # Stamp the ATTEMPT, so a read-only or full filesystem is throttled
+        # exactly like a success instead of retrying every image cycle.
+        _PERSIST_LAST[key] = now
+        fname, stamp_key = meta
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        _write_atomic(os.path.join(CACHE_DIR, fname), data)
+        man = _read_manifest()
+        man['entries'][key] = {
+            'file': fname,
+            'size': len(data),
+            'epoch': float(CACHE.get(stamp_key) or now),
+        }
+        _write_atomic(os.path.join(CACHE_DIR, _MANIFEST_NAME),
+                      json.dumps(man, separators=(',', ':')).encode('utf-8'))
+    except Exception as e:
+        print(f'[{time.strftime("%H:%M:%S")}] persist {key} failed: {e}')
+
+
+def _load_persisted():
+    """Restore persisted images into CACHE. Returns the list of keys loaded.
+
+    Called from __main__ BEFORE the fetcher thread starts and BEFORE the
+    socket binds, so the very first request a client makes is already served
+    from the restored payloads rather than racing the boot fetch chain.
+
+    Seeds each *_updated stamp from the manifest's REAL epoch, never from
+    now(): the age guards downstream (/api/health, MUF_STALE_MAX_S) exist to
+    tell the operator how old the picture is, and stamping now() would make a
+    week-old map claim to be seconds fresh.
+    """
+    global _MUF_PNG_SOURCE
+    loaded = []
+    try:
+        entries = _read_manifest().get('entries') or {}
+        now = time.time()
+        clock_ok = now > _CLOCK_SANITY_EPOCH
+        for key, (default_name, stamp_key) in _PERSIST_KEYS.items():
+            ent = entries.get(key)
+            if not isinstance(ent, dict):
+                continue
+            fname = os.path.basename(str(ent.get('file') or default_name))
+            path = os.path.join(CACHE_DIR, fname)
+            try:
+                with open(path, 'rb') as f:
+                    data = f.read()
+            except OSError:
+                continue
+            size = ent.get('size')
+            try:
+                epoch = float(ent.get('epoch') or 0.0)
+            except (TypeError, ValueError):
+                epoch = 0.0
+            corrupt = (not data
+                       or not isinstance(size, int)
+                       or size != len(data)
+                       or not _image_is_complete(data))
+            if corrupt:
+                # Unlink only for corruption. An over-age entry is merely
+                # skipped (below) — a clock that is wrong but sane must not be
+                # able to destroy the cache.
+                print(f'[{time.strftime("%H:%M:%S")}] cache {key}: corrupt, '
+                      f'discarding {fname}')
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                continue
+            if clock_ok and epoch > 0 and (now - epoch) > PERSIST_MAX_AGE_S:
+                continue
+            CACHE[key] = data
+            if epoch > 0:
+                CACHE[stamp_key] = epoch
+            _PERSIST_LAST[key] = epoch or now
+            if key == 'muf_image_png':
+                _MUF_PNG_SOURCE = 'disk'
+            loaded.append(key)
+        if loaded:
+            print(f'[{time.strftime("%H:%M:%S")}] restored {len(loaded)} '
+                  f'cached image(s) from {CACHE_DIR}: {", ".join(loaded)}')
+    except Exception as e:
+        print(f'[{time.strftime("%H:%M:%S")}] cache restore failed: {e}')
+    return loaded
+
+
+# ---------------------------------------------------------------------------
+# Tier 2.2 — conditional GET (If-Modified-Since) + gzip on every fetcher
+# ---------------------------------------------------------------------------
+
+# URL -> the Last-Modified header we last saw for THAT url. Keyed per URL, not
+# per fetcher: enlil/drap/real-drap each iterate a two-URL fallback list, and
+# NOAA's Last-Modified is a shared mirror-sync stamp (measured identical
+# across unrelated products), so a per-fetcher key would replay one product's
+# validator against a different one.
+_HTTP_LAST_MODIFIED = {}
+_LAST_MODIFIED_CAP = 32
+
+
+def _conditional_get(url, timeout=20, record_lm=True):
+    """GET `url` with Accept-Encoding: gzip and If-Modified-Since.
+
+    Returns (body_bytes, not_modified). On a 304 the body is None.
+
+    Deliberately does NOT replay an ETag. prop.kc2g.com is Apache with
+    mod_deflate, which appends '-gzip' to the ETag on the way out but does not
+    strip it on the way back in (measured: If-None-Match with the gzip ETag +
+    Accept-Encoding: gzip returns 200 and the full body), and RFC 7232 makes
+    If-None-Match win when both validators are sent — so an ETag here would
+    silently disable the If-Modified-Since that does work.
+
+    urllib does not auto-inflate, so the gzip.decompress step is mandatory.
+    """
+    headers = {'User-Agent': UA, 'Accept-Encoding': 'gzip'}
+    lm = _HTTP_LAST_MODIFIED.get(url)
+    if lm:
+        headers['If-Modified-Since'] = lm
+    req = Request(url, headers=headers)
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            # Test doubles for urlopen expose read() only.
+            hdrs = getattr(resp, 'headers', None)
+            encoding = ''
+            new_lm = None
+            if hdrs is not None:
+                try:
+                    encoding = (hdrs.get('Content-Encoding') or '').lower()
+                    new_lm = hdrs.get('Last-Modified')
+                except Exception:
+                    encoding, new_lm = '', None
+    except HTTPError as e:
+        if e.code == 304:
+            return None, True
+        raise
+    if 'gzip' in encoding and raw:
+        raw = gzip.decompress(raw)
+    if record_lm and new_lm:
+        if len(_HTTP_LAST_MODIFIED) >= _LAST_MODIFIED_CAP:
+            # Bounded: the static URL set is <10 entries; only a derived
+            # (per-frame) NOAA animation URL could ever grow this.
+            _HTTP_LAST_MODIFIED.clear()
+        _HTTP_LAST_MODIFIED[url] = new_lm
+    return raw, False
 
 
 def _etag_for(key_updated):
-    """Tier 2c: format an ETag from a CACHE['..._updated'] epoch timestamp."""
+    """Format an ETag header value from a CACHE['..._updated'] timestamp.
+
+    Tier 2c perf: the fetchers stamp CACHE['{solar,bands,dx}_updated'] every
+    time they pre-encode the payload. Reusing that epoch as a quoted
+    millisecond-resolution string gives us a stable, free ETag — no hashing,
+    no extra state. RFC 7232 requires the quoted-string form.
+    """
     ts = CACHE.get(key_updated) or 0
     return '"%.3f"' % float(ts)
+
+
+def _kill_process_group(p):
+    """SIGCONT then SIGKILL the whole process group of subprocess `p`.
+
+    Tier 1.6: the rasterize child is `cpulimit -- python3 -c cairosvg`, and
+    cpulimit enforces its duty cycle by alternating SIGSTOP/SIGCONT on the
+    grandchild. Killing only `p` (what subprocess.run's timeout path does via
+    Popen.kill) SIGKILLs cpulimit and leaves the ~48 MB python3/cairosvg
+    grandchild orphaned — permanently SIGSTOPped if the timeout landed in the
+    STOP half of the cycle, or running unthrottled if it landed in the CONT
+    half. Repeated every 900 s on a 512 MB box that is an OOM.
+
+    SIGCONT goes first because a stopped process acts on nothing but SIGCONT
+    and SIGKILL; SIGKILL then takes the whole group down regardless of state.
+    """
+    pgid = None
+    try:
+        pgid = os.getpgid(p.pid)
+    except OSError:
+        pgid = None
+    # Safety rail: only ever signal a group we know is NOT our own. If
+    # start_new_session did not take effect the child shares our group and a
+    # killpg would SIGKILL the server itself.
+    try:
+        own = os.getpgid(0)
+    except OSError:
+        own = None
+    if pgid is None or pgid == own:
+        try:
+            p.kill()
+        except OSError:
+            pass
+        return
+    for sig in (signal.SIGCONT, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Tier 2.3 — strip chrome from the MUF SVG before handing it to cairosvg
+#
+# cairosvg's cost here is not pixels, it is <use> resolution: a profile of the
+# unslimmed render spends 61 % of its wall clock in cairosvg/defs.py:use(),
+# an O(n^2) cssselect2 re-walk per <use>. Removing the axis ticks, tick
+# labels, gridlines and the colorbar takes 257 <use> down to 114 and halves
+# the render (measured, cairosvg 2.9.0, output_width=360: 1157 ms -> 561 ms;
+# PNG 70,117 B -> 60,601 B).
+#
+# THREE THINGS THIS MUST NOT DO, each verified to destroy real data:
+#   (a) blanket-strip <use>. Of the 257, only 143 are chrome. text_29..text_50
+#       are the per-station MUF values printed on the ionosonde dots and
+#       text_52..text_69 are the contour value labels — both are <use>-only.
+#   (b) remove <g id="matplotlib.axis_1"> without hoisting the six digit glyph
+#       <defs> that live INSIDE it (DejaVuSans-30/31/32/34/36/38). The station
+#       and contour labels reference them, and would lose most of their
+#       digits.
+#   (c) prune "groups with no drawing descendant" — that deletes the document
+#       <style>*{stroke-linejoin:round;stroke-linecap:butt}</style>.
+# ---------------------------------------------------------------------------
+
+_SVG_NS = 'http://www.w3.org/2000/svg'
+_XLINK_NS = 'http://www.w3.org/1999/xlink'
+_SVG_Q = '{%s}' % _SVG_NS
+_XLINK_HREF = '{%s}href' % _XLINK_NS
+
+# Serialize back with the same prefixes matplotlib used, so the output stays
+# byte-for-byte plausible SVG rather than ns0:-prefixed.
+ElementTree.register_namespace('', _SVG_NS)
+ElementTree.register_namespace('xlink', _XLINK_NS)
+
+# patch_2 is the axes rectangle: "M<x> <y+h>v-<h>h<w>v<h>z"
+_PATCH2_D_RE = re.compile(
+    r'^M\s*(-?[\d.]+)[ ,]+(-?[\d.]+)\s*'
+    r'v\s*(-?[\d.]+)\s*h\s*(-?[\d.]+)\s*v\s*(-?[\d.]+)\s*z?$')
+_VIEWBOX_RE = re.compile(r'^\s*(-?[\d.]+)[ ,]+(-?[\d.]+)[ ,]+'
+                         r'(-?[\d.]+)[ ,]+(-?[\d.]+)\s*$')
+_LEN_RE = re.compile(r'^\s*(-?[\d.]+)')
+_URL_REF_RE = re.compile(r'url\(\s*#([^)\s]+)\s*\)')
+
+# Groups whose entire subtree is chrome: the x/y axis ticks + labels +
+# gridlines, and axes_2 (the colorbar, with its own matplotlib.axis_3).
+_MUF_CHROME_ID_PREFIX = 'matplotlib.axis'
+_MUF_CHROME_IDS = ('axes_2',)
+
+# The real document is ~365 KB. Refusing to build a DOM for anything wildly
+# larger bounds both the peak RSS of the parse on a 512 MB box and the blast
+# radius of an entity-expansion payload (xml.etree is safe against XXE and DTD
+# retrieval but not against billion-laughs). defusedxml is not in the stdlib
+# and cannot be installed on the target, and cairosvg parses these same bytes
+# with its own parser either way, so this cap is the available mitigation.
+_MUF_SVG_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _slim_muf_svg(svg_bytes):
+    """Return a chrome-free copy of the KC2G MUF SVG, or None.
+
+    None means "I did not recognise this document" and the caller must fall
+    back to the original bytes unchanged — an upstream re-render that moves
+    the structure must degrade to today's exact behaviour, never to a broken
+    or half-stripped map.
+    """
+    try:
+        if not svg_bytes or len(svg_bytes) > _MUF_SVG_MAX_BYTES:
+            return None
+        root = ElementTree.fromstring(svg_bytes)
+        if root.tag != _SVG_Q + 'svg':
+            return None
+
+        parents = {}
+        for parent in root.iter():
+            for child in parent:
+                parents[child] = parent
+
+        # --- crop rectangle from patch_2 (the axes box) --------------------
+        patch2 = None
+        for el in root.iter(_SVG_Q + 'path'):
+            if el.get('id') == 'patch_2':
+                patch2 = el
+                break
+        if patch2 is None:
+            return None
+        m = _PATCH2_D_RE.match((patch2.get('d') or '').strip())
+        if m is None:
+            return None
+        px, py, pdy, pdx, _pdy2 = (float(v) for v in m.groups())
+        crop_w = abs(pdx)
+        crop_h = abs(pdy)
+        crop_x = px
+        crop_y = min(py, py + pdy)
+
+        vb = _VIEWBOX_RE.match(root.get('viewBox') or '')
+        if vb is None:
+            return None
+        _vx, _vy, vw, vh = (float(v) for v in vb.groups())
+        # Plausibility: the axes box must sit inside the page and must be most
+        # of it. A 5x5 crop out of a 1145x679 page is a parse accident, not a
+        # map.
+        if not (vw > 0 and vh > 0 and crop_w > 0 and crop_h > 0):
+            return None
+        if crop_x < 0 or crop_y < 0:
+            return None
+        if crop_x + crop_w > vw * 1.001 or crop_y + crop_h > vh * 1.001:
+            return None
+        if crop_w < 0.5 * vw or crop_h < 0.5 * vh:
+            return None
+
+        # --- collect the chrome groups ------------------------------------
+        doomed = []
+        for el in root.iter(_SVG_Q + 'g'):
+            eid = el.get('id') or ''
+            if eid.startswith(_MUF_CHROME_ID_PREFIX) or eid in _MUF_CHROME_IDS:
+                doomed.append(el)
+        if not doomed:
+            return None
+
+        # (b) stash every <defs> child before the subtrees go away.
+        stashed = []
+        for group in doomed:
+            for defs in group.iter(_SVG_Q + 'defs'):
+                for child in defs:
+                    if child.get('id'):
+                        stashed.append(child)
+
+        for group in doomed:
+            parent = parents.get(group)
+            if parent is None:
+                continue
+            try:
+                parent.remove(group)
+            except ValueError:
+                # Already gone with an ancestor (matplotlib.axis_3 lives
+                # inside axes_2). Nothing to do.
+                pass
+
+        # --- hoist back only the defs the survivors still reference --------
+        referenced = set()
+        defined = set()
+        for el in root.iter():
+            eid = el.get('id')
+            if eid:
+                defined.add(eid)
+            href = el.get(_XLINK_HREF) or el.get('href')
+            if href and href.startswith('#'):
+                referenced.add(href[1:])
+            for value in el.attrib.values():
+                for ref in _URL_REF_RE.finditer(value):
+                    referenced.add(ref.group(1))
+        needed = [d for d in stashed
+                  if d.get('id') in referenced and d.get('id') not in defined]
+        if needed:
+            hoisted = ElementTree.Element(_SVG_Q + 'defs')
+            hoisted.extend(needed)
+            root.insert(0, hoisted)
+
+        # --- crop ----------------------------------------------------------
+        # Keep the intrinsic px-per-unit scale so cairosvg's output_width
+        # keeps meaning the same thing; only the aspect ratio changes (the
+        # axis gutters and colorbar are gone).
+        scale = 1.0
+        wm = _LEN_RE.match(root.get('width') or '')
+        if wm is not None:
+            try:
+                scale = float(wm.group(1)) / vw
+            except (ValueError, ZeroDivisionError):
+                scale = 1.0
+        if not (0.01 < scale < 100.0):
+            scale = 1.0
+        root.set('viewBox', '%g %g %g %g' % (crop_x, crop_y, crop_w, crop_h))
+        root.set('width', '%g' % (crop_w * scale))
+        root.set('height', '%g' % (crop_h * scale))
+
+        return ElementTree.tostring(root, encoding='utf-8')
+    except Exception as e:
+        print('[muf] slim failed, using full SVG: %s' % e, file=sys.stderr)
+        return None
+
+
+def _record_muf_render(seconds):
+    """Fold a successful render's wall clock into the in-RAM EWMA."""
+    global _muf_render_ewma
+    try:
+        s = float(seconds)
+    except (TypeError, ValueError):
+        return
+    # Reject NaN/inf/non-positive so one bad sample can never pin the budget.
+    if not (0.0 < s < 1e6):
+        return
+    if _muf_render_ewma is None:
+        _muf_render_ewma = s
+    else:
+        _muf_render_ewma = ((1.0 - MUF_EWMA_ALPHA) * _muf_render_ewma
+                            + MUF_EWMA_ALPHA * s)
+
+
+def _muf_timeout():
+    """Adaptive rasterize budget, floored at PHASE2_TIMEOUT_S."""
+    ewma = _muf_render_ewma
+    if not ewma:
+        return PHASE2_TIMEOUT_S
+    return int(min(PHASE2_TIMEOUT_MAX_S,
+                   max(PHASE2_TIMEOUT_S, MUF_TIMEOUT_FACTOR * ewma)))
+
+
+def _rasterize_once(payload, timeout_s):
+    """One cpulimit+cairosvg subprocess round trip. None on any failure."""
+    argv = ['cpulimit', '-l', '50', '-q', '--',
+            'python3', '-c',
+            'import sys, cairosvg; cairosvg.svg2png('
+            'bytestring=sys.stdin.buffer.read(), '
+            'output_width=360, write_to=sys.stdout.buffer)']
+    p = None
+    try:
+        p = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            out, _err = p.communicate(input=payload, timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(p)
+            try:
+                p.communicate()  # reap cpulimit, drain the pipes
+            except Exception:
+                pass
+            raise
+        if p.returncode:
+            raise subprocess.CalledProcessError(p.returncode, argv, output=out)
+        return out
+    # FileNotFoundError (cpulimit not installed) is an OSError subclass.
+    except (subprocess.SubprocessError, OSError) as e:
+        print('[muf] rasterize failed: %s' % e, file=sys.stderr)
+        return None
+    finally:
+        # Belt and braces: no exit path may leave the group alive. A no-op on
+        # every normal path (communicate() has already reaped by then).
+        if p is not None and p.poll() is None:
+            _kill_process_group(p)
+
+
+def _rasterize_muf(svg_bytes):
+    """Render the KC2G MUF SVG to PNG in a subprocess so the multi-second
+    render does not block the request thread or the background fetcher.
+
+    output_width=360 because the MUF panel is ~360x210 in the Tier 2a
+    720x450 native framebuffer (HVS upscales to 1440x900); rendering at
+    native panel width halves cairo's CPU cost vs. the prior 720 width.
+    cairosvg.svg2png preserves aspect ratio when only output_width is
+    given. Width is NOT the lever it looks like — measured, cairosvg's cost
+    is per-parse, not per-pixel (original @360 = 1157 ms vs @204 = 1172 ms),
+    and /api/muf-map is shared with the browser dashboard where the panel is
+    ~790 px wide. Tier 2.3's slimming is what actually halves the render.
+
+    cpulimit caps the subprocess to 50% of one core so the render loop
+    keeps its frame budget even mid-rasterize. nice -n 19 alone is
+    ineffective on an idle single-core box because the render loop
+    sleeps between 10 FPS frames; the cairosvg job would still claim
+    the core. cpulimit enforces a hard duty cycle.
+
+    Tier 1.6: started with start_new_session=True so cpulimit and the
+    python3/cairosvg grandchild it forks share one process group we can take
+    down as a unit on timeout (see _kill_process_group). start_new_session is
+    implemented natively in _posixsubprocess — unlike preexec_fn it is safe in
+    a threaded process and keeps the vfork fast path.
+
+    Returns the PNG bytes, or None on subprocess error / timeout /
+    missing cpulimit / cairosvg ImportError inside the child.
+    """
+    timeout_s = _muf_timeout()
+    slimmed = _slim_muf_svg(svg_bytes)
+    payload = slimmed if slimmed else svg_bytes
+
+    started = time.monotonic()
+    out = _rasterize_once(payload, timeout_s)
+    elapsed = time.monotonic() - started
+
+    if out:
+        _record_muf_render(elapsed)
+        return out
+
+    # Tier 2.3 safety net: if the SLIMMED payload failed quickly, that is a
+    # cairosvg parse complaint about our surgery, not a slow box — retry once
+    # with the untouched bytes so a future upstream re-render can never turn a
+    # working map into a permanently blank panel. Deliberately not retried
+    # after a timeout: two full budgets back to back (up to 220 s) would
+    # starve the 120 s fetch_dx cadence, which is exactly what
+    # PHASE2_TIMEOUT_MAX_S exists to prevent.
+    if slimmed and elapsed < timeout_s * 0.5:
+        print('[muf] slimmed SVG did not render in %.1fs; retrying unslimmed'
+              % elapsed, file=sys.stderr)
+        started = time.monotonic()
+        out = _rasterize_once(svg_bytes, timeout_s)
+        if out:
+            _record_muf_render(time.monotonic() - started)
+            return out
+    return None
 
 
 # Solar image proxy (NASA SDO)
@@ -352,7 +1026,9 @@ def fetch_hamqsl():
     """Fetch solar and band data from HamQSL XML"""
     try:
         req = Request('https://www.hamqsl.com/solarxml.php', headers={'User-Agent': UA})
-        with urlopen(req, timeout=15) as resp:
+        # Tier 1b perf: 8 s is well above HamQSL's median response (~1 s);
+        # the prior 15 s pinned the fetcher on a transient upstream stall.
+        with urlopen(req, timeout=8) as resp:
             xml_data = resp.read().decode('utf-8')
 
         root = ElementTree.fromstring(xml_data)
@@ -394,9 +1070,19 @@ def fetch_hamqsl():
                 bands[name][time_attr] = condition
 
         CACHE['solar'] = solar
-        CACHE['solar_updated'] = time.time()
         CACHE['bands'] = bands
-        CACHE['bands_updated'] = time.time()
+        # Tier 1b perf: pre-encode once per fetch so /api/solar + /api/bands
+        # can write the cached bytes straight to the socket.
+        CACHE['solar_bytes'] = json.dumps(solar, separators=(',', ':')).encode('utf-8')
+        CACHE['bands_bytes'] = json.dumps(bands, separators=(',', ':')).encode('utf-8')
+        # Payload slots are written BEFORE the *_updated stamps on purpose:
+        # the stamp is the ETag source and this is a ThreadingHTTPServer, so a
+        # request landing between the two statements would receive the NEW
+        # ETag with the OLD body — and would then be 304'd on that ETag for up
+        # to the full 5-minute solar cadence.
+        stamp = time.time()
+        CACHE['solar_updated'] = stamp
+        CACHE['bands_updated'] = stamp
         print(f'[{time.strftime("%H:%M:%S")}] Solar/bands updated: SFI={solar["sfi"]} Kp={solar["kIndex"]}')
     except Exception as e:
         print(f'[{time.strftime("%H:%M:%S")}] HamQSL fetch failed: {e}')
@@ -432,10 +1118,15 @@ def freq_to_band(freq_khz):
 
 
 def fetch_dx():
-    """Fetch DX spots from HamQTH or fallback"""
+    """Fetch DX spots from HamQTH or fallback.
+
+    Tier 1b perf: limit=15 (was 30) is enough for the pygame client
+    (5 rows in draw_dx_spots + band-activity histogram which only needs
+    counts per band). Halves the upstream CSV and the cached payload.
+    """
     urls = [
-        'https://www.hamqth.com/dxc_csv.php?limit=30',
-        'https://www.ha8tks.hu/dx/dxc_csv.php?limit=30',
+        'https://www.hamqth.com/dxc_csv.php?limit=15',
+        'https://www.ha8tks.hu/dx/dxc_csv.php?limit=15',
     ]
     for url in urls:
         try:
@@ -456,6 +1147,8 @@ def fetch_dx():
                     freq_khz = float(freq)
                     country = parts[10].strip() if len(parts) > 10 else ''
                     coords = COUNTRY_COORDS.get(country)
+                    # Tier 1b perf: drop the 'country' field — nothing downstream
+                    # reads it; only lat/lng are used to plot on the map.
                     spot = {
                         'frequency': freq,
                         'spotter': parts[0].strip(),
@@ -463,7 +1156,6 @@ def fetch_dx():
                         'comment': parts[3].strip() if len(parts) > 3 else '',
                         'time': parts[4].strip() if len(parts) > 4 else '',
                         'band': freq_to_band(freq_khz),
-                        'country': country,
                         'lat': coords[0] if coords else None,
                         'lng': coords[1] if coords else None,
                     }
@@ -473,6 +1165,13 @@ def fetch_dx():
 
             if spots:
                 CACHE['dxspots'] = spots
+                # Tier 1b perf: pre-encode the dxspots payload once per fetch.
+                CACHE['dxspots_bytes'] = json.dumps(
+                    spots, separators=(',', ':')
+                ).encode('utf-8')
+                # Body before stamp — see the note in fetch_hamqsl: the stamp
+                # is the ETag and a request racing between the two would be
+                # 304'd against a body it never received.
                 CACHE['dx_updated'] = time.time()
                 print(f'[{time.strftime("%H:%M:%S")}] DX spots updated: {len(spots)} spots from {url.split("/")[2]}')
                 return
@@ -482,24 +1181,91 @@ def fetch_dx():
 
 
 def fetch_muf():
-    """Fetch KC2G MUF SVG and rasterize to PNG (Phase 2 offline mirror)."""
+    """Fetch KC2G MUF propagation map SVG and rasterize to PNG.
+
+    The SVG bytes stay in CACHE['muf_image'] so the browser dashboard keeps
+    working (it consumes the SVG directly). The native pygame client wants
+    pre-rasterized PNG because cairosvg on a Pi 1 takes seconds — too slow
+    for the render loop, and SDL/nanosvg decodes the raw SVG into a 5.5 MB
+    greyscale surface on the render thread if it is ever handed one.
+
+    Tier 1.5: a failed rasterize no longer wipes CACHE['muf_image_png'].
+    Overwriting a good PNG with None turns one 45 s timeout into a blank
+    panel until the next successful render 15+ minutes later, and (with the
+    native client now refusing SVG) into a blank panel forever if the
+    rasterize keeps timing out. The last good PNG is kept until it is older
+    than MUF_STALE_MAX_S.
+
+    Tier 2.2: revalidates with If-Modified-Since (365,246 B -> 148,984 B on
+    the wire with gzip, 0 B on a 304).
+    """
+    global _MUF_PNG_SOURCE
     try:
-        req = Request('https://prop.kc2g.com/renders/current/mufd-normal-now.svg',
-                      headers={'User-Agent': UA})
-        with urlopen(req, timeout=20) as resp:
-            data = resp.read()
-        CACHE['muf_image'] = data
-        CACHE['muf_image_updated'] = time.time()
+        data, not_modified = _conditional_get(MUF_URL, timeout=20)
+        if not_modified:
+            # CRITICAL: a 304 must not short-circuit when we have no PNG.
+            # One failed rasterize plus a stalled upstream generator (the SVG
+            # is regenerated on a schedule; a stall is normal) would otherwise
+            # strand /api/muf-map on 503 permanently, because the only code
+            # path that renders is the one that just returned early.
+            if CACHE.get('muf_image_png'):
+                print(f'[{time.strftime("%H:%M:%S")}] MUF map unchanged (304)')
+                return
+            data = CACHE.get('muf_image')
+            if not data:
+                print(f'[{time.strftime("%H:%M:%S")}] MUF map unchanged (304), '
+                      f'nothing cached to rasterize')
+                return
+            print(f'[{time.strftime("%H:%M:%S")}] MUF map unchanged (304), '
+                  f're-rasterizing the cached SVG')
+        else:
+            CACHE['muf_image'] = data
+            CACHE['muf_image_updated'] = time.time()
+        # The PNG inherits the SVG's epoch, not now(): re-rendering a
+        # six-hour-old SVG must not make the map claim to be fresh, or the
+        # /api/health age label (and MUF_STALE_MAX_S) start lying.
+        stamp = CACHE.get('muf_image_updated') or time.time()
         png = _rasterize_muf(data)
-        CACHE['muf_image_png'] = png
-        if png is not None:
+        if png:
+            CACHE['muf_image_png'] = png
+            CACHE['muf_image_png_updated'] = stamp
+            _MUF_PNG_SOURCE = 'live'
+            _persist('muf_image_png')
             print(f'[{time.strftime("%H:%M:%S")}] MUF map updated '
                   f'({len(data)} B SVG -> {len(png)} B PNG)')
         else:
-            print(f'[{time.strftime("%H:%M:%S")}] MUF map updated '
-                  f'({len(data)} B SVG, PNG rasterize failed)')
+            prev = CACHE.get('muf_image_png')
+            age = time.time() - (CACHE.get('muf_image_png_updated') or 0)
+            if prev and age <= MUF_STALE_MAX_S:
+                print(f'[{time.strftime("%H:%M:%S")}] MUF map updated '
+                      f'({len(data)} B SVG, PNG rasterize failed — '
+                      f'keeping last good PNG, age {int(age)} s)')
+            else:
+                CACHE['muf_image_png'] = None
+                CACHE['muf_image_png_updated'] = 0
+                _MUF_PNG_SOURCE = 'none'
+                print(f'[{time.strftime("%H:%M:%S")}] MUF map updated '
+                      f'({len(data)} B SVG, PNG rasterize failed)')
     except Exception as e:
         print(f'[{time.strftime("%H:%M:%S")}] MUF map fetch failed: {e}')
+
+
+def _note_unchanged(label, cache_key, url):
+    """Handle a 304 for an image product. True => the caller should return.
+
+    True means "we already hold the body upstream just told us is current".
+    False is the pathological case (a validator with no body behind it — the
+    slot was cleared after the validator was recorded); we drop the stale
+    validator so the next attempt is unconditional and let the caller fall
+    through to its fallback URL.
+    """
+    if CACHE.get(cache_key):
+        print(f'[{time.strftime("%H:%M:%S")}] {label} unchanged (304)')
+        return True
+    _HTTP_LAST_MODIFIED.pop(url, None)
+    print(f'[{time.strftime("%H:%M:%S")}] {label} unchanged (304) but the '
+          f'cache slot is empty; dropping the validator')
+    return False
 
 
 def fetch_enlil():
@@ -510,20 +1276,32 @@ def fetch_enlil():
     ]
     for url in urls:
         try:
-            req = Request(url, headers={'User-Agent': UA})
-            with urlopen(req, timeout=20) as resp:
-                data = resp.read()
+            data, not_modified = _conditional_get(url, timeout=20)
+            if not_modified:
+                if _note_unchanged('Enlil', 'enlil_image', url):
+                    # return, not continue: falling through would re-download
+                    # the same product from the fallback URL every cycle.
+                    return
+                continue
             if url.endswith('.json'):
                 # JSON response — extract latest image URL
                 items = json.loads(data.decode('utf-8'))
                 if items:
                     last = items[-1]
                     img_url = 'https://services.swpc.noaa.gov' + last.get('url', '')
-                    req2 = Request(img_url, headers={'User-Agent': UA})
-                    with urlopen(req2, timeout=20) as resp2:
-                        data = resp2.read()
+                    # record_lm=False: this URL names one animation FRAME and
+                    # changes every cycle, so caching its validator would grow
+                    # _HTTP_LAST_MODIFIED without ever producing a 304.
+                    img, img_304 = _conditional_get(img_url, timeout=20,
+                                                    record_lm=False)
+                    if img_304:
+                        continue
+                    data = img
+            if not data:
+                raise ValueError('empty body')
             CACHE['enlil_image'] = data
             CACHE['enlil_image_updated'] = time.time()
+            _persist('enlil_image')
             print(f'[{time.strftime("%H:%M:%S")}] Enlil updated ({len(data)} bytes)')
             return
         except Exception as e:
@@ -538,15 +1316,23 @@ def fetch_drap():
     ]
     for url in urls:
         try:
-            req = Request(url, headers={'User-Agent': UA})
-            with urlopen(req, timeout=20) as resp:
-                data = resp.read()
+            data, not_modified = _conditional_get(url, timeout=20)
+            if not_modified:
+                if _note_unchanged('Aurora', 'drap_image', url):
+                    return
+                continue
+            if not data:
+                raise ValueError('empty body')
             CACHE['drap_image'] = data
             CACHE['drap_image_updated'] = time.time()
-            print(f'[{time.strftime("%H:%M:%S")}] DRAP updated ({len(data)} bytes)')
+            _persist('drap_image')
+            # 'Aurora', not 'DRAP': fetch_real_drap logs the D-RAP global map.
+            # Two identical "DRAP updated" lines made the journal useless for
+            # telling which of the two products actually landed.
+            print(f'[{time.strftime("%H:%M:%S")}] Aurora updated ({len(data)} bytes)')
             return
         except Exception as e:
-            print(f'[{time.strftime("%H:%M:%S")}] DRAP fetch failed ({url}): {e}')
+            print(f'[{time.strftime("%H:%M:%S")}] Aurora fetch failed ({url}): {e}')
 
 
 def fetch_real_drap():
@@ -557,15 +1343,48 @@ def fetch_real_drap():
     ]
     for url in urls:
         try:
-            req = Request(url, headers={'User-Agent': UA})
-            with urlopen(req, timeout=20) as resp:
-                data = resp.read()
+            data, not_modified = _conditional_get(url, timeout=20)
+            if not_modified:
+                if _note_unchanged('DRAP', 'real_drap_image', url):
+                    return
+                continue
+            if not data:
+                raise ValueError('empty body')
             CACHE['real_drap_image'] = data
             CACHE['real_drap_image_updated'] = time.time()
+            _persist('real_drap_image')
             print(f'[{time.strftime("%H:%M:%S")}] DRAP updated ({len(data)} bytes)')
             return
         except Exception as e:
             print(f'[{time.strftime("%H:%M:%S")}] DRAP fetch failed ({url}): {e}')
+
+
+def fetch_sdo():
+    """Fetch the NASA SDO solar disk image into CACHE['solar_image'].
+
+    Tier 1.3: this used to happen inline in the /api/solar-image handler,
+    which made that endpoint the only one doing upstream I/O on a request
+    thread — with a 20 s timeout that exactly equals the native client's
+    IMAGE_TIMEOUT, no negative cache and no in-flight dedupe, so every
+    request after a failure re-tried upstream and burned the client's entire
+    serial image budget before it ever reached /api/muf-map.
+
+    Assigns on success only: writing None over a good image would blank the
+    SDO panel on a single transient upstream failure.
+    """
+    try:
+        data, not_modified = _conditional_get(SDO_URL, timeout=20)
+        if not_modified:
+            _note_unchanged('SDO', 'solar_image', SDO_URL)
+            return
+        if not data:
+            raise ValueError('empty body')
+        CACHE['solar_image'] = data
+        CACHE['solar_image_updated'] = time.time()
+        _persist('solar_image')
+        print(f'[{time.strftime("%H:%M:%S")}] SDO updated ({len(data)} bytes)')
+    except Exception as e:
+        print(f'[{time.strftime("%H:%M:%S")}] SDO image fetch failed: {e}')
 
 
 _NTP_HOSTNAME_RE = re.compile(r'^[a-z0-9\-\.]+$', re.IGNORECASE)
@@ -654,16 +1473,91 @@ def get_host_ntp():
     return 'pool.ntp.org'
 
 
+# Tier 1.3: boot order for the five image products. 'real-drap' is FIRST
+# because it backs the propagation panel's DEFAULT tab (PROP_TAB_IMAGE_KEY
+# ['drap'] == 'real-drap') — it used to be fetched last, ~56 s after the
+# client's one and only image refresh had already given up. fetch_muf is last
+# because it is by far the slowest (365 KB SVG + a multi-second rasterize).
+# The CACHE key is the one the fast-retry probes for emptiness.
+_IMAGE_FETCH_ORDER = (
+    ('real_drap_image', 'real_drap'),
+    ('drap_image', 'drap'),
+    ('enlil_image', 'enlil'),
+    ('solar_image', 'sdo'),
+    # Probe the SVG slot, not muf_image_png: a failed rasterize is a
+    # deterministic timeout, not a transient, so re-running it twice more at
+    # 45 s a go would just burn the boot window.
+    ('muf_image', 'muf'),
+)
+
+# Two extra passes, 20 s apart. Bounded on purpose: unbounded retries here
+# would be indistinguishable from the refetch storm this tier removes.
+IMAGE_FAST_RETRY_PASSES = 2
+IMAGE_FAST_RETRY_SLEEP_S = 20
+
+# Five image products on a 900 s cadence => a 180 s comb. Evenly staggering
+# the refreshes keeps two large decodes off the same tick; a simultaneous
+# refresh transiently doubles image memory and can tip a 512MB Pi into an OOM
+# kill. (Was a 4-slot 225 s comb before fetch_sdo joined the loop.)
+IMAGE_STAGGER_S = 180
+
+
+def _image_fetchers():
+    """(cache_key, fetch_fn) pairs in boot order.
+
+    Resolved lazily by name so tests (and any future wrapper) can monkeypatch
+    server.fetch_* and have the boot chain honour it.
+    """
+    g = globals()
+    return [(key, g['fetch_' + name]) for key, name in _IMAGE_FETCH_ORDER]
+
+
+def _image_stagger_offsets(now0):
+    """Initial last-fetch stamps for the five image products.
+
+    The product fetched FIRST at boot is the oldest, so it gets the earliest
+    comb slot (now0 - 4*IMAGE_STAGGER_S => next refresh in 180 s) and the
+    slowest/last one keeps the full 900 s.
+    """
+    n = len(_IMAGE_FETCH_ORDER)
+    return {name: now0 - (n - 1 - i) * IMAGE_STAGGER_S
+            for i, (_key, name) in enumerate(_IMAGE_FETCH_ORDER)}
+
+
+# Resolve once at import so a typo in _IMAGE_FETCH_ORDER refuses to start the
+# service, instead of killing background_fetcher on a daemon thread mid-boot
+# and leaving the dashboard frozen on empty data with only a stderr traceback.
+_image_fetchers()
+
+
+def _image_fast_retry(passes=IMAGE_FAST_RETRY_PASSES,
+                      sleep_s=IMAGE_FAST_RETRY_SLEEP_S):
+    """Retry only the image products whose CACHE slot is still empty.
+
+    Without this a single boot-time failure (network not up yet) left that
+    panel blank until the next 900 s cadence tick.
+    """
+    for _ in range(passes):
+        missing = [(key, fn) for key, fn in _image_fetchers()
+                   if not CACHE.get(key)]
+        if not missing:
+            return
+        time.sleep(sleep_s)
+        for key, fn in missing:
+            if not CACHE.get(key):
+                fn()
+
+
 def background_fetcher():
     """Background thread to periodically fetch data"""
     fetch_hamqsl()
     fetch_dx()
-    fetch_muf()
-    fetch_enlil()
-    fetch_drap()
-    fetch_real_drap()
 
-    # Fast retry if initial fetch failed (network might not be ready yet)
+    # Fast retry if initial fetch failed (network might not be ready yet).
+    # Hoisted ABOVE the image fetches: those are five upstream round trips
+    # plus a rasterize, so leaving the recovery path below them delayed the
+    # first solar/DX retry by ~100 s on exactly the boot where the network
+    # was not ready at ExecStart.
     for _ in range(6):
         if CACHE['solar'] and CACHE['dxspots']:
             break
@@ -673,19 +1567,22 @@ def background_fetcher():
         if not CACHE['dxspots']:
             fetch_dx()
 
+    for _key, fn in _image_fetchers():
+        fn()
+    _image_fast_retry()
+
     solar_interval = 300   # 5 minutes
     dx_interval = 120      # 2 minutes
     image_interval = 900   # 15 minutes
-    # Stagger the four 15-min image fetches so they never all run on the same
-    # tick — a simultaneous refresh transiently doubles image memory and can
-    # tip a 512MB Pi into an OOM kill.
     now0 = time.time()
     last_solar = now0
     last_dx = now0
-    last_muf = now0
-    last_enlil = now0 - 225
-    last_drap = now0 - 450
-    last_real_drap = now0 - 675
+    stagger = _image_stagger_offsets(now0)
+    last_muf = stagger['muf']
+    last_enlil = stagger['enlil']
+    last_drap = stagger['drap']
+    last_real_drap = stagger['real_drap']
+    last_sdo = stagger['sdo']
 
     while True:
         try:
@@ -709,11 +1606,27 @@ def background_fetcher():
             if now - last_real_drap >= image_interval:
                 fetch_real_drap()
                 last_real_drap = now
+            if now - last_sdo >= image_interval:
+                fetch_sdo()
+                last_sdo = now
         except Exception as e:
             # Never let the loop die silently — that would freeze the
             # dashboard on stale data forever. Log and keep going.
             print(f'[{time.strftime("%H:%M:%S")}] background loop error: {e}')
             time.sleep(10)
+
+
+def _age_of(stamp_key, now):
+    """Seconds since CACHE[stamp_key], or -1 if it was never stamped.
+
+    Clamped at 0: the Pi 1 has no RTC, so a persisted epoch written after an
+    NTP sync can legitimately be in the future relative to a fresh boot's
+    fake-hwclock time, and a negative age renders as garbage.
+    """
+    stamp = CACHE.get(stamp_key) or 0
+    if not stamp:
+        return -1
+    return max(0, int(now - stamp))
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -724,14 +1637,27 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=os.path.dirname(os.path.abspath(__file__)), **kwargs)
 
+    # API paths a HEAD must never be dispatched into, because serving them
+    # performs unbounded upstream network I/O on the handler thread. Every
+    # other branch is a pure cache/static read and honours self.command
+    # == 'HEAD' by suppressing the body, so delegating is safe for those.
+    _HEAD_UNSAFE_PREFIXES = ('/api/callsign/',)
+
     def do_HEAD(self):
+        path = urlparse(self.path).path
+        if path.startswith(self._HEAD_UNSAFE_PREFIXES):
+            # A header-only probe has no business firing two 8 s upstream
+            # callbook lookups.
+            self.send_error(405, 'HEAD not supported for callsign lookup')
+            return
         self.do_GET()
 
     def do_GET(self):
         path = urlparse(self.path).path
         if path == '/api/solar':
-            # Tier 2c perf: 304 conditional GET — client skips json.loads
-            # ~80% of polls (5 min upstream vs 60 s client cadence).
+            # Tier 2c perf: 304 conditional GET. ~80% of polls land on
+            # unchanged data (5 min upstream cadence vs ~60 s client poll);
+            # a 304 + empty body lets the client skip json.loads entirely.
             etag = _etag_for('solar_updated')
             inm = self.headers.get('If-None-Match', '')
             if inm == etag and etag != '"0.000"':
@@ -740,7 +1666,11 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_header('Cache-Control', 'no-store')
                 self.end_headers()
                 return
-            self.send_json_with_etag(CACHE.get('solar') or {}, etag)
+            # Tier 1b perf: prefer the pre-encoded bytes; fall back to the dict
+            # (and let send_json re-encode) until the first fetch completes.
+            self.send_json_with_etag(
+                CACHE.get('solar_bytes') or (CACHE.get('solar') or {}),
+                etag)
         elif path == '/api/bands':
             etag = _etag_for('bands_updated')
             inm = self.headers.get('If-None-Match', '')
@@ -750,7 +1680,9 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_header('Cache-Control', 'no-store')
                 self.end_headers()
                 return
-            self.send_json_with_etag(CACHE.get('bands') or {}, etag)
+            self.send_json_with_etag(
+                CACHE.get('bands_bytes') or (CACHE.get('bands') or {}),
+                etag)
         elif path == '/api/dxspots':
             etag = _etag_for('dx_updated')
             inm = self.headers.get('If-None-Match', '')
@@ -760,30 +1692,44 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_header('Cache-Control', 'no-store')
                 self.end_headers()
                 return
-            self.send_json_with_etag(CACHE.get('dxspots') or [], etag)
+            self.send_json_with_etag(
+                CACHE.get('dxspots_bytes') or (CACHE.get('dxspots') or []),
+                etag)
         elif path == '/api/solar-image':
-            # Fetch/cache SDO solar image (15 min cache)
-            now = time.time()
-            if CACHE['solar_image'] is None or now - CACHE['solar_image_updated'] > 900:
-                try:
-                    req = Request(SDO_URL, headers={'User-Agent': UA})
-                    with urlopen(req, timeout=20) as resp:
-                        CACHE['solar_image'] = resp.read()
-                        CACHE['solar_image_updated'] = now
-                except Exception as e:
-                    print(f'[{time.strftime("%H:%M:%S")}] SDO image fetch failed: {e}')
-                    if CACHE['solar_image'] is None:
-                        self.send_error(502, 'Failed to fetch solar image')
-                        return
-            self.send_binary(CACHE['solar_image'], 'image/jpeg')
+            # Tier 1.3: pure cache read. background_fetcher owns the SDO
+            # refresh (fetch_sdo); doing it here made this the one endpoint
+            # that could stall a handler thread for 20 s — the client's whole
+            # image budget — and re-tried upstream on EVERY request after a
+            # failure, because the age guard stays true forever once the slot
+            # is empty. Single snapshot read so the fetcher thread cannot swap
+            # the slot between the test and the write.
+            img = CACHE.get('solar_image')
+            if img:
+                self.send_binary(img, 'image/jpeg')
+            else:
+                self.send_error(503, 'Solar image not yet loaded')
         elif path.startswith('/api/muf-map'):
-            # Phase 2: prefer pre-rasterized PNG; fall back to SVG.
+            # Phase 2 / Tier 1.5: prefer the pre-rasterized PNG (the native
+            # pygame client blits it directly). The SVG fallback exists only
+            # for the browser dashboard — handing 365 KB of SVG to the native
+            # client makes SDL/nanosvg decode a 5.5 MB greyscale surface on
+            # the render thread (a 3-5 s freeze on ARMv6), so a client that
+            # asks for ?fmt=png gets PNG or 503, never SVG.
+            #
+            # Negotiation keys off the query string, NOT Accept: index.html
+            # requests via <img src>, whose Accept header we do not control,
+            # and it already cache-busts with '?t=' (index.html:842).
+            want_png = 'png' in parse_qs(urlparse(self.path).query).get('fmt', ())
             png = CACHE.get('muf_image_png')
+            svg = CACHE.get('muf_image')
             if png:
                 body = png
                 ctype = 'image/png'
-            elif CACHE.get('muf_image'):
-                body = CACHE['muf_image']
+            elif want_png:
+                self.send_error(503, 'MUF PNG not yet rendered')
+                return
+            elif svg:
+                body = svg
                 ctype = 'image/svg+xml'
             else:
                 self.send_error(503, 'MUF map not yet loaded')
@@ -792,6 +1738,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header('Content-Type', ctype)
             self.send_header('Content-Length', len(body))
             self.send_header('Access-Control-Allow-Origin', '*')
+            # no-store: the dashboard fetches a fresh URL each cycle; if the
+            # browser cached these it would accumulate entries until OOM.
             self.send_header('Cache-Control', 'no-store')
             self.end_headers()
             if self.command != 'HEAD':
@@ -820,11 +1768,27 @@ class Handler(SimpleHTTPRequestHandler):
                 CACHE['host_ntp'] = get_host_ntp()
             self.send_json({'ntp': CACHE['host_ntp']})
         elif path == '/api/health':
+            # Tier 2.1/2.5: the image ages are how the clients label a
+            # persisted-stale picture. Neither client can read response
+            # headers — the browser gets these via <img src> and
+            # hamclock_data._fetch_binary discards them — so /api/health is
+            # the only channel. Serving a day-old map unlabelled is worse
+            # than serving nothing to an operator making a band decision.
+            now = time.time()
             self.send_json({
                 'status': 'ok',
-                'solar_age': int(time.time() - CACHE['solar_updated']) if CACHE['solar_updated'] else -1,
-                'bands_age': int(time.time() - CACHE['bands_updated']) if CACHE['bands_updated'] else -1,
-                'dx_age': int(time.time() - CACHE['dx_updated']) if CACHE['dx_updated'] else -1,
+                'solar_age': _age_of('solar_updated', now),
+                'bands_age': _age_of('bands_updated', now),
+                'dx_age': _age_of('dx_updated', now),
+                'muf_age': _age_of('muf_image_png_updated', now),
+                # 'live' (rendered by this process), 'disk' (restored from the
+                # cache dir at boot) or 'none'.
+                'muf_source': (_MUF_PNG_SOURCE if CACHE.get('muf_image_png')
+                               else 'none'),
+                'sdo_age': _age_of('solar_image_updated', now),
+                'enlil_age': _age_of('enlil_image_updated', now),
+                'drap_age': _age_of('drap_image_updated', now),
+                'real_drap_age': _age_of('real_drap_image_updated', now),
             })
         else:
             if self.command == 'HEAD':
@@ -833,7 +1797,15 @@ class Handler(SimpleHTTPRequestHandler):
                 super().do_GET()
 
     def send_json(self, data):
-        body = json.dumps(data).encode('utf-8')
+        # Tier 1b perf: accept pre-encoded JSON bytes directly so the hot
+        # polling endpoints (/api/solar, /api/bands, /api/dxspots) can skip
+        # json.dumps on every request. The cached bytes are built once per
+        # fetch in fetch_hamqsl / fetch_dx. Live dicts still re-encode here
+        # (e.g. /api/health which has dynamic age fields).
+        if isinstance(data, (bytes, bytearray)):
+            body = data
+        else:
+            body = json.dumps(data, separators=(',', ':')).encode('utf-8')
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', len(body))
@@ -843,11 +1815,16 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.write(body)
 
     def send_json_with_etag(self, data, etag):
-        """Tier 2c: send_json + ETag header for /api/{solar,bands,dxspots}."""
+        """Like send_json, but also emit an ETag header.
+
+        Tier 2c perf: used by /api/{solar,bands,dxspots} so the client can
+        replay it as If-None-Match on the next poll and short-circuit to
+        304 when nothing has changed.
+        """
         if isinstance(data, (bytes, bytearray)):
             body = data
         else:
-            body = json.dumps(data).encode('utf-8')
+            body = json.dumps(data, separators=(',', ':')).encode('utf-8')
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', len(body))
@@ -875,6 +1852,12 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == '__main__':
     print(f'HamClock Lite starting on port {PORT}...')
+    # Tier 2.1: restore BEFORE the fetcher thread starts and BEFORE the socket
+    # binds. Both orderings matter — after the thread, a boot fetch could
+    # publish a fresh image and then be overwritten by the older disk copy;
+    # after the bind, the client's very first image request could arrive
+    # while CACHE is still empty and take a 503 we already had the answer to.
+    _load_persisted()
     t = threading.Thread(target=background_fetcher, daemon=True)
     t.start()
     server = HTTPServer(('0.0.0.0', PORT), Handler)
@@ -1778,6 +2761,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
+# Re-exported so tests can monkeypatch 'hamclock_data.urlopen' / 'Request'
+# and _fetch_json picks up the fake — keeps the patch site stable across
+# refactors of the request helper.
+from urllib.request import Request, urlopen
 
 
 class HamClockData:
@@ -1797,6 +2784,14 @@ class HamClockData:
     USER_AGENT = 'HamClockNative/1.0'
     JSON_TIMEOUT = 10
     IMAGE_TIMEOUT = 20
+
+    # Tier 1.4: per-key retry backoff. Index N is the delay (seconds) after
+    # the Nth consecutive failure of that key; the last entry repeats
+    # forever. Retries therefore land at cumulative 5/15/35/75/135 s and
+    # then once a minute, instead of the old "one shot, then nothing for
+    # 900 s" behaviour that left the propagation panel blank for 15 minutes
+    # after a single cold-boot miss.
+    IMAGE_RETRY_BACKOFF = (5, 10, 20, 40, 60)
 
     _JSON_ENDPOINTS = {
         'solar': '/api/solar',
@@ -1825,8 +2820,31 @@ class HamClockData:
         # Timestamps (Unix seconds; 0 means never)
         self.last_data_refresh = 0
         self.last_image_refresh = 0
+        # Per-image refresh timestamps (epoch seconds). Maps image_key
+        # ('solar-image' | 'muf-map' | 'enlil' | 'drap' | 'real-drap')
+        # to the epoch-second when that key's bytes last refreshed.
+        # Used by the pygame client's _scaled_cache to invalidate per-image.
+        self.image_fetched_at = {}
+        # Tier 1.4 retry scheduling, both keyed by image_key.
+        #   image_next_due[key]    epoch second at/after which key may be
+        #                          attempted again (missing => due now)
+        #   image_fail_streak[key] consecutive failures; indexes
+        #                          IMAGE_RETRY_BACKOFF
+        # Written only by the fetch thread; single-key reads are atomic
+        # under the GIL, so GUI code may sample them without the lock.
+        self.image_next_due = {}
+        self.image_fail_streak = {}
+        # Slow (healthy) image cadence in seconds. _run() overwrites this
+        # with the caller's image_interval; the default matches
+        # start_background()'s so a manual refresh_images() before the
+        # thread starts schedules sanely.
+        self._image_interval = 900
         # Errors (most recent error per key, None if last fetch succeeded)
         self.errors = {}
+        # Tier 2c perf: ETags by path so we can replay If-None-Match on the
+        # next poll. ~80% of /api/{solar,bands,dxspots} polls land on
+        # unchanged data; a 304 short-circuits the read+json.loads here.
+        self._etags = {}
         # Internal
         self._lock = threading.Lock()
         self._running = False
@@ -1838,13 +2856,35 @@ class HamClockData:
         return urllib.request.urlopen(req, timeout=timeout)
 
     def _fetch_json(self, path):
-        """HTTP GET path and parse as JSON. Returns dict/list or None on failure."""
+        """HTTP GET path and parse as JSON. Returns dict/list or None on failure.
+
+        Tier 2c perf: sends If-None-Match when we have a prior ETag for
+        this path. Returns None on 304 (caller should keep its cached
+        value — same semantics as the existing error path).
+        """
+        url = self.server_url + path
+        req = Request(url, headers={'User-Agent': self.USER_AGENT})
+        prev_etag = self._etags.get(path)
+        if prev_etag:
+            req.add_header('If-None-Match', prev_etag)
         try:
-            with self._request(path, self.JSON_TIMEOUT) as resp:
+            with urlopen(req, timeout=self.JSON_TIMEOUT) as resp:
+                new_etag = resp.headers.get('ETag')
+                if new_etag:
+                    self._etags[path] = new_etag
                 data = json.loads(resp.read().decode('utf-8'))
             self.errors[path] = None
             return data
-        except (urllib.error.URLError, urllib.error.HTTPError, ValueError, OSError) as e:
+        except urllib.error.HTTPError as e:
+            if e.code == 304:
+                # Server says: no change since prev_etag. Skip parse;
+                # caller keeps its cached value (existing 'None means
+                # don't overwrite' contract in refresh_data).
+                self.errors[path] = None
+                return None
+            self.errors[path] = '{}: {}'.format(type(e).__name__, e)
+            return None
+        except (urllib.error.URLError, ValueError, OSError) as e:
             self.errors[path] = '{}: {}'.format(type(e).__name__, e)
             return None
 
@@ -1880,20 +2920,91 @@ class HamClockData:
             self.last_data_refresh = time.time()
         return results
 
-    def refresh_images(self):
-        """Fetch the 5 image endpoints synchronously."""
+    def _next_image_delay(self, key):
+        """Seconds to wait before the next attempt of image `key`.
+
+        Healthy keys get the slow cadence; failing keys walk
+        IMAGE_RETRY_BACKOFF and saturate on its last entry.
+        """
+        streak = self.image_fail_streak.get(key, 0)
+        if streak <= 0:
+            return self._image_interval
+        idx = min(streak, len(self.IMAGE_RETRY_BACKOFF)) - 1
+        return self.IMAGE_RETRY_BACKOFF[idx]
+
+    def _reschedule_image(self, key, ok, now):
+        """Record the outcome of one image attempt and set its next due time.
+
+        Called from a `finally`, so it must not raise for any input.
+        """
+        if ok:
+            self.image_fail_streak[key] = 0
+        else:
+            self.image_fail_streak[key] = self.image_fail_streak.get(key, 0) + 1
+        self.image_next_due[key] = now + self._next_image_delay(key)
+
+    def _due_image_keys(self, now):
+        """Image keys whose next-due time has passed, or None if none are.
+
+        Returns None rather than [] in the common case: the 1 s tick calls
+        this every second on a single-core ARMv6 box and the quiescent path
+        must not allocate.
+        """
+        due = None
+        for key in self._IMAGE_ENDPOINTS:
+            if now >= self.image_next_due.get(key, 0.0):
+                if due is None:
+                    due = []
+                due.append(key)
+        return due
+
+    def refresh_images(self, keys=None):
+        """Fetch image endpoints synchronously. keys=None means all five.
+
+        Every attempted key is rescheduled unconditionally (in a `finally`),
+        including on an exception _fetch_binary does not catch — a
+        MemoryError escaping the except clause at _fetch_binary would
+        otherwise leave the key permanently due and hot-spin the 1 s tick.
+
+        last_image_refresh is stamped only when at least one key came back
+        with bytes. Stamping it after a total failure is what used to buy a
+        blank panel for a full image_interval.
+        """
+        if keys is None:
+            keys = self._IMAGE_ENDPOINTS
         results = {}
         fetched = {}
-        for key, path in self._IMAGE_ENDPOINTS.items():
-            data = self._fetch_binary(path)
-            results[key] = data is not None
-            if data is not None:
-                fetched[key] = data
-        with self._lock:
-            new_images = dict(self.images)
-            new_images.update(fetched)
-            self.images = new_images
-            self.last_image_refresh = time.time()
+        try:
+            for key in keys:
+                path = self._IMAGE_ENDPOINTS.get(key)
+                if path is None:
+                    continue
+                ok = False
+                try:
+                    data = self._fetch_binary(path)
+                    ok = data is not None
+                    results[key] = ok
+                    if ok:
+                        fetched[key] = data
+                finally:
+                    self._reschedule_image(key, ok, time.time())
+        finally:
+            # Also a `finally` so bytes already in hand are published even if
+            # a later key blows up — those keys are rescheduled 900 s out and
+            # dropping their payload here would recreate the blank-panel bug.
+            if fetched:
+                # Read the clock after the fetches, not before: image ages
+                # should reflect when the bytes landed.
+                now = time.time()
+                with self._lock:
+                    new_images = dict(self.images)
+                    new_images.update(fetched)
+                    self.images = new_images
+                    new_ts = dict(self.image_fetched_at)
+                    for key in fetched:
+                        new_ts[key] = now
+                    self.image_fetched_at = new_ts
+                    self.last_image_refresh = now
         return results
 
     def start_background(self, data_interval=60, image_interval=900):
@@ -1907,6 +3018,7 @@ class HamClockData:
         self._thread.start()
 
     def _run(self, data_interval, image_interval):
+        self._image_interval = image_interval
         # Immediate initial fetch
         try:
             self.refresh_data()
@@ -1916,21 +3028,28 @@ class HamClockData:
             self.refresh_images()
         except Exception as e:
             self.errors['_run_images'] = '{}: {}'.format(type(e).__name__, e)
-        # Sleep-and-check loop
+        # 1 s tick: image retries need second-resolution scheduling, the JSON
+        # cadence does not, so the data check stays on a 5-tick (5 s) grid.
+        tick = 0
         while self._running:
-            for _ in range(5):
-                if not self._running:
-                    return
-                time.sleep(1)
+            time.sleep(1)
+            if not self._running:
+                return
+            tick = (tick + 1) % 5
             now = time.time()
-            if now - self.last_data_refresh >= data_interval:
+            if tick == 0 and now - self.last_data_refresh >= data_interval:
                 try:
                     self.refresh_data()
                 except Exception as e:
                     self.errors['_run_data'] = '{}: {}'.format(type(e).__name__, e)
-            if now - self.last_image_refresh >= image_interval:
+                # refresh_data can block for up to 4 x JSON_TIMEOUT; re-read
+                # the clock so image due-times aren't judged against a stale
+                # `now`.
+                now = time.time()
+            due = self._due_image_keys(now)
+            if due:
                 try:
-                    self.refresh_images()
+                    self.refresh_images(due)
                 except Exception as e:
                     self.errors['_run_images'] = '{}: {}'.format(type(e).__name__, e)
 
@@ -1954,6 +3073,7 @@ Pygame/SDL for a ~50 MB RAM and ~10% CPU win over the browser stack.
 
 import argparse
 import collections
+import gc
 import io
 import json
 import os
@@ -2542,12 +3662,54 @@ THEMES = {
 
 HF_BANDS = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m', '12m', '10m']
 
-SCREEN_W = 1440
-SCREEN_H = 900
+# Tier 2b: per-panel redraw cadence (seconds). The render loop still ticks at
+# 10 FPS so click latency stays bounded (<= ~200 ms p99), but each draw_<x>
+# function only runs when its panel's cadence has elapsed since the last
+# redraw. Clock-driven panels (header, status) tick every second; data panels
+# poll for a refresh every 60 s — the underlying data layer refreshes every
+# 5 min (solar/bands) or 2 min (DX), so 60 s here is "check whether the data
+# changed", not "force a redraw on stale data". Tab clicks trigger a full
+# flip on the next frame via dirty_state['full_flip_pending'], which bypasses
+# this table.
+_CADENCE_S = {
+    'header': 1.0,
+    'status': 1.0,
+    'solar': 60.0,
+    'bands': 60.0,
+    'geomag': 60.0,
+    'xray': 60.0,
+    'open_bands': 60.0,
+    'muf_text': 60.0,
+    'sdo': 60.0,
+    'dx_spots': 60.0,
+    'band_activity': 60.0,
+    'propagation': 60.0,
+}
+
+# Tier 2.5: cadence for the two image panels while they have NO decoded image
+# to show. Their body is then a status line ("fetching...", "feed down /
+# retry 15s"), and a countdown that only moves once a minute reads as a hang —
+# which is the exact confusion this tier exists to remove.
+# Deliberately 15 s and not 5 s: "no image" is a *persistent* state during an
+# outage, not a transient, so a 5 s cadence would be a 12x idle-CPU and
+# glyph/redraw amplifier on a single-core ARMv6 box for precisely the hours
+# when the box is least able to spare it. 15 s also lines up with the fastest
+# rung of hamclock_data.IMAGE_RETRY_BACKOFF once the streak is a few deep.
+# Never faster than its _CADENCE_S entry, and only for keys that have one.
+_CADENCE_S_NO_IMAGE = {
+    'sdo': 15.0,
+    'propagation': 15.0,
+}
+
+SCREEN_W = 720    # Tier 2a: native render at 720x450; BCM2835 HVS upscales to 1440x900 in firmware
+SCREEN_H = 450
 
 # Propagation panel tabs (module-level so the wiring is testable and lives in
-# one place). 'muf' surfaces the KC2G MUF map the server rasterizes to PNG for
-# /api/muf-map — decoded lazily only when the tab is selected.
+# one place). Each tab maps to one of hamclock_data's _IMAGE_ENDPOINTS keys;
+# the render loop resolves the active tab through PROP_TAB_IMAGE_KEY and blits
+# data.images[key]. 'muf' surfaces the KC2G MUF map the server already fetches
+# and rasterizes to PNG for /api/muf-map — decoded lazily only when selected,
+# so idle RAM/FPS on the Pi 1B are unchanged.
 PROP_TABS = ['drap', 'aurora', 'enlil', 'muf']
 PROP_TAB_IMAGE_KEY = {
     'drap': 'real-drap',
@@ -2555,6 +3717,173 @@ PROP_TAB_IMAGE_KEY = {
     'enlil': 'enlil',
     'muf': 'muf-map',
 }
+
+# ---- Phase 1b: layout / counts / string / solar caches ----
+# Item 5: panel rect grid is recomputed only when screen size changes; every
+# per-frame pygame.Rect(...) panel allocation now reads from this dict.
+_layout_cache: dict = {"size": None, "rects": None}
+
+
+def _get_layout(screen_size):
+    """Cache the dashboard layout rects; recompute only on resize."""
+    if _layout_cache["size"] == screen_size:
+        return _layout_cache["rects"]
+    sw, sh = screen_size
+    header_h = 30
+    status_h = 20
+    content_top = header_h + 2
+    content_bot = sh - status_h - 2
+    content_h = content_bot - content_top
+    left_w = int(sw * 288 / 1440)
+    mid_w = int(sw * (936 - 288) / 1440)
+    right_w = sw - left_w - mid_w
+    panel_gap = 4
+    # Tier 1.1: the left column's six panels share content_h minus 6x26 px of
+    # panel chrome (title bar + padding, see _panel_inner_rect) and 5x4 px of
+    # gap — at 720x450 that is 396 - 176 = 220 px of usable content for the
+    # whole column. The old split gave BANDS 12 % (a 21 px inner rect) which
+    # cannot hold its header row plus four band rows at ANY font size, and
+    # gave GEOMAG/X-RAY 10 % (13 px) for a text row plus a bar. These weights
+    # size each panel to what its draw function actually needs at the 8-11 px
+    # fonts _make_fonts builds for the 720x450 framebuffer:
+    #   solar  53 px = 5 rows x 10 px pitch + 11 px glyph (2 columns of 5)
+    #   bands  53 px = header + 4 band rows, same pitch
+    #   sdo    53 px of image (letterboxed square)
+    #   geomag 17 px = 11 px value row + 6 px bar   (x-ray identical)
+    #   open   27 px = 2 wrapped label rows
+    # Everything stays fractional, so 1440x900 scales up unchanged in shape.
+    heights = [
+        int(content_h * 0.20),  # solar
+        int(content_h * 0.20),  # bands
+        int(content_h * 0.20),  # sdo
+        int(content_h * 0.11),  # geomag
+        int(content_h * 0.11),  # xray
+    ]
+    heights.append(content_h - sum(heights) - panel_gap * 5)
+    titles = ['solar', 'bands', 'sdo', 'geomag', 'xray', 'open_bands']
+    rects = {
+        "header": pygame.Rect(0, 0, sw, header_h),
+        "status": pygame.Rect(0, sh - status_h, sw, status_h),
+    }
+    cy = content_top
+    for h, key in zip(heights, titles):
+        rects[key] = pygame.Rect(2, cy, left_w - 4, h)
+        cy += h + panel_gap
+    mx = 2 + left_w
+    rects["muf"] = pygame.Rect(mx, content_top, mid_w - 4, content_h)
+    rx = mx + mid_w
+    rh_dx = int(content_h * 0.28)
+    rh_ba = int(content_h * 0.32)
+    rh_prop = content_h - rh_dx - rh_ba - panel_gap * 2
+    rects["dx_spots"] = pygame.Rect(rx, content_top, right_w - 4, rh_dx)
+    rects["band_activity"] = pygame.Rect(
+        rx, content_top + rh_dx + panel_gap, right_w - 4, rh_ba)
+    rects["propagation"] = pygame.Rect(
+        rx, content_top + rh_dx + rh_ba + panel_gap * 2,
+        right_w - 4, rh_prop)
+    _layout_cache["size"] = screen_size
+    _layout_cache["rects"] = rects
+    return rects
+
+
+# Item 6: draw_band_activity pre-allocated counts (no per-frame dict alloc).
+_band_counts: list = [0] * len(HF_BANDS)
+
+# Item 7: cached OPEN / CLOSED label strings keyed by data.last_data_refresh.
+_open_bands_cache: dict = {"ts": None, "open": "", "closed": ""}
+
+
+def _open_bands_strings(bands, data_refresh_ts):
+    """Return the cached (open_label, closed_label) strings; refresh only
+    on a new data.last_data_refresh tick."""
+    if _open_bands_cache["ts"] == data_refresh_ts:
+        return _open_bands_cache["open"], _open_bands_cache["closed"]
+    opens, closes = [], []
+    if isinstance(bands, dict):
+        for key, entry in bands.items():
+            if not isinstance(entry, dict):
+                continue
+            day = entry.get('day', 'N/A')
+            if day in ('Good', 'Fair'):
+                opens.append(key)
+            elif day == 'Poor':
+                closes.append(key)
+    o = 'OPEN: ' + (', '.join(opens) or '--')
+    c = 'CLOSED: ' + (', '.join(closes) or '--')
+    _open_bands_cache["ts"] = data_refresh_ts
+    _open_bands_cache["open"] = o
+    _open_bands_cache["closed"] = c
+    return o, c
+
+
+# Item 8: header / status / Kp string format cache keyed by
+# (int(time.time()), data.last_data_refresh, data.last_image_refresh, dx_len).
+_strfmt_cache: dict = {
+    "key": None, "utc": "", "local": "", "status": "", "kp": "",
+}
+
+
+def _formatted_strings(data):
+    """Return cached strings for header (utc, local), status bar, and Kp.
+    Refreshes once per UTC second OR on a data/image refresh tick."""
+    try:
+        now_sec = int(time.time())
+    except Exception:
+        now_sec = 0
+    dx_len = len(data.dxspots) if isinstance(data.dxspots, list) else 0
+    key = (now_sec, data.last_data_refresh,
+           data.last_image_refresh, dx_len,
+           bool(data.solar), bool(data.bands))
+    if _strfmt_cache["key"] == key:
+        return _strfmt_cache
+    try:
+        utc = time.strftime('%H:%M:%S', time.gmtime())
+        local = time.strftime('%H:%M:%S')
+    except Exception:
+        utc = local = '--:--:--'
+    dage = int(now_sec - data.last_data_refresh) if data.last_data_refresh else -1
+    iage = int(now_sec - data.last_image_refresh) if data.last_image_refresh else -1
+    _strfmt_cache["utc"] = 'UTC ' + utc
+    _strfmt_cache["local"] = 'LOC ' + local
+    _strfmt_cache["status"] = 'Data:{}s  Img:{}s  Solar:{}  Bands:{}  DX:{}'.format(
+        dage if dage >= 0 else '--',
+        iage if iage >= 0 else '--',
+        'OK' if data.solar else '--',
+        'OK' if data.bands else '--',
+        dx_len,
+    )
+    kp = _safe(data.solar or {}, 'kIndex', 0) if data.solar is not None else 0
+    _strfmt_cache["kp"] = 'Kp {}'.format(kp)
+    _strfmt_cache["key"] = key
+    return _strfmt_cache
+
+
+# Item 9: de-nested solar snapshot keyed by data.last_data_refresh.
+_solar_snapshot: dict = {"ts": None, "view": {}}
+
+
+def _solar_view(solar, data_refresh_ts):
+    """Single de-nested view of solar dict; refreshed only on data refresh."""
+    if _solar_snapshot["ts"] == data_refresh_ts and _solar_snapshot["view"]:
+        return _solar_snapshot["view"]
+    s = solar or {}
+    _solar_snapshot["view"] = {
+        'sfi':         _safe(s, 'sfi'),
+        'kIndex':      _safe(s, 'kIndex'),
+        'ssn':         _safe(s, 'ssn'),
+        'aIndex':      _safe(s, 'aIndex'),
+        'xray':        _safe(s, 'xray'),
+        'solarWind':   _safe(s, 'solarWind'),
+        'bz':          _safe(s, 'bz'),
+        'geomagField': _safe(s, 'geomagField'),
+        'signalNoise': _safe(s, 'signalNoise'),
+        'fof2':        _safe(s, 'fof2'),
+        'kIndex_raw':  _safe(s, 'kIndex', 0),
+        'xray_raw':    _safe(s, 'xray', 'A0.0'),
+    }
+    _solar_snapshot["ts"] = data_refresh_ts
+    return _solar_snapshot["view"]
+
 
 # ---- Glyph cache (Phase 1 perf fix #3) ----
 # Keyed by (font_name_or_None, font_size, text, color); explicitly NOT id(font)
@@ -2585,14 +3914,20 @@ def _font_key(font):
 _SCALED_CACHE_CAP = 16
 _scaled_cache = collections.OrderedDict()
 
+# ---- Per-font AA flag (Tier-1a perf) ----
+# pygame.font.Font is a C-extension type that rejects arbitrary attribute
+# assignment, so we side-channel the AA flag through a module-level dict
+# keyed by id(font_obj). _make_fonts populates it; _blit_text reads it.
+# The dict is cleared in _make_fonts alongside _glyph_cache.
+_font_aa = {}
+
 
 def _make_fonts():
     """Build the fonts dict. Falls back to default font if SysFont fails.
 
-    Includes 'tiny' (size 11) used by draw_image's loading placeholder so
-    the inline pygame.font.Font(None, 18) per-frame allocation is gone.
-    Also clears the module-level _glyph_cache so stale renders from a
-    previous font set cannot leak through (Task 1.3).
+    Sizes are tuned for the Tier 2a 720x450 native framebuffer (HVS upscales
+    to 1440x900 on Pi 1 / VideoCore IV). A 'tiny' font at 8 px renders
+    pleasantly at 16 px effective on the HDMI output.
     """
     # Ensure font subsystem is up; callers (incl. recovery-overlay tests) may
     # only have initialized pygame.display, leaving pygame.font uninitialized.
@@ -2610,14 +3945,22 @@ def _make_fonts():
         except Exception:
             return pygame.font.Font(None, size + 4)
     _glyph_cache.clear()
-    return {
-        'title': mk(22),
-        'panel': mk(14),
-        'body': mk(14),
-        'label': mk(12),
-        'small': mk(11),
-        'tiny': mk(11),
+    _font_aa.clear()
+    fonts = {
+        'title': mk(13),    # was 22
+        'panel': mk(9),     # was 14
+        'body':  mk(9),     # was 14
+        'label': mk(8),     # was 12
+        'small': mk(7),     # was 11
+        'tiny':  mk(7),     # was 11
     }
+    # Tier-1a perf: AA only on 'title'. On a 700 MHz armv6 the AA glyph path
+    # is 5-10x flat render; body/panel/label/small/tiny look acceptable
+    # without it and AA-off compositing is much cheaper. Side-channel via
+    # id() because pygame.font.Font rejects attribute assignment.
+    for name, f in fonts.items():
+        _font_aa[id(f)] = (name == 'title')
+    return fonts
 
 
 def _safe(d, key, default='--'):
@@ -2638,7 +3981,33 @@ def _blit_text(screen, font, text, color, x, y):
         key = (_font_key(font), s, color)
         surf = _glyph_cache.get(key)
         if surf is None:
-            surf = font.render(s, True, color)
+            # Tier-1a perf: per-font AA flag (set in _make_fonts) read via
+            # the _font_aa side-channel dict (pygame Font rejects attr set).
+            # AA only for 'title' at 22 px; smaller fonts render flat to
+            # dodge the 5-10x AA cost on armv6. Default True for fonts not
+            # registered (e.g. ad-hoc fonts in recovery overlay).
+            aa = _font_aa.get(id(font), True)
+            surf = font.render(s, aa, color)
+            # Tier-1a perf: convert glyph to the display's pixel format once
+            # at cache-insert time so subsequent blits skip the per-pixel
+            # format-conversion the blitter would otherwise pay.
+            try:
+                disp = pygame.display.get_surface()
+                if disp is not None:
+                    # An antialiased render (the 'title' font, see _make_fonts)
+                    # comes back as a 32-bit SRCALPHA surface whose RGB is the
+                    # text colour EVERYWHERE — the glyph shape lives entirely
+                    # in the alpha channel. Surface.convert() drops that
+                    # channel, so every AA'd string painted as a solid filled
+                    # rectangle: the 'HAMCLOCK LITE' banner and all five MUF
+                    # STATUS values were unreadable blocks on the real display
+                    # as well as headless. Keep the alpha for those.
+                    if surf.get_flags() & pygame.SRCALPHA:
+                        surf = surf.convert_alpha(disp)
+                    else:
+                        surf = surf.convert(disp)
+            except Exception:
+                pass
             _glyph_cache[key] = surf
             if len(_glyph_cache) > _GLYPH_CACHE_CAP:
                 _glyph_cache.popitem(last=False)
@@ -2650,10 +4019,85 @@ def _blit_text(screen, font, text, color, x, y):
         return 0
 
 
+def _fit_text(font, text, max_w):
+    """Return `text` truncated so it renders within `max_w` px.
+
+    Tier 1.1: at the 720x450 native framebuffer the narrowest panel content
+    rect is 128 px, so a long value ('Very Unsettled', a 10-char spotter)
+    would otherwise paint straight over the panel border and into its
+    neighbour. Fast path is a single Font.size() and the original string back
+    (no allocation); the binary search only runs when the text overflows, and
+    only on a panel's cadence tick, not per frame.
+    """
+    try:
+        if max_w <= 0:
+            return ''
+        if font.size(text)[0] <= max_w:
+            return text
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font.size(text[:mid])[0] <= max_w:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo]
+    except Exception:
+        return text
+
+
+def _blit_fit(screen, font, text, color, x, y, max_w):
+    """_blit_text with a hard width clamp. See _fit_text."""
+    return _blit_text(screen, font, _fit_text(font, text, max_w), color, x, y)
+
+
+def _smoothscale_safe(surface, size):
+    """smoothscale that cannot raise on a sub-24-bit source surface.
+
+    pygame.transform.smoothscale accepts only 24- and 32-bit surfaces and
+    raises ValueError("Only 24-bit or 32-bit surfaces can be smoothly
+    scaled") on 8bpp AND 16bpp (verified, pygame 2.6.1). Both depths occur on
+    the shipped Pi: 10-monitor.conf sets DefaultDepth 16, and /api/real-drap
+    — the DEFAULT propagation tab — decodes as an 8bpp palettised PNG. Every
+    image panel would then silently paint nothing via draw_image's bare
+    `except Exception: pass`.
+
+    Promote to 24-bit and retry; if even that fails, fall back to
+    transform.scale, which is nearest-neighbour but depth-agnostic (a coarse
+    image beats a blank panel). Deliberately NOT a convert() against a
+    template built from pygame.display.get_surface().get_flags(): the display
+    is created with pygame.FULLSCREEN, so get_flags() returns 2164260864
+    (> INT32_MAX) and Surface((w, h), flags, ...) raises OverflowError.
+    """
+    try:
+        if surface.get_bitsize() < 24:
+            try:
+                surface = surface.convert(24)
+            except Exception:
+                return pygame.transform.scale(surface, size)
+        return pygame.transform.smoothscale(surface, size)
+    except Exception:
+        return pygame.transform.scale(surface, size)
+
+
 def _load_image(data_bytes):
     """Decode JPEG/PNG bytes into a Pygame surface, or None on failure."""
     if not data_bytes:
         return None
+    # Tier 1.5: never hand SVG to SDL_image. nanosvg happily "succeeds" on the
+    # 365 KB KC2G MUF vector in 104-193 ms on x86 (3.1-5.2 s on ARMv6) and
+    # yields a 1526x905 / 5,524,120-byte surface — ~11 MB peak once .convert()
+    # copies it — on a 512 MB box, in pure greyscale because nanosvg ignores
+    # the CSS that carries the contour colours. That is a multi-second
+    # render-loop freeze every 900 s for a panel that is 236x102 px and would
+    # be unreadable anyway. The server is meant to send PNG; if it ever falls
+    # back to the raw vector we want a blank panel, not a stall.
+    try:
+        head = data_bytes[:256].lstrip()
+        if head[:5] == b'<?xml' or head[:4] == b'<svg':
+            return None
+    except Exception:
+        pass
     for hint in ('x.jpg', 'x.png'):
         try:
             return pygame.image.load_extended(io.BytesIO(data_bytes), hint).convert()
@@ -2672,50 +4116,110 @@ def draw_panel(screen, rect, title, fonts, theme):
     pygame.draw.rect(screen, theme['border'], bar)
     _blit_text(screen, fonts['panel'], title, theme['bright'],
                rect.x + 6, rect.y + 2)
+    return _panel_inner_rect(rect)
+
+
+def _panel_inner_rect(rect):
+    """Compute the inner content rect for a panel without painting the chrome.
+
+    Tier 2b uses this on frames where a panel's cadence has NOT elapsed,
+    so we can still hand its inner rect to a no-op skip path while not
+    re-blitting the title bar and border. Keep this formula in lockstep
+    with draw_panel's return value above."""
     return pygame.Rect(rect.x + 6, rect.y + 22, rect.w - 12, rect.h - 26)
 
 
-def draw_header(screen, rect, callsign, fonts, theme):
+def draw_header(screen, rect, callsign, fonts, theme, data=None):
+    """Item 8: pull pre-formatted UTC/LOC strings from _strfmt_cache when a
+    HamClockData reference is available; the cache hits on every same-second
+    frame, eliminating per-frame strftime + Font.render churn."""
     pygame.draw.rect(screen, theme['card'], rect)
     pygame.draw.rect(screen, theme['border'], rect, 1)
-    _blit_text(screen, fonts['title'], 'HAMCLOCK LITE', theme['accent'],
-               rect.x + 8, rect.y + 4)
+    # Tier 1.1: columns are fractions of rect.w so the header keeps its shape
+    # at the 720x450 framebuffer instead of assuming the old 1440 px width.
+    title_x = rect.x + 8
+    call_x = rect.x + int(rect.w * 0.30)
+    utc_x = rect.x + int(rect.w * 0.53)
+    loc_x = rect.x + int(rect.w * 0.75)
+    dot_x = rect.x + rect.w - 18
+    _blit_fit(screen, fonts['title'], 'HAMCLOCK LITE', theme['accent'],
+              title_x, rect.y + 4, call_x - title_x - 4)
     if callsign:
-        _blit_text(screen, fonts['body'], str(callsign), theme['bright'],
-                   rect.x + 220, rect.y + 8)
-    try:
-        utc = time.strftime('%H:%M:%S', time.gmtime())
-        local = time.strftime('%H:%M:%S')
-    except Exception:
-        utc = local = '--:--:--'
-    _blit_text(screen, fonts['body'], 'UTC ' + utc, theme['fg'],
-               rect.x + rect.w - 340, rect.y + 8)
-    _blit_text(screen, fonts['body'], 'LOC ' + local, theme['fg'],
-               rect.x + rect.w - 180, rect.y + 8)
+        _blit_fit(screen, fonts['body'], str(callsign), theme['bright'],
+                  call_x, rect.y + 8, utc_x - call_x - 4)
+    if data is not None:
+        cached = _formatted_strings(data)
+        utc_str = cached["utc"]
+        local_str = cached["local"]
+    else:
+        try:
+            utc_str = 'UTC ' + time.strftime('%H:%M:%S', time.gmtime())
+            local_str = 'LOC ' + time.strftime('%H:%M:%S')
+        except Exception:
+            utc_str = local_str = '--:--:--'
+    _blit_fit(screen, fonts['body'], utc_str, theme['fg'],
+              utc_x, rect.y + 8, loc_x - utc_x - 4)
+    _blit_fit(screen, fonts['body'], local_str, theme['fg'],
+              loc_x, rect.y + 8, dot_x - 6 - loc_x)
     dot_color = theme['good'] if (int(time.time()) % 2 == 0) else theme['fair']
-    pygame.draw.circle(screen, dot_color,
-                       (rect.x + rect.w - 18, rect.y + 14), 5)
+    pygame.draw.circle(screen, dot_color, (dot_x, rect.y + 14), 5)
 
 
-def draw_solar(screen, rect, solar, fonts, theme):
-    rows = [
-        ('SFI', _safe(solar, 'sfi')),
-        ('Kp', _safe(solar, 'kIndex')),
-        ('SSN', _safe(solar, 'ssn')),
-        ('A', _safe(solar, 'aIndex')),
-        ('X-Ray', _safe(solar, 'xray')),
-        ('Wind', _safe(solar, 'solarWind')),
-        ('Bz', _safe(solar, 'bz')),
-        ('Geo', _safe(solar, 'geomagField')),
-        ('S/N', _safe(solar, 'signalNoise')),
-        ('foF2', _safe(solar, 'fof2')),
-    ]
-    y = rect.y
-    for label, value in rows:
-        _blit_text(screen, fonts['label'], label, theme['label'], rect.x, y)
-        _blit_text(screen, fonts['body'], str(value), theme['bright'],
-                   rect.x + 70, y - 1)
-        y += 16
+def draw_solar(screen, rect, solar, fonts, theme, data_refresh_ts=None):
+    """Item 9: pull values from _solar_view snapshot when a refresh ts is
+    known so the per-frame _safe(...) chain runs at most once per refresh."""
+    v = _solar_view(solar, data_refresh_ts) if data_refresh_ts is not None else None
+    if v is not None:
+        rows = [
+            ('SFI', v['sfi']), ('Kp', v['kIndex']), ('SSN', v['ssn']),
+            ('A', v['aIndex']), ('X-Ray', v['xray']),
+            ('Wind', v['solarWind']), ('Bz', v['bz']),
+            ('Geo', v['geomagField']), ('S/N', v['signalNoise']),
+            ('foF2', v['fof2']),
+        ]
+    else:
+        rows = [
+            ('SFI', _safe(solar, 'sfi')),
+            ('Kp', _safe(solar, 'kIndex')),
+            ('SSN', _safe(solar, 'ssn')),
+            ('A', _safe(solar, 'aIndex')),
+            ('X-Ray', _safe(solar, 'xray')),
+            ('Wind', _safe(solar, 'solarWind')),
+            ('Bz', _safe(solar, 'bz')),
+            ('Geo', _safe(solar, 'geomagField')),
+            ('S/N', _safe(solar, 'signalNoise')),
+            ('foF2', _safe(solar, 'fof2')),
+        ]
+    # Tier 1.1: ten label/value rows at the old fixed pitch 16 needed 160 px;
+    # the SOLAR content rect at 720x450 is 128x53. Derive the pitch from the
+    # font and wrap into as many columns as it takes to fit, so the panel
+    # degrades by getting narrower cells rather than by painting over its
+    # neighbours. Values are clamped to their cell width.
+    lab_f, val_f = fonts['label'], fonts['body']
+    lab_h, val_h = lab_f.get_height(), val_f.get_height()
+    glyph_h = max(lab_h, val_h)
+    n = len(rows)
+    if n == 0 or rect.w <= 0 or rect.h < glyph_h:
+        return
+    ncols, per_col = 1, n
+    for ncols in range(1, 5):
+        per_col = -(-n // ncols)
+        if (per_col - 1) * lab_h + glyph_h <= rect.h:
+            break
+    pitch = lab_h if per_col < 2 else max(
+        lab_h, min(lab_h + 4, (rect.h - glyph_h) // (per_col - 1)))
+    col_w = rect.w // ncols
+    val_x = min(col_w // 2, lab_f.size('MMMMMM')[0] + 4)
+    lab_w = val_x - 2
+    val_w = col_w - val_x - 2
+    for i, (label, value) in enumerate(rows):
+        y = rect.y + (i % per_col) * pitch
+        if y + glyph_h > rect.bottom:
+            continue
+        cx = rect.x + (i // per_col) * col_w
+        _blit_fit(screen, lab_f, label, theme['label'], cx, y, lab_w)
+        _blit_fit(screen, val_f, str(value), theme['bright'],
+                  cx + val_x, y, val_w)
 
 
 def draw_bands(screen, rect, bands, fonts, theme):
@@ -2729,55 +4233,152 @@ def draw_bands(screen, rect, bands, fonts, theme):
         'Good': theme['good'], 'Fair': theme['fair'],
         'Poor': theme['poor'], 'N/A': theme['na'],
     }
-    _blit_text(screen, fonts['label'], 'BAND',  theme['label'], rect.x, rect.y)
-    _blit_text(screen, fonts['label'], 'DAY',   theme['label'], rect.x + 100, rect.y)
-    _blit_text(screen, fonts['label'], 'NIGHT', theme['label'], rect.x + 160, rect.y)
-    y = rect.y + 16
+    # Tier 1.1: DAY at +100 and NIGHT at +160 were absolute pixels for the
+    # 1440x900 dashboard; the BANDS content rect at 720x450 is 128 px wide, so
+    # NIGHT was drawn 32 px past the panel's right border. Columns are now
+    # fractions of rect.w and the row pitch comes from the font.
+    lab_f, val_f = fonts['label'], fonts['body']
+    lab_h, glyph_h = lab_f.get_height(), max(fonts['label'].get_height(),
+                                             val_f.get_height())
+    if rect.w <= 0 or rect.h < glyph_h:
+        return
+    n = len(groups) + 1                       # header row + one row per group
+    pitch = max(lab_h, min(lab_h + 4, (rect.h - glyph_h) // max(1, n - 1)))
+    name_x = rect.x
+    day_x = rect.x + int(rect.w * 0.42)
+    night_x = rect.x + int(rect.w * 0.71)
+    name_w = day_x - name_x - 2
+    day_w = night_x - day_x - 2
+    night_w = rect.right - night_x
+    _blit_fit(screen, lab_f, 'BAND', theme['label'], name_x, rect.y, name_w)
+    _blit_fit(screen, lab_f, 'DAY', theme['label'], day_x, rect.y, day_w)
+    _blit_fit(screen, lab_f, 'NIGHT', theme['label'], night_x, rect.y, night_w)
+    y = rect.y + pitch
     for name, keys in groups:
+        if y + glyph_h > rect.bottom:
+            break
         entry = bands.get(keys[0], {}) if isinstance(bands, dict) else {}
         day = entry.get('day', 'N/A') if isinstance(entry, dict) else 'N/A'
         night = entry.get('night', 'N/A') if isinstance(entry, dict) else 'N/A'
-        _blit_text(screen, fonts['body'], name, theme['fg'], rect.x, y)
-        _blit_text(screen, fonts['body'], str(day),
-                   cond.get(day, theme['fg']), rect.x + 100, y)
-        _blit_text(screen, fonts['body'], str(night),
-                   cond.get(night, theme['fg']), rect.x + 160, y)
-        y += 16
+        _blit_fit(screen, val_f, name, theme['fg'], name_x, y, name_w)
+        _blit_fit(screen, val_f, str(day),
+                  cond.get(day, theme['fg']), day_x, y, day_w)
+        _blit_fit(screen, val_f, str(night),
+                  cond.get(night, theme['fg']), night_x, y, night_w)
+        y += pitch
+
+
+def _draw_status_lines(screen, rect, text, font, color,
+                       top=True, backdrop=None):
+    """Paint up to two short status lines inside rect. Never raises.
+
+    Tier 2.5. `text` may carry a single '\\n' to split a status into a head
+    ("D-layer: feed down") and a detail ("retry 15s"); at the 128x53 SDO
+    content rect a 7 px monospace font fits ~25 characters, so two short
+    lines read where one long one is truncated to noise.
+
+    Allocation stays bounded: the vocabulary is a handful of fixed strings
+    plus one coarse ETA/age token, all absorbed by _blit_text's glyph cache,
+    and this only runs on a cadenced redraw (>= 15 s apart), never per frame.
+    Every write is clamped inside rect so tests/test_panel_containment.py
+    stays green at 720x450.
+    """
+    try:
+        if not text or rect.w <= 8 or rect.h <= 0:
+            return
+        gh = font.get_height()
+        if gh <= 0 or rect.h < gh:
+            return
+        lines = text.split('\n') if '\n' in text else (text,)
+        n = max(1, min(2, len(lines), rect.h // gh))
+        if top:
+            y = rect.y + min(6, rect.h - n * gh)
+        else:
+            # Bottom-anchored, over a painted image: lay a card-coloured bar
+            # first or the text fights the pixels underneath it.
+            y = max(rect.y, rect.bottom - n * gh - 1)
+            if backdrop is not None:
+                bar = pygame.Rect(rect.x, y, rect.w,
+                                  min(rect.bottom - y, n * gh + 1))
+                if bar.h > 0:
+                    pygame.draw.rect(screen, backdrop, bar)
+        for i in range(n):
+            _blit_fit(screen, font, lines[i], color,
+                      rect.x + 6, y, rect.w - 8)
+            y += gh
+    except Exception:
+        pass
 
 
 def draw_image(screen, rect, surface, fonts=None, theme=None,
-               image_key=None, fetched_at=None):
+               image_key=None, fetched_at=None, status=None):
+    """Blit `surface` into `rect`, with an honest status line.
+
+    Tier 2.5. `status` is appended LAST on purpose — tests/test_perf_alloc.py
+    and tests/test_themes.py:277 call this with up to five positional
+    arguments. It is the (possibly None) return of _image_status_text; None
+    means "nothing worth saying" and the panel renders exactly as it did
+    before this tier.
+
+    Two placements, because both states are real on a Pi:
+      * no decoded image -> the status IS the panel body, so an operator can
+        tell "fetching, retry in ~15 s" from "feed is down" from "bytes
+        arrived but will not decode" instead of staring at a permanent
+        "image loading..." that means all three;
+      * an image is painted but the status is non-empty -> label it over the
+        bottom of the image. _get_cached_image keeps serving the last good
+        surface, so a stale or newly-undecodable payload would otherwise be
+        invisible; serve-stale without an age label is worse than blank for
+        someone making a band decision.
+    """
     if surface is None:
         if fonts is not None and 'tiny' in fonts:
             label_color = theme['label'] if theme is not None else (184, 160, 216)
-            _blit_text(screen, fonts['tiny'], 'image loading...',
-                       label_color, rect.x + 6, rect.y + 6)
+            # Tier 1.1: the SDO content rect is 128x53 at 720x450 — clamp the
+            # placeholder to it instead of trusting a 1440-wide panel.
+            _draw_status_lines(
+                screen, rect,
+                status if isinstance(status, str) and status
+                else 'image loading...',
+                fonts['tiny'], label_color, top=True)
         return
     try:
         iw, ih = surface.get_size()
-        if iw == 0 or ih == 0:
+        if iw == 0 or ih == 0 or rect.w <= 0 or rect.h <= 0:
             return
         scale = min(rect.w / iw, rect.h / ih)
         nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+        if nw > rect.w or nh > rect.h:
+            # Rounding at extreme aspect ratios can push the 1 px floor past
+            # the rect; a panel too small to show anything shows nothing.
+            return
         if scale >= 1.0:
             scaled = surface
         elif image_key is not None and fetched_at is not None:
             key = (image_key, float(fetched_at), (nw, nh))
             scaled = _scaled_cache.get(key)
             if scaled is None:
-                scaled = pygame.transform.smoothscale(surface, (nw, nh))
+                scaled = _smoothscale_safe(surface, (nw, nh))
                 _scaled_cache[key] = scaled
                 if len(_scaled_cache) > _SCALED_CACHE_CAP:
                     _scaled_cache.popitem(last=False)
             else:
                 _scaled_cache.move_to_end(key)
         else:
-            scaled = pygame.transform.smoothscale(surface, (nw, nh))
+            scaled = _smoothscale_safe(surface, (nw, nh))
         x = rect.x + (rect.w - nw) // 2
         y = rect.y + (rect.h - nh) // 2
         screen.blit(scaled, (x, y))
     except Exception:
         pass
+    # Outside the try above: a scale/blit failure must not also silence the
+    # label that explains what the operator is (or is not) looking at.
+    if isinstance(status, str) and status and fonts is not None and 'tiny' in fonts:
+        _draw_status_lines(
+            screen, rect, status, fonts['tiny'],
+            theme['accent'] if theme is not None else (244, 197, 92),
+            top=False,
+            backdrop=theme['card'] if theme is not None else (0, 0, 0))
 
 
 def draw_bar(screen, rect, value, vmax, color, theme):
@@ -2793,6 +4394,38 @@ def draw_bar(screen, rect, value, vmax, color, theme):
         pygame.draw.rect(screen, color, inner)
 
 
+def _draw_value_and_bar(screen, rect, text, value, vmax, color, fonts, theme):
+    """Shared GEOMAGNETIC / X-RAY FLUX body: a value row plus a gauge bar.
+
+    Tier 1.1: both panels used to blit the value at rect.y + 2 and the bar at
+    a fixed rect.y + 20 with a fixed height of 10 — 30 px of content in a
+    content rect that is 17 px tall at 720x450, so the bar was painted over
+    the panel border and into the next panel. The bar now stacks below the
+    value when there is room and sits beside it when there is not.
+    """
+    f = fonts['body']
+    gh = f.get_height()
+    if rect.w <= 0 or rect.h <= 0:
+        return
+    if rect.h >= gh + 4:
+        _blit_fit(screen, f, text, theme['bright'], rect.x, rect.y, rect.w)
+        bar_x, bar_w = rect.x, rect.w
+        bar_y = rect.y + gh + 1
+        bar_h = min(10, rect.bottom - bar_y)
+    else:
+        # No room to stack: value on the left, gauge filling what is left.
+        if rect.h >= gh:
+            _blit_fit(screen, f, text, theme['bright'], rect.x, rect.y,
+                      max(0, int(rect.w * 0.45) - 4))
+        bar_x = rect.x + int(rect.w * 0.45)
+        bar_w = rect.right - bar_x
+        bar_h = min(10, rect.h)
+        bar_y = rect.y + (rect.h - bar_h) // 2
+    if bar_w > 0 and bar_h >= 2:
+        draw_bar(screen, pygame.Rect(bar_x, bar_y, bar_w, bar_h),
+                 value, vmax, color, theme)
+
+
 def draw_muf_text(screen, rect, solar, fonts, theme):
     rows = [
         ('FOF2',   '{} MHz'.format(_safe(solar, 'fof2'))),
@@ -2801,92 +4434,167 @@ def draw_muf_text(screen, rect, solar, fonts, theme):
         ('SFI',    _safe(solar, 'sfi')),
         ('SSN',    _safe(solar, 'ssn')),
     ]
-    y = rect.y + 20
+    # Tier 1.1: pitch 44 and the +20/+140 columns were absolute pixels. Keep
+    # the same look where there is room (the MUF panel is the roomy one, 308
+    # px wide at 720x450) but derive both from the rect so a smaller panel
+    # compresses instead of overflowing.
+    lab_f, val_f, foot_f = fonts['panel'], fonts['title'], fonts['small']
+    val_h = val_f.get_height()
+    glyph_h = max(lab_f.get_height(), val_h)
+    if rect.w <= 0 or rect.h < glyph_h:
+        return
+    foot_h = foot_f.get_height() + 4 if rect.h >= glyph_h * 2 + 12 else 0
+    n = len(rows)
+    top = rect.y + min(20, max(0, (rect.h - foot_h - glyph_h) // 4))
+    avail = rect.bottom - foot_h - top - glyph_h
+    pitch = max(glyph_h + 1, min(44, avail // max(1, n - 1)))
+    lab_x = rect.x + int(rect.w * 0.06)
+    val_x = rect.x + int(rect.w * 0.45)
+    lab_w = val_x - lab_x - 2
+    val_w = rect.right - val_x
+    y = top
     for label, value in rows:
-        _blit_text(screen, fonts['panel'], label, theme['label'],
-                   rect.x + 20, y)
-        _blit_text(screen, fonts['title'], str(value), theme['bright'],
-                   rect.x + 140, y - 4)
-        y += 44
-    _blit_text(screen, fonts['small'], '(Map available in web UI)',
-               theme['label'], rect.x + 20, rect.y + rect.h - 20)
+        if y + glyph_h > rect.bottom - foot_h:
+            break
+        _blit_fit(screen, lab_f, label, theme['label'], lab_x, y, lab_w)
+        _blit_fit(screen, val_f, str(value), theme['bright'],
+                  val_x, y + (glyph_h - val_h) // 2, val_w)
+        y += pitch
+    if foot_h:
+        _blit_fit(screen, foot_f, '(Map available in web UI)', theme['label'],
+                  lab_x, rect.bottom - foot_h, rect.right - lab_x)
 
 
 def draw_dx_spots(screen, rect, dxspots, fonts, theme):
     if not isinstance(dxspots, list):
         dxspots = []
-    band_lut = dict(zip(HF_BANDS, theme['band_palette']))
-    _blit_text(screen, fonts['label'], 'FREQ',    theme['label'], rect.x, rect.y)
-    _blit_text(screen, fonts['label'], 'BND',     theme['label'], rect.x + 90, rect.y)
-    _blit_text(screen, fonts['label'], 'DX',      theme['label'], rect.x + 140, rect.y)
-    _blit_text(screen, fonts['label'], 'SPOTTER', theme['label'], rect.x + 230, rect.y)
-    _blit_text(screen, fonts['label'], 'TIME',    theme['label'], rect.x + 340, rect.y)
-    y = rect.y + 16
+    # Tier-1a perf: read the band-palette LUT cached on the theme dict by
+    # _run_render_loop; fall back to building it inline so callers that
+    # short-circuit the loop (tests, recovery overlay) still work.
+    band_lut = theme.get('_band_lut') or dict(zip(HF_BANDS, theme['band_palette']))
+    # Tier 1.1: the +90/+140/+230/+340 columns assumed a 488 px panel; the DX
+    # SPOTS content rect at 720x450 is 236 px wide, so SPOTTER and TIME landed
+    # outside it entirely. Column starts are now fractions of rect.w (the same
+    # proportions the 1440 layout had) and every cell is width-clamped.
+    lab_f, val_f = fonts['label'], fonts['body']
+    glyph_h = max(lab_f.get_height(), val_f.get_height())
+    if rect.w <= 0 or rect.h < glyph_h:
+        return
+    fracs = (0.0, 0.26, 0.40, 0.60, 0.85)
+    xs = [rect.x + int(rect.w * f) for f in fracs]
+    ws = [xs[i + 1] - xs[i] - 4 for i in range(4)] + [rect.right - xs[4]]
+    n_rows = 1 + 5
+    pitch = max(lab_f.get_height(),
+                min(lab_f.get_height() + 4,
+                    (rect.h - glyph_h) // max(1, n_rows - 1)))
+    for i, head in enumerate(('FREQ', 'BND', 'DX', 'SPOTTER', 'TIME')):
+        _blit_fit(screen, lab_f, head, theme['label'], xs[i], rect.y, ws[i])
+    y = rect.y + pitch
     for spot in dxspots[:5]:
         if not isinstance(spot, dict):
             continue
+        if y + glyph_h > rect.bottom:
+            break
         freq = _safe(spot, 'frequency')
         band = _safe(spot, 'band')
         dx = _safe(spot, 'dxCall')
         spotter = _safe(spot, 'spotter')
         tm = _safe(spot, 'time')
-        _blit_text(screen, fonts['body'], str(freq), theme['accent'], rect.x, y)
-        _blit_text(screen, fonts['body'], str(band),
-                   band_lut.get(str(band), theme['fg']), rect.x + 90, y)
-        _blit_text(screen, fonts['body'], str(dx), theme['bright'], rect.x + 140, y)
-        _blit_text(screen, fonts['body'], str(spotter)[:10], theme['fg'],
-                   rect.x + 230, y)
-        _blit_text(screen, fonts['body'], str(tm), theme['label'],
-                   rect.x + 340, y)
-        y += 16
+        _blit_fit(screen, val_f, str(freq), theme['accent'], xs[0], y, ws[0])
+        _blit_fit(screen, val_f, str(band),
+                  band_lut.get(str(band), theme['fg']), xs[1], y, ws[1])
+        _blit_fit(screen, val_f, str(dx), theme['bright'], xs[2], y, ws[2])
+        _blit_fit(screen, val_f, str(spotter)[:10], theme['fg'],
+                  xs[3], y, ws[3])
+        _blit_fit(screen, val_f, str(tm), theme['label'], xs[4], y, ws[4])
+        y += pitch
 
 
 def draw_band_activity(screen, rect, dxspots, fonts, theme):
-    counts = {b: 0 for b in HF_BANDS}
+    """Item 6: pre-allocated _band_counts list (reset in place) replaces the
+    per-frame {b: 0 for b in HF_BANDS} dict comprehension."""
+    for i in range(len(_band_counts)):
+        _band_counts[i] = 0
     if isinstance(dxspots, list):
-        for spot in dxspots:
+        for spot in dxspots[:200]:
             if isinstance(spot, dict):
                 b = spot.get('band')
-                if b in counts:
-                    counts[b] += 1
-    vmax = max(counts.values()) if any(counts.values()) else 1
-    band_lut = dict(zip(HF_BANDS, theme['band_palette']))
-    label_w = 40
-    count_w = 36
-    row_h = max(14, (rect.h - 4) // len(HF_BANDS))
-    y = rect.y + 2
-    for band in HF_BANDS:
-        c = counts[band]
-        _blit_text(screen, fonts['label'], band, theme['label'], rect.x, y + 1)
-        bar_rect = pygame.Rect(rect.x + label_w, y + 2,
-                               max(1, rect.w - label_w - count_w), row_h - 4)
-        draw_bar(screen, bar_rect, c, vmax,
-                 band_lut.get(band, theme['fg']), theme)
-        _blit_text(screen, fonts['label'], str(c), theme['bright'],
-                   rect.x + rect.w - count_w + 4, y + 1)
+                if b in HF_BANDS:
+                    _band_counts[HF_BANDS.index(b)] += 1
+    vmax = max(_band_counts) if any(_band_counts) else 1
+    # Tier-1a perf: same theme-cached LUT as draw_dx_spots.
+    band_lut = theme.get('_band_lut') or dict(zip(HF_BANDS, theme['band_palette']))
+    # Tier 1.1: `row_h = max(14, ...)` forced 10 x 14 = 140 px of rows into a
+    # content rect that is 100 px tall at 720x450 — the floor was the bug, not
+    # the divisor. Pitch is now the rect's share per band (capped so a tall
+    # 1440 panel does not stretch the bars absurdly) and the label/count
+    # gutters are fractions of rect.w rather than 40/36 absolute px.
+    lab_f = fonts['label']
+    glyph_h = lab_f.get_height()
+    n = len(HF_BANDS)
+    if rect.w <= 0 or rect.h < glyph_h:
+        return
+    row_h = max(1, min(rect.h // n, glyph_h + 10))
+    label_w = min(rect.w, max(glyph_h * 2, int(rect.w * 0.17)))
+    count_w = max(0, min(rect.w - label_w, max(glyph_h * 2,
+                                               int(rect.w * 0.15))))
+    bar_w = rect.w - label_w - count_w
+    count_pad = 2 if count_w > 4 else 0
+    count_x = rect.right - count_w + count_pad
+    y = rect.y
+    for i, band in enumerate(HF_BANDS):
+        if y + glyph_h > rect.bottom:
+            break
+        c = _band_counts[i]
+        _blit_fit(screen, lab_f, band, theme['label'], rect.x, y,
+                  label_w - 2)
+        bar_h = min(max(2, row_h - 3), rect.bottom - y - 1)
+        if bar_w > 2 and bar_h >= 2:
+            bar_rect = pygame.Rect(rect.x + label_w, y + 1, bar_w, bar_h)
+            draw_bar(screen, bar_rect, c, vmax,
+                     band_lut.get(band, theme['fg']), theme)
+        _blit_fit(screen, lab_f, str(c), theme['bright'],
+                  count_x, y, count_w - 2)
         y += row_h
 
 
 def draw_tabs(screen, rect, tabs, active, fonts, theme):
     """Draw a tab bar across rect.y (height 20). Returns {name: Rect}."""
     regions = {}
-    if not tabs:
+    if not tabs or rect.w <= 0 or rect.h <= 0:
         return regions
     tw = rect.w // len(tabs)
+    if tw < 4:
+        # Tier 1.1: `tw - 2` goes negative below two tabs' worth of width and
+        # pygame normalises a negative-width Rect by moving its left edge, so
+        # the chrome would be painted to the LEFT of the bar.
+        return regions
+    f = fonts['panel']
+    fh = f.get_height()
+    th = min(20, rect.h)
+    pad = min(8, max(1, tw // 6))
+    ty = rect.y + min(2, max(0, th - fh))
     for i, name in enumerate(tabs):
-        tab_rect = pygame.Rect(rect.x + i * tw, rect.y, tw - 2, 20)
+        tab_rect = pygame.Rect(rect.x + i * tw, rect.y, max(1, tw - 2), th)
         color = theme['border'] if name == active else theme['card']
         pygame.draw.rect(screen, color, tab_rect)
         pygame.draw.rect(screen, theme['border'], tab_rect, 1)
         text_color = theme['accent'] if name == active else theme['label']
-        _blit_text(screen, fonts['panel'], name.upper(), text_color,
-                   tab_rect.x + 8, tab_rect.y + 2)
+        if th >= fh:
+            _blit_fit(screen, f, name.upper(), text_color,
+                      tab_rect.x + pad, ty, tab_rect.w - pad - 1)
         regions[name] = tab_rect
     return regions
 
 
-def draw_geomag(screen, rect, solar, fonts, theme):
-    kp = _safe(solar, 'kIndex', 0)
+def draw_geomag(screen, rect, solar, fonts, theme, data_refresh_ts=None):
+    """Items 8 + 9: pull Kp value & label from caches when a refresh ts is
+    known so neither the _safe call nor the format string runs each frame."""
+    if data_refresh_ts is not None:
+        v = _solar_view(solar, data_refresh_ts)
+        kp = v['kIndex_raw']
+    else:
+        kp = _safe(solar, 'kIndex', 0)
     try:
         kp_val = float(kp)
     except Exception:
@@ -2894,14 +4602,18 @@ def draw_geomag(screen, rect, solar, fonts, theme):
     color = (theme['good'] if kp_val < 4
              else theme['fair'] if kp_val < 6
              else theme['poor'])
-    _blit_text(screen, fonts['body'], 'Kp {}'.format(kp), theme['bright'],
-               rect.x, rect.y + 2)
-    bar_rect = pygame.Rect(rect.x, rect.y + 20, rect.w, 10)
-    draw_bar(screen, bar_rect, kp_val, 9.0, color, theme)
+    _draw_value_and_bar(screen, rect, 'Kp {}'.format(kp), kp_val, 9.0,
+                        color, fonts, theme)
 
 
-def draw_xray(screen, rect, solar, fonts, theme):
-    xray = _safe(solar, 'xray', 'A0.0')
+def draw_xray(screen, rect, solar, fonts, theme, data_refresh_ts=None):
+    """Item 9: read the X-Ray value from the cached _solar_view when a
+    refresh ts is known."""
+    if data_refresh_ts is not None:
+        v = _solar_view(solar, data_refresh_ts)
+        xray = v['xray_raw']
+    else:
+        xray = _safe(solar, 'xray', 'A0.0')
     s = str(xray)
     try:
         letter = s[0]
@@ -2913,59 +4625,252 @@ def draw_xray(screen, rect, solar, fonts, theme):
     color = (theme['good'] if value < 2
              else theme['fair'] if value < 3
              else theme['poor'])
-    _blit_text(screen, fonts['body'], s, theme['bright'], rect.x, rect.y + 2)
-    bar_rect = pygame.Rect(rect.x, rect.y + 20, rect.w, 10)
-    draw_bar(screen, bar_rect, value, 5.0, color, theme)
+    _draw_value_and_bar(screen, rect, s, value, 5.0, color, fonts, theme)
 
 
-def draw_open_bands(screen, rect, bands, fonts, theme):
-    opens, closes = [], []
-    if isinstance(bands, dict):
-        for key, entry in bands.items():
-            if not isinstance(entry, dict):
-                continue
-            day = entry.get('day', 'N/A')
-            if day in ('Good', 'Fair'):
-                opens.append(key)
-            elif day == 'Poor':
-                closes.append(key)
-    _blit_text(screen, fonts['label'], 'OPEN: ' + (', '.join(opens) or '--'),
-               theme['good'], rect.x, rect.y)
-    _blit_text(screen, fonts['label'], 'CLOSED: ' + (', '.join(closes) or '--'),
-               theme['poor'], rect.x, rect.y + 16)
+def draw_open_bands(screen, rect, bands, fonts, theme, data_refresh_ts=None):
+    """Item 7: build the OPEN / CLOSED labels once per data refresh; until
+    the next refresh tick we just read the cached strings."""
+    o, c = _open_bands_strings(bands, data_refresh_ts)
+    # Tier 1.1: 'OPEN: 80m-40m, 30m-20m, 17m-15m' is 31 chars — 155 px in the
+    # label font, in a content rect 128 px wide at 720x450. Step down to the
+    # smaller face before truncating so the band list survives, and derive the
+    # second row's offset from the font instead of a fixed 16 px.
+    f = fonts['label']
+    if rect.w > 0 and (f.size(o)[0] > rect.w or f.size(c)[0] > rect.w):
+        f = fonts['small']
+    gh = f.get_height()
+    if rect.h < gh:
+        return
+    pitch = min(gh + 6, rect.h - gh)
+    _blit_fit(screen, f, o, theme['good'], rect.x, rect.y, rect.w)
+    if pitch > 0:
+        _blit_fit(screen, f, c, theme['poor'], rect.x, rect.y + pitch, rect.w)
 
 
 def draw_status_bar(screen, rect, data, fonts, theme):
+    """Item 8: status bar text is pulled from _strfmt_cache so the format
+    string is built at most once per UTC second."""
     pygame.draw.rect(screen, theme['card'], rect)
     pygame.draw.rect(screen, theme['border'], rect, 1)
-    now = time.time()
-    dage = int(now - data.last_data_refresh) if data.last_data_refresh else -1
-    iage = int(now - data.last_image_refresh) if data.last_image_refresh else -1
-    text = 'Data:{}s  Img:{}s  Solar:{}  Bands:{}  DX:{}'.format(
-        dage if dage >= 0 else '--',
-        iage if iage >= 0 else '--',
-        'OK' if data.solar else '--',
-        'OK' if data.bands else '--',
-        len(data.dxspots) if isinstance(data.dxspots, list) else 0,
-    )
-    _blit_text(screen, fonts['small'], text, theme['label'],
-               rect.x + 6, rect.y + 4)
-    _blit_text(screen, fonts['small'], 'ESC/Q to quit', theme['label'],
-               rect.x + rect.w - 110, rect.y + 4)
+    text = _formatted_strings(data)["status"]
+    f = fonts['small']
+    # Tier 1.1: the quit hint was pinned 110 px from the right edge, which is
+    # a different fraction of a 720 px bar than of a 1440 px one; place it by
+    # its measured width and give the status string the rest.
+    hint = 'ESC/Q to quit'
+    hint_x = max(rect.x, rect.right - 6 - f.size(hint)[0])
+    ty = rect.y + max(0, min(4, rect.h - f.get_height()))
+    _blit_fit(screen, f, text, theme['label'], rect.x + 6, ty,
+              hint_x - rect.x - 12)
+    _blit_fit(screen, f, hint, theme['label'], hint_x, ty,
+              rect.right - hint_x)
+
+
+# Tier 1.2: keys whose payload failed to decode, stamped with the fetch ts
+# that produced them. _load_image makes up to three SDL probes per call and
+# pygame offers no cheap "is this decodable" test, so without this memo an
+# undecodable payload (a 503 body, a truncated JPEG, an SVG the Tier 1.5 guard
+# refuses) is re-probed on every redraw of its panel instead of once per
+# refresh. Bounded by the five _IMAGE_ENDPOINTS keys.
+_decode_failed_ts: dict = {}
+
+
+def _image_stamp(data, key):
+    """Per-key fetch timestamp, falling back to the global refresh tick.
+
+    The getattr/isinstance guard is load-bearing: HamClockData grew
+    image_fetched_at in Tier 1a but stand-ins that predate it (e.g.
+    tests/test_themes.py's _StubData) do not have the attribute at all, and an
+    AttributeError here is swallowed by the render loop's per-panel
+    `except Exception: pass` — which is exactly how the installer-embedded
+    client ended up with two permanently blank image panels.
+    """
+    _fa = getattr(data, 'image_fetched_at', None)
+    return (_fa.get(key, data.last_image_refresh)
+            if isinstance(_fa, dict) else data.last_image_refresh)
 
 
 def _get_cached_image(data, key, image_cache, image_cache_ts):
-    """Return a pygame Surface for data.images[key], rebuilt when refresh ts changes."""
+    """Return a pygame Surface for data.images[key], rebuilt when THAT key's
+    fetch timestamp changes.
+
+    Tier 1.2: the stamp used to be the global data.last_image_refresh, so one
+    endpoint arriving invalidated the decoded surfaces of all five and the
+    render thread paid 3-4 redundant full JPEG/PNG decodes per retry during
+    cold boot (~36-165 ms each, ARMv6 extrapolated). A decode that fails is
+    now remembered against the same stamp so it is retried once per refresh,
+    not once per redraw; the previously decoded surface (if any) keeps being
+    served meanwhile.
+    """
     raw = data.images.get(key) if isinstance(data.images, dict) else None
     if raw is None:
         return None
-    ts = data.last_image_refresh
+    ts = _image_stamp(data, key)
     if image_cache_ts.get(key) != ts or key not in image_cache:
+        if _decode_failed_ts.get(key) == ts:
+            return image_cache.get(key)
         surf = _load_image(raw)
         if surf is not None:
             image_cache[key] = surf
             image_cache_ts[key] = ts
+            _decode_failed_ts.pop(key, None)
+        else:
+            _decode_failed_ts[key] = ts
     return image_cache.get(key)
+
+
+# Tier 2.5: what to call each feed on screen. The panel titles ("SDO IMAGE")
+# and the propagation tab labels ("drap", "aurora") do not name the upstream
+# product, and during an outage the feed name is most of the information.
+_IMAGE_LABEL = {
+    'solar-image': 'SDO',
+    'muf-map': 'MUF map',
+    'enlil': 'Enlil',
+    'drap': 'Aurora',
+    'real-drap': 'D-layer',
+}
+
+# Optional per-key content-age fields on /api/health. Client-side fetch time
+# cannot see that the server answered from its persisted disk cache (Tier
+# 2.1), so when the server publishes a real content age we prefer it. Absent
+# or -1 (the existing "unknown" convention at server.py's /api/health) falls
+# back to the client's own last-successful-fetch stamp.
+_HEALTH_AGE_FIELD = {
+    'solar-image': 'sdo_age',
+    'muf-map': 'muf_age',
+    'enlil': 'enlil_age',
+    'drap': 'drap_age',
+    'real-drap': 'real_drap_age',
+}
+
+# Consecutive failed attempts before a feed is called "down" rather than
+# "no data yet". With hamclock_data.IMAGE_RETRY_BACKOFF = (5, 10, 20, 40, 60)
+# the 4th failure lands ~75 s in, which is long enough that a slow server or a
+# boot-time race has been ruled out.
+_IMAGE_DOWN_AFTER_FAILS = 4
+
+# Show an age label once a displayed image is this old. Below it the label is
+# clutter (the feeds refresh every 900 s); above it the picture may no longer
+# describe the band conditions in front of the operator.
+_IMAGE_STALE_S = 3600.0
+
+
+def _fmt_eta(secs):
+    """Coarse 'retry in ...' token. Never raises; never returns ''."""
+    try:
+        s = float(secs)
+        if s != s:          # NaN
+            return '?'
+        if s <= 1:
+            return 'now'
+        # Round UP: a countdown that reads 0s while nothing has happened yet
+        # is the same lie this tier exists to remove. Ceil first, then pick
+        # the unit, so 59.9 s reads "1m" rather than "60s".
+        s = int(s) + (1 if s > int(s) else 0)
+        if s < 60:
+            return '%ds' % s
+        if s < 3600:
+            return '%dm' % ((s + 59) // 60)
+        if s < 86400:
+            return '%dh' % (s // 3600)
+        return '%dd' % (s // 86400)
+    except Exception:
+        return '?'
+
+
+def _fmt_age(secs):
+    """Coarse '... old' token. Never raises; never returns ''."""
+    try:
+        s = float(secs)
+        if s != s or s < 0:
+            return '?'
+        if s < 60:
+            return '%ds' % int(s)
+        if s < 3600:
+            return '%dm' % int(s // 60)
+        if s < 86400:
+            return '%dh' % int(s // 3600)
+        return '%dd' % int(s // 86400)
+    except Exception:
+        return '?'
+
+
+def _image_status_text(data, key):
+    """Honest one/two-line status for image panel `key`, or None.
+
+    TOTAL by construction. The render loop evaluates this as an *argument* to
+    draw_image, inside the per-panel `except Exception: pass`, so an exception
+    escaping here does not merely lose the status — it skips the draw_image
+    call entirely and leaves the panel blank, which is strictly worse than the
+    string it was meant to replace. Hence .get() on every dict lookup (getattr
+    guards the attribute, never the key), isinstance checks on everything that
+    came off the wire, and a blanket except returning None.
+
+    Returning None means "say nothing", which is the right answer for a fresh
+    image and for any data object this function does not understand.
+
+    Deliberately NOT sourced from `data.images.get(key) is not None`: that
+    cannot tell a decode failure from a decode success, and data.images is
+    cumulative (refresh_images does new_images.update(fetched) and never
+    deletes), so it stays truthy forever after one good cycle. The decode
+    verdict comes from _decode_failed_ts (Tier 1.2) and the liveness verdict
+    from the per-key retry state (Tier 1.4).
+    """
+    try:
+        name = _IMAGE_LABEL.get(key, 'image')
+        now = time.time()
+
+        images = getattr(data, 'images', None)
+        raw = images.get(key) if isinstance(images, dict) else None
+
+        fa = getattr(data, 'image_fetched_at', None)
+        stamp = fa.get(key) if isinstance(fa, dict) else None
+        if stamp is None:
+            stamp = getattr(data, 'last_image_refresh', None)
+
+        # 1) Bytes in hand that SDL refused. Checked first and against the
+        #    stamp that produced them, so a *newly* bad payload is reported
+        #    even while _get_cached_image is still showing the last good
+        #    surface underneath.
+        failed = _decode_failed_ts.get(key)
+        if (raw is not None and failed is not None and stamp is not None
+                and failed == stamp):
+            return '%s: image data\nnot readable' % name
+
+        fs = getattr(data, 'image_fail_streak', None)
+        streak = fs.get(key, 0) if isinstance(fs, dict) else 0
+        if not isinstance(streak, int) or isinstance(streak, bool):
+            streak = 0
+
+        # 2) Nothing to draw at all.
+        if raw is None:
+            if streak <= 0:
+                return '%s: fetching...' % name
+            nd = getattr(data, 'image_next_due', None)
+            due = nd.get(key) if isinstance(nd, dict) else None
+            head = ('%s: feed down' % name if streak >= _IMAGE_DOWN_AFTER_FAILS
+                    else '%s: no data yet' % name)
+            if isinstance(due, (int, float)) and not isinstance(due, bool):
+                return '%s\nretry %s' % (head, _fmt_eta(due - now))
+            return head
+
+        # 3) An image is on screen. Say how old it is once that matters.
+        age = None
+        health = getattr(data, 'health', None)
+        if isinstance(health, dict):
+            hv = health.get(_HEALTH_AGE_FIELD.get(key) or '\x00')
+            if (isinstance(hv, (int, float)) and not isinstance(hv, bool)
+                    and hv >= 0):
+                age = float(hv)
+        if (age is None and isinstance(stamp, (int, float))
+                and not isinstance(stamp, bool) and stamp > 0):
+            age = now - float(stamp)
+        if age is not None and age >= _IMAGE_STALE_S:
+            return '%s %s old' % (name, _fmt_age(age))
+        return None
+    except Exception:
+        return None
 
 
 def _compute_dirty_rects(state, panel_rects, active_tab,
@@ -3144,6 +5049,13 @@ def main(argv=None):
         injected_iter = _inject_event_iter(
             _load_injected_events(args.inject_events))
 
+    # Tier-1a perf: relax the gen-0 GC threshold from the default 700 to
+    # 50000 so short-lived per-frame allocations don't trigger a sweep mid
+    # render. We still collect gen-1/gen-2 normally so long-lived churn is
+    # cleaned. The Pi 1's 256 MB RAM tolerates this comfortably given our
+    # working set is dominated by SDL surfaces, not Python objects.
+    gc.set_threshold(50_000, 10, 10)
+
     screen = _init_display()
     pygame.display.set_caption('HamClock Lite')
     try:
@@ -3197,6 +5109,10 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
     """The dashboard render loop, factored out of main() so that the
     Phase-4 first-boot wizard can run beforehand and tests can patch this
     entry point to assert ordering without spinning up real rendering."""
+    # Tier-1a perf: stash the {band: color} LUT on the theme so draw_dx_spots
+    # and draw_band_activity don't rebuild dict(zip(...)) every frame.
+    if '_band_lut' not in theme:
+        theme['_band_lut'] = dict(zip(HF_BANDS, theme['band_palette']))
     data = HamClockData()
     try:
         data.start_background(data_interval=60, image_interval=900)
@@ -3215,6 +5131,11 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
         'prev_image_refresh': 0.0,
         'full_flip_pending': True,
     }
+    # Tier 2b: per-panel next-due-at clock. 0.0 means "draw on the very next
+    # frame" so first-paint catches every panel. After each panel's draw, we
+    # bump its entry by _CADENCE_S[name]. A tab change or pending full flip
+    # forces all panels to redraw regardless of due time.
+    _panel_due_at = {name: 0.0 for name in _CADENCE_S}
 
     clock = pygame.time.Clock()
     running = True
@@ -3243,119 +5164,188 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                             break
 
             sw, sh = screen.get_size()
-            screen.fill(theme['bg'])
+            # Tier-0 perf: only memset the whole 720x450 framebuffer when this
+            # frame will end in a full display.flip(). The dirty-rect helper
+            # signals "full flip" on first frame, tab change, or pending flag;
+            # peek at the same predicate here (without mutating state) so we
+            # can gate the fill. On partial-update frames each panel's
+            # draw_panel paints over its own pixels, so the bg fill is dead
+            # work that negates the dirty-rect win.
+            will_full_flip = (
+                dirty_state.get('full_flip_pending')
+                or dirty_state.get('prev_active_tab') != active_tab
+            )
+            if will_full_flip:
+                screen.fill(theme['bg'])
 
-            header = pygame.Rect(0, 0, sw, 30)
+            # Phase 1b item 5: panel rects are cached and rebuilt only on
+            # screen-size change. Per-frame pygame.Rect allocations are gone
+            # for every panel that uses a stable position.
+            layout = _get_layout((sw, sh))
+            data_ts = data.last_data_refresh
+
+            # Tier 2b: cadence gate. On a full-flip frame (first paint or
+            # tab change) every panel redraws; otherwise each panel only
+            # redraws when its _panel_due_at has elapsed. Panels that ran
+            # this frame land in redrawn_this_frame so we can build the
+            # display.update() rect list from the actual draws, instead of
+            # the speculative dirty-rect helper.
+            now_ts = time.time()
+            force_all = will_full_flip
+
+            def _panel_due(name):
+                if force_all:
+                    return True
+                return _panel_due_at[name] <= now_ts
+
+            redrawn_this_frame = set()
+
+            header = layout["header"]
             callsign = settings.get('callsign') or os.environ.get(
                 'HAMCLOCK_CALLSIGN', 'N0CALL')
-            draw_header(screen, header, callsign, fonts, theme)
+            if _panel_due('header'):
+                draw_header(screen, header, callsign, fonts, theme, data=data)
+                redrawn_this_frame.add('header')
+                _panel_due_at['header'] = now_ts + _CADENCE_S['header']
 
-            status = pygame.Rect(0, sh - 20, sw, 20)
-            draw_status_bar(screen, status, data, fonts, theme)
+            status = layout["status"]
+            if _panel_due('status'):
+                draw_status_bar(screen, status, data, fonts, theme)
+                redrawn_this_frame.add('status')
+                _panel_due_at['status'] = now_ts + _CADENCE_S['status']
 
-            content_top = 32
-            content_bot = sh - 22
-            content_h = content_bot - content_top
-
-            left_w = int(sw * 288 / 1440)
-            mid_w = int(sw * (936 - 288) / 1440)
-            right_w = sw - left_w - mid_w
+            panel_gap = 4
 
             # ---- LEFT COLUMN ----
-            lx = 2
-            ly = content_top
-            panel_gap = 4
-            # allocate heights (percent of content_h)
-            heights = [
-                int(content_h * 0.20),  # solar
-                int(content_h * 0.12),  # bands
-                int(content_h * 0.28),  # sdo
-                int(content_h * 0.10),  # geomag
-                int(content_h * 0.10),  # xray
-            ]
-            heights.append(content_h - sum(heights) - panel_gap * 5)  # open bands
-            titles = ['SOLAR', 'BANDS', 'SDO IMAGE', 'GEOMAGNETIC', 'X-RAY FLUX', 'OPEN BANDS']
-            cy = ly
+            titles = ['SOLAR', 'BANDS', 'SDO IMAGE',
+                      'GEOMAGNETIC', 'X-RAY FLUX', 'OPEN BANDS']
+            layout_keys = ['solar', 'bands', 'sdo',
+                           'geomag', 'xray', 'open_bands']
+            # Compute inner rects without re-issuing draw_panel chrome on
+            # frames where no left-column panel is due (chrome blit is
+            # cheap but pointless if nothing inside changed).
             panel_rects = []
-            for h, t in zip(heights, titles):
-                r = pygame.Rect(lx, cy, left_w - 4, h)
-                inner = draw_panel(screen, r, t, fonts, theme)
+            for key, t in zip(layout_keys, titles):
+                if _panel_due(key):
+                    inner = draw_panel(screen, layout[key], t, fonts, theme)
+                else:
+                    inner = _panel_inner_rect(layout[key])
                 panel_rects.append(inner)
-                cy += h + panel_gap
 
-            try:
-                draw_solar(screen, panel_rects[0], data.solar or {}, fonts, theme)
-            except Exception:
-                pass
-            try:
-                draw_bands(screen, panel_rects[1], data.bands or {}, fonts, theme)
-            except Exception:
-                pass
-            try:
-                sdo_surf = _get_cached_image(data, 'solar-image', image_cache, image_cache_ts)
-                draw_image(screen, panel_rects[2], sdo_surf, fonts, theme,
-                           image_key='solar-image',
-                           fetched_at=data.image_fetched_at.get('solar-image', 0.0))
-            except Exception:
-                pass
-            try:
-                draw_geomag(screen, panel_rects[3], data.solar or {}, fonts, theme)
-            except Exception:
-                pass
-            try:
-                draw_xray(screen, panel_rects[4], data.solar or {}, fonts, theme)
-            except Exception:
-                pass
-            try:
-                draw_open_bands(screen, panel_rects[5], data.bands or {}, fonts, theme)
-            except Exception:
-                pass
+            if _panel_due('solar'):
+                try:
+                    draw_solar(screen, panel_rects[0], data.solar or {},
+                               fonts, theme, data_refresh_ts=data_ts)
+                except Exception:
+                    pass
+                redrawn_this_frame.add('solar')
+                _panel_due_at['solar'] = now_ts + _CADENCE_S['solar']
+            if _panel_due('bands'):
+                try:
+                    draw_bands(screen, panel_rects[1], data.bands or {}, fonts, theme)
+                except Exception:
+                    pass
+                redrawn_this_frame.add('bands')
+                _panel_due_at['bands'] = now_ts + _CADENCE_S['bands']
+            if _panel_due('sdo'):
+                # Tier 2.5: hoisted out of the try. The cadence line below
+                # reads it, and a NameError there would land in the render
+                # loop's consecutive_errors counter instead of this panel's
+                # own except.
+                sdo_surf = None
+                try:
+                    sdo_surf = _get_cached_image(data, 'solar-image', image_cache, image_cache_ts)
+                    draw_image(screen, panel_rects[2], sdo_surf, fonts, theme,
+                               image_key='solar-image',
+                               fetched_at=_image_stamp(data, 'solar-image'),
+                               status=_image_status_text(data, 'solar-image'))
+                except Exception:
+                    pass
+                redrawn_this_frame.add('sdo')
+                _panel_due_at['sdo'] = now_ts + (
+                    _CADENCE_S['sdo'] if sdo_surf is not None
+                    else _CADENCE_S_NO_IMAGE.get('sdo', _CADENCE_S['sdo']))
+            if _panel_due('geomag'):
+                try:
+                    draw_geomag(screen, panel_rects[3], data.solar or {},
+                                fonts, theme, data_refresh_ts=data_ts)
+                except Exception:
+                    pass
+                redrawn_this_frame.add('geomag')
+                _panel_due_at['geomag'] = now_ts + _CADENCE_S['geomag']
+            if _panel_due('xray'):
+                try:
+                    draw_xray(screen, panel_rects[4], data.solar or {},
+                              fonts, theme, data_refresh_ts=data_ts)
+                except Exception:
+                    pass
+                redrawn_this_frame.add('xray')
+                _panel_due_at['xray'] = now_ts + _CADENCE_S['xray']
+            if _panel_due('open_bands'):
+                try:
+                    draw_open_bands(screen, panel_rects[5], data.bands or {},
+                                    fonts, theme, data_refresh_ts=data_ts)
+                except Exception:
+                    pass
+                redrawn_this_frame.add('open_bands')
+                _panel_due_at['open_bands'] = now_ts + _CADENCE_S['open_bands']
 
             # ---- MIDDLE COLUMN ----
-            mx = lx + left_w
-            mid_rect = pygame.Rect(mx, content_top, mid_w - 4, content_h)
-            mid_inner = draw_panel(screen, mid_rect, 'MUF STATUS', fonts, theme)
-            try:
-                draw_muf_text(screen, mid_inner, data.solar or {}, fonts, theme)
-            except Exception:
-                pass
+            mid_rect = layout["muf"]
+            if _panel_due('muf_text'):
+                mid_inner = draw_panel(screen, mid_rect, 'MUF STATUS', fonts, theme)
+                try:
+                    draw_muf_text(screen, mid_inner, data.solar or {}, fonts, theme)
+                except Exception:
+                    pass
+                redrawn_this_frame.add('muf_text')
+                _panel_due_at['muf_text'] = now_ts + _CADENCE_S['muf_text']
 
             # ---- RIGHT COLUMN ----
-            rx = mx + mid_w
-            rh_dx = int(content_h * 0.28)
-            rh_ba = int(content_h * 0.32)
-            rh_prop = content_h - rh_dx - rh_ba - panel_gap * 2
+            dx_r = layout["dx_spots"]
+            if _panel_due('dx_spots'):
+                dx_inner = draw_panel(screen, dx_r, 'DX SPOTS', fonts, theme)
+                try:
+                    draw_dx_spots(screen, dx_inner, data.dxspots or [], fonts, theme)
+                except Exception:
+                    pass
+                redrawn_this_frame.add('dx_spots')
+                _panel_due_at['dx_spots'] = now_ts + _CADENCE_S['dx_spots']
 
-            dx_r = pygame.Rect(rx, content_top, right_w - 4, rh_dx)
-            dx_inner = draw_panel(screen, dx_r, 'DX SPOTS', fonts, theme)
-            try:
-                draw_dx_spots(screen, dx_inner, data.dxspots or [], fonts, theme)
-            except Exception:
-                pass
+            ba_r = layout["band_activity"]
+            if _panel_due('band_activity'):
+                ba_inner = draw_panel(screen, ba_r, 'BAND ACTIVITY', fonts, theme)
+                try:
+                    draw_band_activity(screen, ba_inner, data.dxspots or [], fonts, theme)
+                except Exception:
+                    pass
+                redrawn_this_frame.add('band_activity')
+                _panel_due_at['band_activity'] = now_ts + _CADENCE_S['band_activity']
 
-            ba_r = pygame.Rect(rx, content_top + rh_dx + panel_gap, right_w - 4, rh_ba)
-            ba_inner = draw_panel(screen, ba_r, 'BAND ACTIVITY', fonts, theme)
-            try:
-                draw_band_activity(screen, ba_inner, data.dxspots or [], fonts, theme)
-            except Exception:
-                pass
-
-            prop_r = pygame.Rect(rx, content_top + rh_dx + rh_ba + panel_gap * 2,
-                                 right_w - 4, rh_prop)
-            prop_inner = draw_panel(screen, prop_r, 'PROPAGATION', fonts, theme)
-            tab_bar = pygame.Rect(prop_inner.x, prop_inner.y, prop_inner.w, 20)
-            tab_regions = draw_tabs(screen, tab_bar, PROP_TABS,
-                                    active_tab, fonts, theme)
-            img_rect = pygame.Rect(prop_inner.x, prop_inner.y + 24,
-                                   prop_inner.w, prop_inner.h - 24)
-            try:
-                key = tab_image_key.get(active_tab, 'real-drap')
-                surf = _get_cached_image(data, key, image_cache, image_cache_ts)
-                draw_image(screen, img_rect, surf, fonts, theme,
-                           image_key=key,
-                           fetched_at=data.image_fetched_at.get(key, 0.0))
-            except Exception:
-                pass
+            prop_r = layout["propagation"]
+            if _panel_due('propagation'):
+                prop_inner = draw_panel(screen, prop_r, 'PROPAGATION', fonts, theme)
+                tab_bar = pygame.Rect(prop_inner.x, prop_inner.y, prop_inner.w, 20)
+                tab_regions = draw_tabs(screen, tab_bar, PROP_TABS,
+                                        active_tab, fonts, theme)
+                img_rect = pygame.Rect(prop_inner.x, prop_inner.y + 24,
+                                       prop_inner.w, prop_inner.h - 24)
+                # Tier 2.5: hoisted out of the try — see the sdo panel above.
+                surf = None
+                try:
+                    key = tab_image_key.get(active_tab, 'real-drap')
+                    surf = _get_cached_image(data, key, image_cache, image_cache_ts)
+                    draw_image(screen, img_rect, surf, fonts, theme,
+                               image_key=key,
+                               fetched_at=_image_stamp(data, key),
+                               status=_image_status_text(data, key))
+                except Exception:
+                    pass
+                redrawn_this_frame.add('propagation')
+                _panel_due_at['propagation'] = now_ts + (
+                    _CADENCE_S['propagation'] if surf is not None
+                    else _CADENCE_S_NO_IMAGE.get('propagation',
+                                                 _CADENCE_S['propagation']))
 
             panel_rects_map = {
                 'header': header,
@@ -3371,15 +5361,20 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 'band_activity': ba_r,
                 'propagation': prop_r,
             }
-            dirty = _compute_dirty_rects(
-                dirty_state, panel_rects_map, active_tab,
-                int(time.time()),
-                data.last_data_refresh,
-                data.last_image_refresh)
-            if dirty is None:
+            # Tier 2b: present this frame. Full-flip path matches the legacy
+            # _compute_dirty_rects contract (first frame, tab change, pending
+            # flag). Otherwise we update only the rects of panels actually
+            # redrawn this frame; if nothing was due, we present nothing.
+            if (dirty_state.get('full_flip_pending')
+                    or dirty_state.get('prev_active_tab') != active_tab):
+                dirty_state['full_flip_pending'] = False
+                dirty_state['prev_active_tab'] = active_tab
                 pygame.display.flip()
-            elif dirty:
-                pygame.display.update(dirty)
+            else:
+                rects = [panel_rects_map[n] for n in redrawn_this_frame
+                         if n in panel_rects_map]
+                if rects:
+                    pygame.display.update(rects)
             clock.tick(10)
             consecutive_errors = 0
         except Exception as e:
@@ -3667,7 +5662,7 @@ class HamClockTkApp:
         )
 
         self._value_labels = {}
-        self._last_image_ts = 0
+        self._last_image_ts = {}  # Tier 1.2: per-image-key fetch stamps
         self._image_refs = {}  # hold refs to prevent GC
 
         self._build_ui()
@@ -4087,20 +6082,43 @@ class HamClockTkApp:
             text='CLOSED: ' + (', '.join(closed_list) if closed_list else '—'),
         )
 
-    def _update_images(self):
-        ts = self.data.last_image_refresh
-        if ts == self._last_image_ts:
-            return
-        self._last_image_ts = ts
-        imgs = self.data.images or {}
+    def _image_stamp(self, key):
+        """Per-key fetch timestamp, falling back to the global refresh tick.
 
-        sdo = self._load_image(imgs.get('solar-image'), 360, 220)
-        if sdo is not None:
-            self._set_image(self.sdo_label, 'sdo', sdo)
-        elif not HAS_PIL:
-            self.sdo_label.configure(text='(PIL missing)')
+        The getattr/isinstance guard is load-bearing: image_fetched_at arrived
+        with Tier 1a and older HamClockData copies (notably the one embedded
+        in the installers) do not have it at all.
+        """
+        fa = getattr(self.data, 'image_fetched_at', None)
+        if isinstance(fa, dict):
+            return fa.get(key, self.data.last_image_refresh)
+        return self.data.last_image_refresh
+
+    def _update_images(self):
+        # Tier 1.2: gate each image on ITS OWN fetch timestamp. The single
+        # last_image_refresh gate re-decoded and re-thumbnailed all five
+        # payloads whenever any one of them arrived (PIL LANCZOS resize is the
+        # expensive part), and a refresh cycle that fetched nothing at all
+        # still bumped the stamp. The per-key stamp is recorded whether or not
+        # the decode succeeds, so an undecodable payload costs one attempt per
+        # refresh rather than one per UI tick.
+        imgs = self.data.images or {}
+        seen = self._last_image_ts
+
+        ts = self._image_stamp('solar-image')
+        if seen.get('solar-image') != ts:
+            seen['solar-image'] = ts
+            sdo = self._load_image(imgs.get('solar-image'), 360, 220)
+            if sdo is not None:
+                self._set_image(self.sdo_label, 'sdo', sdo)
+            elif not HAS_PIL:
+                self.sdo_label.configure(text='(PIL missing)')
 
         for key, label in self.prop_tabs.items():
+            ts = self._image_stamp(key)
+            if seen.get(key) == ts:
+                continue
+            seen[key] = ts
             photo = self._load_image(imgs.get(key), 380, 260)
             if photo is not None:
                 self._set_image(label, 'prop_' + key, photo)
@@ -4139,17 +6157,24 @@ HCTKEOF
 
 # ── Step 5: Create hamclock-lite systemd service ────────────────────
 echo "Creating HamClock server service..."
-if ! systemctl is-enabled hamclock-lite &>/dev/null; then
-    # Tier 1c: pygame-mode only — reduce glibc arena fragmentation, strip
-    # asserts/docstrings, and pre-compile .pyc once at service start so
-    # subsequent imports skip the bytecode compile path on a 512 MB Pi.
-    LITE_PYGAME_ENV=""
-    LITE_PYGAME_PRE=""
-    if [ "$KIOSK_MODE" = "pygame" ]; then
-        LITE_PYGAME_ENV="Environment=MALLOC_ARENA_MAX=1 PYTHONOPTIMIZE=1 PYTHONDONTWRITEBYTECODE=1"
-        LITE_PYGAME_PRE="ExecStartPre=/usr/bin/python3 -O -m compileall -q /opt/hamclock-lite"
-    fi
-    sudo tee /etc/systemd/system/hamclock-lite.service > /dev/null <<EOF
+# The unit is rewritten on EVERY run (it used to sit inside
+# `if ! systemctl is-enabled hamclock-lite`, so an existing box never picked up
+# unit changes such as CacheDirectory=). Only enable/start is first-run
+# behaviour; a re-run is covered by the explicit restart at the end of the script.
+# Tier 1c: pygame-mode only — reduce glibc arena fragmentation, strip
+# asserts/docstrings, and pre-compile .pyc once at service start so
+# subsequent imports skip the bytecode compile path on a 512 MB Pi.
+LITE_PYGAME_ENV=""
+LITE_PYGAME_PRE=""
+if [ "$KIOSK_MODE" = "pygame" ]; then
+    LITE_PYGAME_ENV="Environment=MALLOC_ARENA_MAX=1 PYTHONOPTIMIZE=1 PYTHONDONTWRITEBYTECODE=1"
+    LITE_PYGAME_PRE="ExecStartPre=/usr/bin/python3 -O -m compileall -q /opt/hamclock-lite"
+fi
+# CacheDirectory= makes systemd create/chown /var/cache/hamclock-lite for the
+# service user, which is where server.py persists the fetched images so a warm
+# boot paints immediately instead of waiting on the network. Needs systemd>=235
+# (Buster 241, Bullseye 247, Bookworm 252).
+sudo tee /etc/systemd/system/hamclock-lite.service > /dev/null <<EOF
 [Unit]
 Description=HamClock Lite Server
 After=network-online.target
@@ -4159,6 +6184,7 @@ Wants=network-online.target
 Type=simple
 User=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR
+CacheDirectory=hamclock-lite
 $LITE_PYGAME_ENV
 $LITE_PYGAME_PRE
 ExecStart=/usr/bin/python3 $INSTALL_DIR/server.py
@@ -4169,7 +6195,8 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-    sudo systemctl daemon-reload
+sudo systemctl daemon-reload
+if ! systemctl is-enabled hamclock-lite &>/dev/null; then
     sudo systemctl enable hamclock-lite
     sudo systemctl start hamclock-lite
 fi
