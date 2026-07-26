@@ -1,0 +1,13 @@
+[Unit]
+Description=HamClock Lite update apply
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as root: it writes /opt/hamclock-lite, rewrites units, and may reboot.
+# The script consumes the request file first thing, so a crash cannot leave the
+# path unit re-triggering in a loop.
+ExecStart=/opt/hamclock-lite/hamclock-update.sh --apply
+# Long enough for a slow ARMv6 download plus install plus the health probe.
+TimeoutStartSec=900

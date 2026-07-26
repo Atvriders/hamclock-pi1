@@ -1,0 +1,16 @@
+[Unit]
+Description=HamClock Lite update check (writes status, installs nothing)
+# Checking before the clock is right produces a bogus "checked" timestamp, and
+# TLS certificate validation itself fails when the date is wildly wrong — which
+# on an RTC-less Pi 1 is the normal state for the first minute after boot.
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# --check only ever fetches a small manifest and writes a status file.
+# It cannot install anything; that is a separate unit with a separate trigger.
+ExecStart=/opt/hamclock-lite/hamclock-update.sh --check
+TimeoutStartSec=120
+Nice=19
+IOSchedulingClass=idle

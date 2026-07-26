@@ -1,0 +1,13 @@
+[Unit]
+Description=HamClock Lite settings-apply request watcher
+# Same privilege boundary as the updater: the setup wizard runs as an
+# unprivileged user and can save settings.json, but the NTP source lives in a
+# root-owned timesyncd drop-in. The wizard creates this empty file to ask; root
+# reads the value, re-validates it from scratch, and applies it.
+
+[Path]
+PathExists=/run/hamclock-lite/settings.request
+Unit=hamclock-apply-settings.service
+
+[Install]
+WantedBy=multi-user.target

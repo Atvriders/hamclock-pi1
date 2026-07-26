@@ -301,6 +301,172 @@ MUF_URL = 'https://prop.kc2g.com/renders/current/mufd-normal-now.svg'
 
 
 # ---------------------------------------------------------------------------
+# Diagnostics counters — the read side is GET /api/diagnostics
+#
+# The maintainer owns no ARMv6 hardware, so every Pi figure in this project is
+# extrapolated from x86 and unverified. These counters exist to answer the
+# questions that extrapolation cannot: is the 45 s rasterize budget actually
+# firing, is the conditional GET actually producing 304s, did the disk cache
+# come back warm.
+#
+# Rules every counter here follows:
+#   * plain module-level ints/floats updated at call sites that ALREADY exist.
+#     No new threads, no locks, no work added to a request path.
+#   * every dict is created with its complete key set and never grows, so the
+#     handler thread can copy one while the fetcher thread writes values into
+#     it. A dict that could gain a key mid-copy would raise RuntimeError
+#     ("changed size during iteration") inside the diagnostics handler.
+#   * nothing in here is transmitted by itself. /api/diagnostics is a local
+#     read; the operator's explicit press is what sends anything anywhere.
+# ---------------------------------------------------------------------------
+
+_BOOT_EPOCH = time.time()
+_BOOT_MONOTONIC = time.monotonic()
+
+# Rasterize outcome counts since boot. The whole point of splitting timeout
+# from fail: a timeout means PHASE2_TIMEOUT_S/_muf_timeout() is too low for
+# this hardware, a fail means cairosvg or cpulimit is broken/absent. They are
+# indistinguishable in the log line, which prints "rasterize failed" for both.
+_MUF_RASTERIZE_OK = 0
+_MUF_RASTERIZE_TIMEOUT = 0
+_MUF_RASTERIZE_FAIL = 0
+
+# Wall clock of the last SUCCESSFUL rasterize, and the budget that was in
+# force the last time one timed out (i.e. the number that fired).
+_MUF_LAST_RENDER_S = None
+_MUF_LAST_TIMEOUT_BUDGET_S = None
+
+# Byte sizes from the last rasterize attempt. slim_bytes is None when
+# _slim_muf_svg declined the document (upstream re-render), which is exactly
+# the case where the render cost doubles.
+_MUF_LAST_SVG_BYTES = None
+_MUF_LAST_SLIM_BYTES = None
+_MUF_LAST_PNG_BYTES = None
+_MUF_SLIM_OK = 0
+_MUF_SLIM_DECLINED = 0
+_MUF_UNSLIMMED_RETRIES = 0
+
+# What /api/muf-map last wrote to a client: 'png', 'svg' or 'none' (503).
+# Distinct from _MUF_PNG_SOURCE, which says where the PNG we hold came from
+# ('live' = rendered here, 'disk' = restored at boot).
+_MUF_LAST_SERVED = 'none'
+
+# Filled by _load_persisted() at boot, before any thread starts. A tuple, not
+# a mutable set, so the handler never observes it half-built.
+_DISK_RESTORED = ()
+_BOOT_DISK_WARM = False
+
+# One entry per fetcher. 'hamqsl' covers both solar and bands (one XML).
+_FETCH_NAMES = ('hamqsl', 'dx', 'muf', 'sdo', 'enlil', 'drap', 'real_drap')
+
+# product -> (CACHE payload key, CACHE stamp key). The five image products,
+# in the same order as _PERSIST_KEYS.
+_DIAG_PRODUCTS = (
+    ('muf', 'muf_image_png', 'muf_image_png_updated'),
+    ('sdo', 'solar_image', 'solar_image_updated'),
+    ('enlil', 'enlil_image', 'enlil_image_updated'),
+    ('drap', 'drap_image', 'drap_image_updated'),
+    ('real_drap', 'real_drap_image', 'real_drap_image_updated'),
+)
+
+
+def _new_fetch_stat():
+    """Fixed key set — see the no-resize rule above."""
+    return {
+        'last_ms': None,
+        'last_status': None,
+        'last_error': None,
+        'last_at': None,
+        'consecutive_failures': 0,
+        'ok': 0,
+        'not_modified': 0,
+        'errors': 0,
+    }
+
+
+_FETCH_STATS = {name: _new_fetch_stat() for name in _FETCH_NAMES}
+
+# name -> seconds from process start to the first fetch that came back with
+# usable data. Pre-seeded with every name so the dict never resizes.
+_FIRST_OK_S = {name: None for name in _FETCH_NAMES}
+
+
+def _diag_error_name(error):
+    """A short, safe label for a failure.
+
+    Deliberately the exception TYPE, never str(e): an exception message can
+    carry a proxy URL with credentials in it, and this structure is what the
+    operator transmits.
+    """
+    if error is None:
+        return None
+    if isinstance(error, HTTPError):
+        try:
+            return 'HTTPError:%d' % int(error.code)
+        except Exception:
+            return 'HTTPError'
+    if isinstance(error, BaseException):
+        return type(error).__name__
+    return str(error)[:40]
+
+
+def _diag_fetch(name, status, started, error=None):
+    """Record the outcome of ONE fetcher call. MUST NOT RAISE.
+
+    Called from the fetcher thread only, at the points where the fetchers
+    already return or log. `started` is a time.monotonic() reading taken at
+    the top of the fetcher.
+
+    `status` is one of:
+      'ok'            — we now hold new bytes.
+      'not_modified'  — upstream confirmed (304) the copy we already hold.
+      'error'         — nothing usable came back.
+
+    The first two are both successes for boot timing: a 304 means the panel
+    has current data, which is the question first_ok_s is asked to answer.
+
+    For fetch_muf this records the HTTP exchange only, stamped BEFORE the
+    rasterize — the rasterize has its own three counters and its own wall
+    clock, and folding a 45 s render into 'last_ms' would hide the fetch.
+    """
+    try:
+        stat = _FETCH_STATS.get(name)
+        if stat is None:
+            return
+        stat['last_ms'] = int(max(0.0, time.monotonic() - started) * 1000)
+        stat['last_status'] = status
+        stat['last_at'] = time.time()
+        if status == 'error':
+            stat['errors'] += 1
+            stat['consecutive_failures'] += 1
+            stat['last_error'] = _diag_error_name(error)
+            return
+        stat['consecutive_failures'] = 0
+        stat['last_error'] = None
+        if status == 'not_modified':
+            stat['not_modified'] += 1
+        else:
+            stat['ok'] += 1
+        if _FIRST_OK_S.get(name) is None:
+            _FIRST_OK_S[name] = round(
+                max(0.0, time.monotonic() - _BOOT_MONOTONIC), 1)
+    except Exception:
+        # A diagnostics counter may never be the reason a fetch is lost.
+        pass
+
+
+def _note_muf_served(kind):
+    """Remember what /api/muf-map last wrote ('png' / 'svg' / 'none').
+
+    A module-level function so the handler branch stays free of a `global`
+    declaration; the cost on that path is one call and one store, on an
+    endpoint the client hits about once every 15 minutes.
+    """
+    global _MUF_LAST_SERVED
+    _MUF_LAST_SERVED = kind
+
+
+# ---------------------------------------------------------------------------
 # Tier 2.1 — disk persistence for the five image products
 #
 # CACHE is RAM-only, so every restart (and every power cut on a box with no
@@ -490,7 +656,7 @@ def _load_persisted():
     tell the operator how old the picture is, and stamping now() would make a
     week-old map claim to be seconds fresh.
     """
-    global _MUF_PNG_SOURCE
+    global _MUF_PNG_SOURCE, _DISK_RESTORED, _BOOT_DISK_WARM
     loaded = []
     try:
         entries = _read_manifest().get('entries') or {}
@@ -541,6 +707,11 @@ def _load_persisted():
                   f'cached image(s) from {CACHE_DIR}: {", ".join(loaded)}')
     except Exception as e:
         print(f'[{time.strftime("%H:%M:%S")}] cache restore failed: {e}')
+    # Rebound (not mutated) so the diagnostics handler can never see this
+    # half-built, and stamped even on the failure path so a restore that blew
+    # up reports an honest "cold".
+    _DISK_RESTORED = tuple(loaded)
+    _BOOT_DISK_WARM = bool(loaded)
     return loaded
 
 
@@ -862,6 +1033,8 @@ def _muf_timeout():
 
 def _rasterize_once(payload, timeout_s):
     """One cpulimit+cairosvg subprocess round trip. None on any failure."""
+    global _MUF_RASTERIZE_OK, _MUF_RASTERIZE_TIMEOUT, _MUF_RASTERIZE_FAIL
+    global _MUF_LAST_TIMEOUT_BUDGET_S
     argv = ['cpulimit', '-l', '50', '-q', '--',
             'python3', '-c',
             'import sys, cairosvg; cairosvg.svg2png('
@@ -887,9 +1060,23 @@ def _rasterize_once(payload, timeout_s):
             raise
         if p.returncode:
             raise subprocess.CalledProcessError(p.returncode, argv, output=out)
+        # A zero exit with an empty stdout is still a failed render as far as
+        # every caller is concerned (`if out:`), so count it as one.
+        if out:
+            _MUF_RASTERIZE_OK += 1
+        else:
+            _MUF_RASTERIZE_FAIL += 1
         return out
     # FileNotFoundError (cpulimit not installed) is an OSError subclass.
     except (subprocess.SubprocessError, OSError) as e:
+        # The log line below says "rasterize failed" for a 45 s timeout and
+        # for a missing cpulimit alike. Splitting the two counters is what
+        # tells the maintainer which one the Pi is actually hitting.
+        if isinstance(e, subprocess.TimeoutExpired):
+            _MUF_RASTERIZE_TIMEOUT += 1
+            _MUF_LAST_TIMEOUT_BUDGET_S = timeout_s
+        else:
+            _MUF_RASTERIZE_FAIL += 1
         print('[muf] rasterize failed: %s' % e, file=sys.stderr)
         return None
     finally:
@@ -927,9 +1114,24 @@ def _rasterize_muf(svg_bytes):
     Returns the PNG bytes, or None on subprocess error / timeout /
     missing cpulimit / cairosvg ImportError inside the child.
     """
+    global _MUF_LAST_RENDER_S, _MUF_LAST_SVG_BYTES, _MUF_LAST_SLIM_BYTES
+    global _MUF_LAST_PNG_BYTES, _MUF_SLIM_OK, _MUF_SLIM_DECLINED
+    global _MUF_UNSLIMMED_RETRIES
+
     timeout_s = _muf_timeout()
     slimmed = _slim_muf_svg(svg_bytes)
     payload = slimmed if slimmed else svg_bytes
+
+    # Slimmed vs original is the lever on render cost (257 <use> -> 114,
+    # 1157 ms -> 561 ms on x86). If a future upstream re-render makes
+    # _slim_muf_svg decline, slim_bytes goes null and the render doubles —
+    # this is where that shows up.
+    _MUF_LAST_SVG_BYTES = len(svg_bytes) if svg_bytes else 0
+    _MUF_LAST_SLIM_BYTES = len(slimmed) if slimmed else None
+    if slimmed:
+        _MUF_SLIM_OK += 1
+    else:
+        _MUF_SLIM_DECLINED += 1
 
     started = time.monotonic()
     out = _rasterize_once(payload, timeout_s)
@@ -937,6 +1139,8 @@ def _rasterize_muf(svg_bytes):
 
     if out:
         _record_muf_render(elapsed)
+        _MUF_LAST_RENDER_S = round(elapsed, 3)
+        _MUF_LAST_PNG_BYTES = len(out)
         return out
 
     # Tier 2.3 safety net: if the SLIMMED payload failed quickly, that is a
@@ -949,10 +1153,14 @@ def _rasterize_muf(svg_bytes):
     if slimmed and elapsed < timeout_s * 0.5:
         print('[muf] slimmed SVG did not render in %.1fs; retrying unslimmed'
               % elapsed, file=sys.stderr)
+        _MUF_UNSLIMMED_RETRIES += 1
         started = time.monotonic()
         out = _rasterize_once(svg_bytes, timeout_s)
         if out:
-            _record_muf_render(time.monotonic() - started)
+            retry_elapsed = time.monotonic() - started
+            _record_muf_render(retry_elapsed)
+            _MUF_LAST_RENDER_S = round(retry_elapsed, 3)
+            _MUF_LAST_PNG_BYTES = len(out)
             return out
     return None
 
@@ -1024,6 +1232,7 @@ def lookup_callsign(call):
 
 def fetch_hamqsl():
     """Fetch solar and band data from HamQSL XML"""
+    started = time.monotonic()
     try:
         req = Request('https://www.hamqsl.com/solarxml.php', headers={'User-Agent': UA})
         # Tier 1b perf: 8 s is well above HamQSL's median response (~1 s);
@@ -1034,6 +1243,7 @@ def fetch_hamqsl():
         root = ElementTree.fromstring(xml_data)
         sd = root.find('.//solardata')
         if sd is None:
+            _diag_fetch('hamqsl', 'error', started, 'no_solardata')
             return
 
         def gt(tag, default=''):
@@ -1083,8 +1293,10 @@ def fetch_hamqsl():
         stamp = time.time()
         CACHE['solar_updated'] = stamp
         CACHE['bands_updated'] = stamp
+        _diag_fetch('hamqsl', 'ok', started)
         print(f'[{time.strftime("%H:%M:%S")}] Solar/bands updated: SFI={solar["sfi"]} Kp={solar["kIndex"]}')
     except Exception as e:
+        _diag_fetch('hamqsl', 'error', started, e)
         print(f'[{time.strftime("%H:%M:%S")}] HamQSL fetch failed: {e}')
 
 
@@ -1128,6 +1340,11 @@ def fetch_dx():
         'https://www.hamqth.com/dxc_csv.php?limit=15',
         'https://www.ha8tks.hu/dx/dxc_csv.php?limit=15',
     ]
+    # One diagnostics record per CALL, not per URL: recording inside the loop
+    # would count a primary failure that the fallback rescued as a fetch
+    # failure, and inflate consecutive_failures by 2 per cycle when both fail.
+    started = time.monotonic()
+    last_error = None
     for url in urls:
         try:
             req = Request(url, headers={'User-Agent': UA})
@@ -1173,10 +1390,13 @@ def fetch_dx():
                 # is the ETag and a request racing between the two would be
                 # 304'd against a body it never received.
                 CACHE['dx_updated'] = time.time()
+                _diag_fetch('dx', 'ok', started)
                 print(f'[{time.strftime("%H:%M:%S")}] DX spots updated: {len(spots)} spots from {url.split("/")[2]}')
                 return
         except Exception as e:
+            last_error = e
             print(f'[{time.strftime("%H:%M:%S")}] DX fetch failed ({url.split("/")[2]}): {e}')
+    _diag_fetch('dx', 'error', started, last_error)
     print(f'[{time.strftime("%H:%M:%S")}] All DX sources failed')
 
 
@@ -1200,6 +1420,10 @@ def fetch_muf():
     the wire with gzip, 0 B on a 304).
     """
     global _MUF_PNG_SOURCE
+    # Stamped before the rasterize on every path below, so fetch.muf.last_ms
+    # is the HTTP exchange only. The render has its own wall clock
+    # (muf.last_render_s) and its own three outcome counters.
+    started = time.monotonic()
     try:
         data, not_modified = _conditional_get(MUF_URL, timeout=20)
         if not_modified:
@@ -1209,18 +1433,25 @@ def fetch_muf():
             # strand /api/muf-map on 503 permanently, because the only code
             # path that renders is the one that just returned early.
             if CACHE.get('muf_image_png'):
+                _diag_fetch('muf', 'not_modified', started)
                 print(f'[{time.strftime("%H:%M:%S")}] MUF map unchanged (304)')
                 return
             data = CACHE.get('muf_image')
             if not data:
+                # A validator with nothing behind it: the map is missing and
+                # upstream will keep telling us it has not changed. Counted as
+                # an error, not a 304, because no data reached the panel.
+                _diag_fetch('muf', 'error', started, '304_no_body')
                 print(f'[{time.strftime("%H:%M:%S")}] MUF map unchanged (304), '
                       f'nothing cached to rasterize')
                 return
+            _diag_fetch('muf', 'not_modified', started)
             print(f'[{time.strftime("%H:%M:%S")}] MUF map unchanged (304), '
                   f're-rasterizing the cached SVG')
         else:
             CACHE['muf_image'] = data
             CACHE['muf_image_updated'] = time.time()
+            _diag_fetch('muf', 'ok', started)
         # The PNG inherits the SVG's epoch, not now(): re-rendering a
         # six-hour-old SVG must not make the map claim to be fresh, or the
         # /api/health age label (and MUF_STALE_MAX_S) start lying.
@@ -1247,6 +1478,7 @@ def fetch_muf():
                 print(f'[{time.strftime("%H:%M:%S")}] MUF map updated '
                       f'({len(data)} B SVG, PNG rasterize failed)')
     except Exception as e:
+        _diag_fetch('muf', 'error', started, e)
         print(f'[{time.strftime("%H:%M:%S")}] MUF map fetch failed: {e}')
 
 
@@ -1274,6 +1506,9 @@ def fetch_enlil():
         'https://services.swpc.noaa.gov/images/animations/enlil/latest.jpg',
         'https://services.swpc.noaa.gov/products/animations/enlil.json',
     ]
+    # One record per call — see the note in fetch_dx.
+    started = time.monotonic()
+    last_error = None
     for url in urls:
         try:
             data, not_modified = _conditional_get(url, timeout=20)
@@ -1281,6 +1516,7 @@ def fetch_enlil():
                 if _note_unchanged('Enlil', 'enlil_image', url):
                     # return, not continue: falling through would re-download
                     # the same product from the fallback URL every cycle.
+                    _diag_fetch('enlil', 'not_modified', started)
                     return
                 continue
             if url.endswith('.json'):
@@ -1302,10 +1538,13 @@ def fetch_enlil():
             CACHE['enlil_image'] = data
             CACHE['enlil_image_updated'] = time.time()
             _persist('enlil_image')
+            _diag_fetch('enlil', 'ok', started)
             print(f'[{time.strftime("%H:%M:%S")}] Enlil updated ({len(data)} bytes)')
             return
         except Exception as e:
+            last_error = e
             print(f'[{time.strftime("%H:%M:%S")}] Enlil fetch failed ({url}): {e}')
+    _diag_fetch('enlil', 'error', started, last_error)
 
 
 def fetch_drap():
@@ -1314,11 +1553,15 @@ def fetch_drap():
         'https://services.swpc.noaa.gov/images/aurora-forecast-northern-hemisphere.jpg',
         'https://services.swpc.noaa.gov/images/swx-overview-large.gif',
     ]
+    # One record per call — see the note in fetch_dx.
+    started = time.monotonic()
+    last_error = None
     for url in urls:
         try:
             data, not_modified = _conditional_get(url, timeout=20)
             if not_modified:
                 if _note_unchanged('Aurora', 'drap_image', url):
+                    _diag_fetch('drap', 'not_modified', started)
                     return
                 continue
             if not data:
@@ -1326,13 +1569,16 @@ def fetch_drap():
             CACHE['drap_image'] = data
             CACHE['drap_image_updated'] = time.time()
             _persist('drap_image')
+            _diag_fetch('drap', 'ok', started)
             # 'Aurora', not 'DRAP': fetch_real_drap logs the D-RAP global map.
             # Two identical "DRAP updated" lines made the journal useless for
             # telling which of the two products actually landed.
             print(f'[{time.strftime("%H:%M:%S")}] Aurora updated ({len(data)} bytes)')
             return
         except Exception as e:
+            last_error = e
             print(f'[{time.strftime("%H:%M:%S")}] Aurora fetch failed ({url}): {e}')
+    _diag_fetch('drap', 'error', started, last_error)
 
 
 def fetch_real_drap():
@@ -1341,11 +1587,15 @@ def fetch_real_drap():
         'https://services.swpc.noaa.gov/images/animations/d-rap/global/latest.png',
         'https://services.swpc.noaa.gov/images/d-rap/global_f10.png',
     ]
+    # One record per call — see the note in fetch_dx.
+    started = time.monotonic()
+    last_error = None
     for url in urls:
         try:
             data, not_modified = _conditional_get(url, timeout=20)
             if not_modified:
                 if _note_unchanged('DRAP', 'real_drap_image', url):
+                    _diag_fetch('real_drap', 'not_modified', started)
                     return
                 continue
             if not data:
@@ -1353,10 +1603,13 @@ def fetch_real_drap():
             CACHE['real_drap_image'] = data
             CACHE['real_drap_image_updated'] = time.time()
             _persist('real_drap_image')
+            _diag_fetch('real_drap', 'ok', started)
             print(f'[{time.strftime("%H:%M:%S")}] DRAP updated ({len(data)} bytes)')
             return
         except Exception as e:
+            last_error = e
             print(f'[{time.strftime("%H:%M:%S")}] DRAP fetch failed ({url}): {e}')
+    _diag_fetch('real_drap', 'error', started, last_error)
 
 
 def fetch_sdo():
@@ -1372,18 +1625,26 @@ def fetch_sdo():
     Assigns on success only: writing None over a good image would blank the
     SDO panel on a single transient upstream failure.
     """
+    started = time.monotonic()
     try:
         data, not_modified = _conditional_get(SDO_URL, timeout=20)
         if not_modified:
-            _note_unchanged('SDO', 'solar_image', SDO_URL)
+            # False => a validator with no body behind it (the slot was
+            # cleared after the validator was recorded). SDO has no fallback
+            # URL to fall through to, so that is a miss, not a hit.
+            held = _note_unchanged('SDO', 'solar_image', SDO_URL)
+            _diag_fetch('sdo', 'not_modified' if held else 'error', started,
+                        '304_no_body')
             return
         if not data:
             raise ValueError('empty body')
         CACHE['solar_image'] = data
         CACHE['solar_image_updated'] = time.time()
         _persist('solar_image')
+        _diag_fetch('sdo', 'ok', started)
         print(f'[{time.strftime("%H:%M:%S")}] SDO updated ({len(data)} bytes)')
     except Exception as e:
+        _diag_fetch('sdo', 'error', started, e)
         print(f'[{time.strftime("%H:%M:%S")}] SDO image fetch failed: {e}')
 
 
@@ -1629,6 +1890,174 @@ def _age_of(stamp_key, now):
     return max(0, int(now - stamp))
 
 
+# ---------------------------------------------------------------------------
+# GET /api/diagnostics — the read side of the counters above
+#
+# Read-only, and it must NEVER block: no upstream fetch, no subprocess, no
+# import of cairosvg. (Doing upstream I/O on a handler thread is the mistake
+# that was just removed from /api/solar-image; it burned the native client's
+# entire serial image budget on one 20 s stall.) Everything here is either a
+# counter we already keep or a single small /proc read.
+#
+# The client embeds this body verbatim under "server" in the diagnostics
+# payload, and that payload is only ever transmitted by an explicit operator
+# press. Nothing in this structure is a credential, a network name, or file
+# content from outside this project: failures are recorded as exception TYPE
+# names (see _diag_error_name), and no URL, hostname or path is echoed.
+# ---------------------------------------------------------------------------
+
+_DEPS_SNAPSHOT = None
+
+
+def _deps_snapshot():
+    """cairosvg + cpulimit availability. Computed once, then memoised.
+
+    Deliberately does NOT import cairosvg. The rasterize runs in a subprocess
+    precisely because that import costs ~48 MB RSS on a 512 MB box, and a
+    diagnostics request must never make the long-lived server pay it.
+    importlib.util.find_spec and importlib.metadata answer both questions from
+    the filesystem without executing the package.
+
+    Memoised because the answer cannot change without a restart (installing
+    cairosvg under a running server does not make the render work — the child
+    process is what imports it), and because find_spec walks sys.path.
+    """
+    global _DEPS_SNAPSHOT
+    if _DEPS_SNAPSHOT is not None:
+        return _DEPS_SNAPSHOT
+    info = {'cairosvg': False, 'cairosvg_version': None, 'cpulimit': False}
+    try:
+        import importlib.util
+        info['cairosvg'] = importlib.util.find_spec('cairosvg') is not None
+    except Exception:
+        # ModuleNotFoundError/ValueError from a broken sys.path entry.
+        info['cairosvg'] = False
+    if info['cairosvg']:
+        try:
+            from importlib.metadata import version
+            info['cairosvg_version'] = version('cairosvg')
+        except Exception:
+            info['cairosvg_version'] = None
+    try:
+        import shutil
+        # The bool only. The resolved path would leak the account name if
+        # cpulimit ever came off a PATH entry under /home.
+        info['cpulimit'] = shutil.which('cpulimit') is not None
+    except Exception:
+        pass
+    _DEPS_SNAPSHOT = info
+    return info
+
+
+def _proc_self_status():
+    """(VmRSS kB, thread count) from /proc/self/status.
+
+    Either value is None when the field is missing or the file cannot be
+    read — a non-Linux dev box, or a container with a hidden /proc. Guarded
+    because an endpoint that can 500 is worse than one that reports null.
+    """
+    rss = None
+    threads = None
+    try:
+        with open('/proc/self/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    rss = int(line.split()[1])
+                elif line.startswith('Threads:'):
+                    threads = int(line.split()[1])
+                if rss is not None and threads is not None:
+                    break
+    except Exception:
+        pass
+    return rss, threads
+
+
+def _diagnostics_snapshot():
+    """Build the /api/diagnostics body. Pure reads; never raises."""
+    now = time.time()
+    png = CACHE.get('muf_image_png')
+    svg = CACHE.get('muf_image')
+    ewma = _muf_render_ewma
+
+    # dict(stat) copies a fixed-key dict the fetcher thread may be writing
+    # values into. Safe: values change, the key set never does, so no resize
+    # can happen mid-copy.
+    fetch = {}
+    for name in _FETCH_NAMES:
+        fetch[name] = dict(_FETCH_STATS[name])
+
+    cache = {}
+    for product, payload_key, stamp_key in _DIAG_PRODUCTS:
+        body = CACHE.get(payload_key)
+        cache[payload_key] = {
+            'bytes': len(body) if body else 0,
+            'age_s': _age_of(stamp_key, now),
+            'from_disk': payload_key in _DISK_RESTORED,
+            # 304 vs full is the field measurement of Tier 2.2's conditional
+            # GET: on a working install the 304 count should dominate.
+            'http_304': fetch[product]['not_modified'],
+            'http_full': fetch[product]['ok'],
+        }
+
+    rss_kb, threads = _proc_self_status()
+
+    return {
+        'schema': 1,
+        'now': now,
+        'muf': {
+            # Seconds of the last SUCCESSFUL rasterize, the smoothed cost the
+            # adaptive budget is derived from, and the budget itself. If
+            # timeout_s is pinned at timeout_floor_s while rasterize_timeout
+            # climbs, PHASE2_TIMEOUT_S is too low for this hardware — the
+            # EWMA only learns from renders that finish.
+            'last_render_s': _MUF_LAST_RENDER_S,
+            'render_ewma_s': round(ewma, 3) if ewma else None,
+            'timeout_s': _muf_timeout(),
+            'timeout_floor_s': PHASE2_TIMEOUT_S,
+            'timeout_max_s': PHASE2_TIMEOUT_MAX_S,
+            'timeout_factor': MUF_TIMEOUT_FACTOR,
+            'last_timeout_budget_s': _MUF_LAST_TIMEOUT_BUDGET_S,
+            'rasterize_ok': _MUF_RASTERIZE_OK,
+            'rasterize_timeout': _MUF_RASTERIZE_TIMEOUT,
+            'rasterize_fail': _MUF_RASTERIZE_FAIL,
+            'slim_ok': _MUF_SLIM_OK,
+            'slim_declined': _MUF_SLIM_DECLINED,
+            'unslimmed_retries': _MUF_UNSLIMMED_RETRIES,
+            'svg_bytes': _MUF_LAST_SVG_BYTES,
+            'slim_bytes': _MUF_LAST_SLIM_BYTES,
+            'png_bytes': _MUF_LAST_PNG_BYTES,
+            # Where the PNG we hold came from vs what the endpoint last
+            # served. 'disk' + 'png' means the map on screen is a restored
+            # one, which is also what /api/health labels it.
+            'png_source': _MUF_PNG_SOURCE if png else 'none',
+            'last_served': _MUF_LAST_SERVED,
+            'svg_cached_bytes': len(svg) if svg else 0,
+            'svg_age_s': _age_of('muf_image_updated', now),
+            'png_cached_bytes': len(png) if png else 0,
+            'png_age_s': _age_of('muf_image_png_updated', now),
+            'stale_max_s': MUF_STALE_MAX_S,
+        },
+        'deps': _deps_snapshot(),
+        'cache': cache,
+        'fetch': fetch,
+        'boot': {
+            'started_at': _BOOT_EPOCH,
+            'uptime_s': int(max(0.0, time.monotonic() - _BOOT_MONOTONIC)),
+            'disk_warm': _BOOT_DISK_WARM,
+            'restored': list(_DISK_RESTORED),
+            # Seconds from process start to the first fetch that produced
+            # usable data (a 304 counts — it means the panel has current
+            # data). null = it has never succeeded.
+            'first_ok_s': dict(_FIRST_OK_S),
+        },
+        'process': {
+            'rss_kb': rss_kb,
+            'threads': threads,
+            'python': '%d.%d.%d' % sys.version_info[:3],
+        },
+    }
+
+
 class Handler(SimpleHTTPRequestHandler):
     # Socket timeout so a stalled client can't pin a thread (and its buffered
     # response) forever — unbounded stuck threads are a memory-pressure source.
@@ -1725,13 +2154,17 @@ class Handler(SimpleHTTPRequestHandler):
             if png:
                 body = png
                 ctype = 'image/png'
+                _note_muf_served('png')
             elif want_png:
+                _note_muf_served('none')
                 self.send_error(503, 'MUF PNG not yet rendered')
                 return
             elif svg:
                 body = svg
                 ctype = 'image/svg+xml'
+                _note_muf_served('svg')
             else:
+                _note_muf_served('none')
                 self.send_error(503, 'MUF map not yet loaded')
                 return
             self.send_response(200)
@@ -1790,6 +2223,13 @@ class Handler(SimpleHTTPRequestHandler):
                 'drap_age': _age_of('drap_image_updated', now),
                 'real_drap_age': _age_of('real_drap_image_updated', now),
             })
+        elif path == '/api/diagnostics':
+            # Opt-in diagnostics: a read-only snapshot of counters this
+            # process already keeps. No upstream I/O, no subprocess, no
+            # cairosvg import — see _diagnostics_snapshot. The client embeds
+            # this body under "server" and transmits it only when the operator
+            # presses the button.
+            self.send_json(_diagnostics_snapshot())
         else:
             if self.command == 'HEAD':
                 super().do_HEAD()
@@ -3078,7 +3518,9 @@ import io
 import json
 import os
 import sys
+import threading
 import time
+import urllib.error
 
 import pygame
 
@@ -3088,6 +3530,12 @@ import pwd
 import grp
 import re
 import tempfile
+
+# Re-exported so tests can monkeypatch hamclock_pygame._urlopen / _Request and
+# the diagnostics sender picks up the fake — same patch-site convention
+# hamclock_data uses. urllib.request is already resident (hamclock_data imports
+# it at module scope), so this costs no extra RAM on the Pi.
+from urllib.request import Request as _Request, urlopen as _urlopen
 
 # ---- Settings layer (Phase 4) ----
 SETTINGS_PATH = "/etc/hamclock-lite/settings.json"
@@ -3099,6 +3547,16 @@ DEFAULT_SETTINGS = {
     "theme": "kstate",
     "ntp": "",
 }
+
+# Opt-in diagnostics: the random per-Pi report id lives in the same
+# settings.json as the four keys above, but deliberately NOT in
+# DEFAULT_SETTINGS. There is no sensible default for it — a Pi that has never
+# opened the report dialog has no id at all — and load_settings() must keep
+# returning exactly the four keys above for a fresh install (an installed
+# base, the wizard, --setup-cli and the settings tests all round-trip that
+# exact shape). It is created on first use by _get_or_create_device_id() and
+# carried through load_settings/--setup-cli once it exists.
+DEVICE_ID_KEY = "device_id"
 
 
 def _resolve_service_ids():
@@ -3133,6 +3591,12 @@ def load_settings(path: str = SETTINGS_PATH) -> dict:
                 for k in DEFAULT_SETTINGS:
                     if k in data and isinstance(data[k], str):
                         merged[k] = data[k]
+                # Carry an already-assigned diagnostics report id through, so
+                # repeat reports from this Pi correlate across reboots. Absent
+                # (the common case) the key simply is not in the result.
+                did = data.get(DEVICE_ID_KEY)
+                if isinstance(did, str) and did:
+                    merged[DEVICE_ID_KEY] = did
             return merged
         except FileNotFoundError:
             return dict(DEFAULT_SETTINGS)
@@ -3231,6 +3695,180 @@ def validate_timezone(s: str) -> tuple:
     return (False, "unknown timezone (use IANA name like America/Chicago)")
 
 
+# ---- NTP server validation ----
+#
+# This mirrors valid_one()/valid_ntp_list() in
+# scripts/hamclock-apply-settings.sh, and must keep mirroring them: the shell
+# is what actually writes the root-owned timesyncd drop-in, so a value this
+# side accepts but the root side refuses becomes a setting that silently never
+# applies, with the operator's only clue an hour of wrong clock.
+#
+# THIS COPY IS NOT THE SECURITY BOUNDARY. settings.json is writable by the
+# unprivileged service user, so the root applier re-validates from scratch and
+# never trusts that the wizard checked. This exists purely to put the error
+# under the operator's cursor while they can still fix it.
+#
+# Deliberately NOT a DNS check. The box may be pointed at an internal time
+# server on a network that is not up yet, and a Pi 1 has no RTC, so at setup
+# time the clock is routinely wrong and the LAN routinely absent. Format is
+# the only thing that can honestly be decided here; reachability is the root
+# side's business, after saving.
+NTP_MAX_LEN = 512        # whole list; matches the shell's `[ ${#v} -le 512 ]`
+NTP_MAX_HOST_LEN = 253   # one element; matches the shell's `[ ${#s} -le 253 ]`
+
+# A hostname or an IPv4/IPv6 literal, and nothing else. No spaces, no '#', no
+# '=', no quotes, no shell metacharacters: this string is written into a
+# systemd config as root, so anything that could open a second directive is
+# refused outright.
+_NTP_HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.:-]*[A-Za-z0-9])?$")
+_NTP_DIGITS_DOTS_RE = re.compile(r"^[0-9.]+$")
+
+
+def _valid_ntp_host(s: str) -> bool:
+    """One element of an NTP= list. Parity with the shell's valid_one()."""
+    if not s or len(s) > NTP_MAX_HOST_LEN:
+        return False
+    if not _NTP_HOST_RE.match(s):
+        return False
+    if _NTP_DIGITS_DOTS_RE.match(s):
+        # A bare run of digits and dots that is not a valid dotted quad is a
+        # typo ('192.168.1'), not a hostname. Catching it here beats a
+        # silently broken time source.
+        octets = s.split(".")
+        if len(octets) != 4:
+            return False
+        for o in octets:
+            if not (1 <= len(o) <= 3) or int(o) > 255:
+                return False
+    return True
+
+
+def normalize_ntp(s) -> str:
+    """Collapse whitespace to single spaces; '' when there is nothing to set.
+
+    Applied before the value is written to settings.json so the root side
+    never sees the whitespace-only string, which its word-splitting loop reads
+    as an empty list but its `[ -z ]` guard does not."""
+    if not isinstance(s, str):
+        return ""
+    return " ".join(s.split())
+
+
+def validate_ntp_list(s) -> tuple:
+    """Strict parity with `hamclock-apply-settings.sh --validate`.
+
+    Empty is INVALID here, exactly as it is there. The wizard wants the
+    optional-field semantics instead — use validate_ntp() for that.
+    Returns (ok, error_msg)."""
+    if not isinstance(s, str) or not s.strip():
+        return (False, "NTP server required")
+    if len(s) > NTP_MAX_LEN:
+        return (False, "too long (max %d characters)" % NTP_MAX_LEN)
+    for one in s.split():
+        if not _valid_ntp_host(one):
+            return (False, "invalid server: %s" % one[:28])
+    return (True, "")
+
+
+def validate_ntp(s) -> tuple:
+    """Wizard-facing NTP validator. The field is OPTIONAL.
+
+    Empty means "use the distro's default time servers", which is a perfectly
+    good answer and the one most operators want. A non-empty value may be a
+    space-separated list — systemd's NTP= takes several, and that is how
+    fallbacks are specified. Returns (ok, error_msg)."""
+    if s is None:
+        return (True, "")
+    if not isinstance(s, str):
+        return (False, "invalid value")
+    if not s.strip():
+        return (True, "")
+    return validate_ntp_list(s)
+
+
+# ---- The unprivileged half of the privilege boundary ----
+#
+# THIS PROCESS RUNS AS AN UNPRIVILEGED SERVICE USER WITH NO SUDO AT ALL. The
+# only privileged thing it can cause to happen is the creation of an empty
+# flag file under /run/hamclock-lite. A root-owned systemd .path unit notices
+# that file and starts the matching root service, which then re-reads and
+# re-validates everything itself and decides what to do.
+#
+# So this side never downloads, never verifies, never installs and never
+# writes a root-owned path. It asks. What gets installed, and whether the
+# request is honoured at all, is not ours to say — which is the point: a
+# compromised dashboard can ask for an update it cannot choose the contents
+# of, and can suggest an NTP value that root will re-check character by
+# character before writing.
+RUN_DIR = "/run/hamclock-lite"
+UPDATE_REQUEST_NAME = "update.request"
+SETTINGS_REQUEST_NAME = "settings.request"
+UPDATE_STATUS_NAME = "update-status.json"
+
+# Read cap for the status file. It is ~150 bytes; anything vastly larger is
+# not a status file and is not worth parsing.
+UPDATE_STATUS_MAX_BYTES = 16 * 1024
+
+
+def _run_path(name, run_dir=None):
+    return os.path.join(RUN_DIR if run_dir is None else run_dir, name)
+
+
+def _touch_request(path):
+    """Create the empty request flag. Returns True/False; never raises.
+
+    Failure is ordinary, not exceptional: a dev box has no /run/hamclock-lite
+    at all. The caller tells the operator; nothing crashes the render loop
+    over it."""
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        # O_APPEND rather than truncate: the file's existence is the entire
+        # message, and PathExists= is what the unit watches.
+        fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
+        os.close(fd)
+        return True
+    except OSError as e:
+        print("[request] could not create %s: %s" % (path, e),
+              file=sys.stderr)
+        return False
+
+
+def request_settings_apply(run_dir=None):
+    """Ask root to apply the NTP server recorded in settings.json.
+
+    Root re-reads the file and re-validates the value; nothing about it is
+    passed through this call."""
+    return _touch_request(_run_path(SETTINGS_REQUEST_NAME, run_dir))
+
+
+def request_update(run_dir=None):
+    """Ask root to install the available update.
+
+    This is the whole of the client's involvement in updating. It does not
+    fetch the manifest, check the SHA-256, unpack, install or restart
+    anything — hamclock-update.sh does all of that as root and verifies the
+    download itself."""
+    return _touch_request(_run_path(UPDATE_REQUEST_NAME, run_dir))
+
+
+def read_update_status(run_dir=None):
+    """Parse /run/hamclock-lite/update-status.json, or return None.
+
+    A missing file is the NORMAL state — the check runs once a day and a Pi
+    that has not reached 07:00 yet has never written one. So this never logs
+    and never raises: no file, an unparseable file, a truncated file mid-write
+    and a file that is not a JSON object all read as "nothing to say"."""
+    try:
+        with open(_run_path(UPDATE_STATUS_NAME, run_dir), "r") as f:
+            raw = f.read(UPDATE_STATUS_MAX_BYTES)
+        d = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    return d
+
+
 class TextField:
     """Single-line text input widget for the setup wizard.
 
@@ -3323,14 +3961,23 @@ class TextField:
         pygame.draw.rect(surface, border, box_rect, 2)
         font = pygame.font.Font(None, 28)
         txt = font.render(self.text, True, theme["fg"])
-        surface.blit(txt, (box_rect.x + 8,
+        # A space-separated NTP list is the first value that can outrun the
+        # box, so scroll it horizontally to keep the caret in view and clip to
+        # the box instead of painting over the neighbouring row's label.
+        inner_w = max(1, box_rect.w - 16)
+        caret_w = font.size(self.text[:self.cursor])[0]
+        scroll = max(0, caret_w - inner_w)
+        prev_clip = surface.get_clip()
+        surface.set_clip(box_rect.clip(prev_clip) if prev_clip else box_rect)
+        surface.blit(txt, (box_rect.x + 8 - scroll,
                            box_rect.y + (box_rect.h - txt.get_height()) // 2))
         if focused:
             # Blinking caret driven by time; always drawn here for tests.
-            cx = box_rect.x + 8 + font.size(self.text[:self.cursor])[0]
+            cx = box_rect.x + 8 + caret_w - scroll
             cy = box_rect.y + 6
             pygame.draw.line(surface, theme["fg"],
                              (cx, cy), (cx, cy + box_rect.h - 12), 2)
+        surface.set_clip(prev_clip)
         if self.error:
             ef = pygame.font.Font(None, 20)
             er = ef.render(self.error, True, theme["poor"])
@@ -3388,13 +4035,29 @@ def _wait_for_ntp_sync(deadline_s: float = 10.0) -> bool:
     return False
 
 
-def setup_screen(screen, fonts, theme):
-    """Render the first-boot wizard. Block until Save, return settings dict.
+def setup_screen(screen, fonts, theme, initial=None, allow_cancel=False,
+                 wait_ntp=True):
+    """Render the setup wizard. Block until Save, return a settings dict.
 
     Reads events from pygame.event.get() unless HAMCLOCK_DEBUG=1 and
     HAMCLOCK_INJECT_EVENTS is set, in which case events are read from
-    the named JSON file and dispatched one per frame."""
+    the named JSON file and dispatched one per frame.
+
+    `initial`      pre-fills the fields from an existing settings dict. This
+                   is what makes the wizard re-openable from the dashboard
+                   ('S'): before it existed, the wizard ran only when
+                   settings.json was absent, so an operator could never change
+                   their NTP server or timezone from the device again.
+    `allow_cancel` ESC returns None ("leave everything as it was") instead of
+                   exiting the process. First boot leaves this False — there
+                   is nothing to fall back to and the kiosk wrapper should
+                   restart us — but killing a running dashboard because
+                   someone pressed S by accident would be absurd.
+    `wait_ntp`     block briefly for a clock sync before saving. Worth 10 s at
+                   first boot on a Pi with no RTC, pointless once the
+                   dashboard has been up and running."""
     sw, sh = screen.get_size()
+    init = initial if isinstance(initial, dict) else {}
 
     # Resolve fonts defensively: the kiosk passes {title, panel, small, ...}
     # but tests use {tiny, small, med, lg}. Fall back to any available font.
@@ -3407,6 +4070,15 @@ def setup_screen(screen, fonts, theme):
     title_font = _font("title", "lg", "med")
     panel_font = _font("panel", "med", "small")
     small_font = _font("small", "tiny")
+    if title_font.get_height() < 26:
+        # The kiosk's font set is sized for the 720x450 dashboard, where
+        # 'title' is 15 px — smaller than the 28 px face TextField draws its
+        # own labels in, so the heading would come out dwarfed by "Callsign".
+        # Built once here, outside the frame loop.
+        try:
+            title_font = pygame.font.Font(None, 34)
+        except Exception:
+            pass
 
     # Set key repeat once (skip on x11 where the WM already handles it).
     try:
@@ -3416,23 +4088,73 @@ def setup_screen(screen, fonts, theme):
         pass
     pygame.mouse.set_visible(False)
 
-    # Panel layout (centered 700x500 panel).
-    panel_w, panel_h = 700, 500
+    # Panel layout. Everything below is derived from the screen size: the
+    # kiosk renders at 720x450 (Tier 2a), where the old hard-coded 700x500
+    # panel with its Save button pinned at y=540 fell off the bottom of the
+    # display entirely — and a fourth row makes that worse, not better.
+    panel_w = min(700, max(240, sw - 20))
+    panel_h = min(500, max(180, sh - 20))
     px = (sw - panel_w) // 2
     py = (sh - panel_h) // 2
 
+    label_col = min(170, max(70, panel_w // 4))
+    field_x = px + label_col
+    field_w = max(80, panel_w - label_col - 16)
+
+    title_h = title_font.get_height()
+    hint_h = small_font.get_height()
+    content_top = py + 10 + title_h + 10
+    # Two short hint lines rather than one long one: at 720x450 a single line
+    # carrying both the key bindings and the "blank means distro default" note
+    # is wider than the display, and centring it would clip both ends.
+    hint2_y = py + panel_h - 6 - hint_h
+    hint1_y = hint2_y - hint_h - 2
+    save_h = min(44, max(24, panel_h // 12))
+    save_y = hint1_y - 8 - save_h
+    # 4 rows: callsign, timezone, ntp, theme.
+    row_pitch = max(26, (save_y - content_top) // 4)
+    # Leave room under each box for its inline error, which TextField draws at
+    # box bottom + 4 in an ~16 px face.
+    field_h = max(18, min(44, row_pitch - 18))
+
+    def _row(i):
+        return pygame.Rect(field_x, content_top + i * row_pitch,
+                           field_w, field_h)
+
     call_field = TextField(
-        pygame.Rect(px + 220, 280, 440, 44),
-        initial="", max_len=10,
+        _row(0),
+        initial=str(init.get("callsign") or ""), max_len=10,
         validator=lambda s: validate_callsign(s.upper()),
         label="Callsign")
     tz_field = TextField(
-        pygame.Rect(px + 220, 360, 440, 44),
-        initial="", max_len=64,
+        _row(1),
+        initial=str(init.get("timezone") or ""), max_len=64,
         validator=validate_timezone, label="Timezone")
-    theme_idx = 0
-    focus = 0  # 0=call, 1=tz, 2=theme, 3=save
-    fields = [call_field, tz_field]
+    # Optional. 128 is well past the two or three servers an operator
+    # realistically lists, and far short of the 512-char cap the root applier
+    # enforces, so the field can never produce a value the shell calls
+    # over-long.
+    ntp_field = TextField(
+        _row(2),
+        initial=normalize_ntp(init.get("ntp") or ""), max_len=128,
+        validator=validate_ntp, label="NTP server")
+    theme_row = _row(3)
+    try:
+        theme_idx = WIZARD_THEMES.index(init.get("theme"))
+    except ValueError:
+        theme_idx = 0
+    # The theme row is not a TextField but sits on the same grid, so it is
+    # lettered in the same face TextField.draw uses for its labels — built
+    # once here rather than per frame.
+    try:
+        form_font = pygame.font.Font(None, 28)
+    except Exception:
+        form_font = panel_font
+    focus = 0  # 0=call, 1=tz, 2=ntp, 3=theme, 4=save
+    fields = [call_field, tz_field, ntp_field]
+    n_focus = len(fields) + 2
+    save_focus = n_focus - 1
+    theme_focus = len(fields)
 
     # Inject-event source (debug only).
     inject_path = None
@@ -3465,82 +4187,99 @@ def setup_screen(screen, fonts, theme):
                 running = False
                 break
             if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                if allow_cancel:
+                    return None
                 sys.exit(1)
 
-            if focus == 0 or focus == 1:
+            if focus < len(fields):
                 res = fields[focus].handle_event(ev)
                 if res == "next":
-                    focus = (focus + 1) % 4
+                    focus = (focus + 1) % n_focus
                 elif res == "prev":
-                    focus = (focus - 1) % 4
+                    focus = (focus - 1) % n_focus
                 elif res == "submit":
-                    focus = 3  # jump to Save
+                    focus = save_focus
                 elif res == "cancel":
+                    if allow_cancel:
+                        return None
                     sys.exit(1)
-            elif focus == 2:  # theme cycler
+            elif focus == theme_focus:  # theme cycler
                 if ev.type == pygame.KEYDOWN:
                     if ev.key in (pygame.K_LEFT,):
                         theme_idx = (theme_idx - 1) % len(WIZARD_THEMES)
                     elif ev.key in (pygame.K_RIGHT,):
                         theme_idx = (theme_idx + 1) % len(WIZARD_THEMES)
                     elif ev.key in (pygame.K_TAB, pygame.K_DOWN, pygame.K_RETURN):
-                        focus = 3
+                        focus = save_focus
                     elif ev.key == pygame.K_UP:
-                        focus = 1
-            elif focus == 3:  # Save button
+                        focus = theme_focus - 1
+            elif focus == save_focus:  # Save button
                 if ev.type == pygame.KEYDOWN:
                     if ev.key in (pygame.K_TAB, pygame.K_DOWN):
                         focus = 0
                     elif ev.key == pygame.K_UP:
-                        focus = 2
+                        focus = theme_focus
                     elif ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
-                        # Re-validate both fields.
-                        ok1 = call_field._validate()
-                        ok2 = tz_field._validate()
-                        if ok1 and ok2:
-                            _wait_for_ntp_sync(deadline_s=10.0)
+                        # Re-validate every field.
+                        oks = [f._validate() for f in fields]
+                        if all(oks):
+                            if wait_ntp:
+                                _wait_for_ntp_sync(deadline_s=10.0)
                             result = {
                                 "callsign": call_field.text.upper(),
                                 "timezone": tz_field.text,
                                 "theme": WIZARD_THEMES[theme_idx],
-                                "ntp": "",
+                                # Normalised here so the root applier never
+                                # sees ragged whitespace — its own guard reads
+                                # a whitespace-only string as non-empty but
+                                # word-splits it to nothing.
+                                "ntp": normalize_ntp(ntp_field.text),
                             }
                             running = False
                         else:
-                            focus = 0 if not ok1 else 1
+                            focus = oks.index(False)
 
         # Draw.
         screen.fill(theme["bg"])
         pygame.draw.rect(screen, theme["card"],
                          pygame.Rect(px, py, panel_w, panel_h))
-        title = title_font.render("HAMCLOCK SETUP", True, theme["fg"])
-        screen.blit(title, (sw // 2 - title.get_width() // 2, 180))
+        heading = "HAMCLOCK SETTINGS" if initial is not None else "HAMCLOCK SETUP"
+        title = title_font.render(heading, True, theme["fg"])
+        screen.blit(title, (sw // 2 - title.get_width() // 2, py + 10))
 
-        call_field.draw(screen, theme, focused=(focus == 0))
-        tz_field.draw(screen, theme, focused=(focus == 1))
+        for i, fld in enumerate(fields):
+            fld.draw(screen, theme, focused=(focus == i))
 
-        # Theme cycler row.
-        tf_font = panel_font
-        lbl = tf_font.render("Theme", True, theme["label"])
-        screen.blit(lbl, (px + 220 - lbl.get_width() - 14, 440 + 10))
+        # Theme cycler row, on the same grid as the fields above it.
+        lbl = form_font.render("Theme", True, theme["label"])
+        screen.blit(lbl, (field_x - lbl.get_width() - 14,
+                          theme_row.y + (field_h - lbl.get_height()) // 2))
         cur = WIZARD_THEMES[theme_idx]
-        arrows = "< %s >" % cur if focus == 2 else "  %s  " % cur
-        col = theme["accent"] if focus == 2 else theme["fg"]
-        arr = tf_font.render(arrows, True, col)
-        screen.blit(arr, (sw // 2 - arr.get_width() // 2, 440 + 4))
+        arrows = "< %s >" % cur if focus == theme_focus else "  %s  " % cur
+        col = theme["accent"] if focus == theme_focus else theme["fg"]
+        arr = form_font.render(arrows, True, col)
+        screen.blit(arr, (field_x + 8,
+                          theme_row.y + (field_h - arr.get_height()) // 2))
 
         # Save button.
-        save_rect = pygame.Rect(sw // 2 - 80, 540, 160, 48)
-        save_col = theme["accent"] if focus == 3 else theme["muted"]
+        save_w = min(200, max(90, panel_w // 4))
+        save_rect = pygame.Rect(sw // 2 - save_w // 2, save_y, save_w, save_h)
+        save_col = theme["accent"] if focus == save_focus else theme["muted"]
         pygame.draw.rect(screen, theme["card"], save_rect)
         pygame.draw.rect(screen, save_col, save_rect, 3)
-        sv = tf_font.render("Save", True, theme["fg"])
+        sv = form_font.render("Save", True, theme["fg"])
         screen.blit(sv, (save_rect.centerx - sv.get_width() // 2,
                          save_rect.centery - sv.get_height() // 2))
 
-        hint = small_font.render(
-            "Tab to move, Enter to save", True, theme["muted"])
-        screen.blit(hint, (sw // 2 - hint.get_width() // 2, 620))
+        for _hy, _ht in (
+                (hint1_y, "NTP server is optional - leave it blank to use "
+                          "the distro defaults"),
+                (hint2_y, "Tab to move, Enter to save"
+                          + (", Esc to leave it as it was"
+                             if allow_cancel else ""))):
+            _hs = small_font.render(_fit_text(small_font, _ht, panel_w - 16),
+                                    True, theme["muted"])
+            screen.blit(_hs, (sw // 2 - _hs.get_width() // 2, _hy))
 
         pygame.display.flip()
         if injected_events is None:
@@ -3549,12 +4288,18 @@ def setup_screen(screen, fonts, theme):
             clock.tick(0)  # no throttle in tests
 
     if result is None:
-        # QUIT/timeout: return current values with kstate fallback.
+        if allow_cancel:
+            # Re-opened from a running dashboard: QUIT or the frame cap means
+            # "the operator walked away", and the settings they already have
+            # are a better answer than half-typed ones.
+            return None
+        # QUIT/timeout at first boot: return current values with fallbacks.
         result = {
             "callsign": call_field.text.upper(),
             "timezone": tz_field.text if validate_timezone(tz_field.text)[0] else "UTC",
             "theme": WIZARD_THEMES[theme_idx],
-            "ntp": "",
+            "ntp": (normalize_ntp(ntp_field.text)
+                    if validate_ntp(ntp_field.text)[0] else ""),
         }
     return result
 
@@ -4698,23 +5443,79 @@ def draw_open_bands(screen, rect, bands, fonts, theme, data_refresh_ts=None):
         _blit_fit(screen, f, c, theme['poor'], rect.x, rect.y + pitch, rect.w)
 
 
-def draw_status_bar(screen, rect, data, fonts, theme):
+def draw_status_bar(screen, rect, data, fonts, theme,
+                    notice=None, notice_color='accent', update_label=None):
     """Item 8: status bar text is pulled from _strfmt_cache so the format
-    string is built at most once per UTC second."""
+    string is built at most once per UTC second.
+
+    Returns {'send_report': Rect} — and, when `update_label` is given,
+    {'update': Rect} as well: the hit targets for the opt-in diagnostics
+    report and for installing an available update, registered the same way
+    draw_tabs registers the propagation tabs so the render loop's existing
+    MOUSEBUTTONDOWN sweep picks them up. The dict is empty when the bar is too
+    narrow to hold the chips; the 'T' and 'U' key bindings are what make the
+    features reachable at all, because a Pi 1 kiosk is routinely run with no
+    mouse attached.
+
+    `update_label` is None whenever there is no update to offer, which is
+    almost always — the chip appears only while the root updater's status file
+    says state=available.
+
+    `notice` replaces the left-hand status string while a report is in
+    flight or has just finished. It displaces the least important text on the
+    display for ten seconds, which is the correct trade for telling the
+    operator whether their report actually went."""
     pygame.draw.rect(screen, theme['card'], rect)
     pygame.draw.rect(screen, theme['border'], rect, 1)
-    text = _formatted_strings(data)["status"]
     f = fonts['small']
+    regions = {}
     # Tier 1.1: the quit hint was pinned 110 px from the right edge, which is
     # a different fraction of a 720 px bar than of a 1440 px one; place it by
     # its measured width and give the status string the rest.
     hint = 'ESC/Q to quit'
     hint_x = max(rect.x, rect.right - 6 - f.size(hint)[0])
     ty = rect.y + max(0, min(4, rect.h - f.get_height()))
-    _blit_fit(screen, f, text, theme['label'], rect.x + 6, ty,
-              hint_x - rect.x - 12)
+
+    btn_label = 'REPORT [T]'
+    btn_w = f.size(btn_label)[0] + 10
+    btn_x = hint_x - 8 - btn_w
+    text_right = hint_x
+    if btn_x >= rect.x + 48 and rect.h >= f.get_height() + 2:
+        btn = pygame.Rect(btn_x, rect.y + 1, btn_w, rect.h - 2)
+        pygame.draw.rect(screen, theme['border'], btn)
+        pygame.draw.rect(screen, theme['accent'], btn, 1)
+        _blit_fit(screen, f, btn_label, theme['accent'],
+                  btn.x + 5, ty, btn.w - 10)
+        regions['send_report'] = btn
+        text_right = btn.x
+
+    # The update chip sits immediately left of SEND REPORT and is drawn
+    # filled, not outlined: it is the one control on this bar that is offering
+    # to change the machine, and it is only ever present when there is
+    # genuinely something to install.
+    if update_label:
+        uw = f.size(update_label)[0] + 10
+        ux = text_right - 8 - uw
+        if ux >= rect.x + 48 and rect.h >= f.get_height() + 2:
+            ubtn = pygame.Rect(ux, rect.y + 1, uw, rect.h - 2)
+            pygame.draw.rect(screen, theme['accent'], ubtn)
+            pygame.draw.rect(screen, theme['bright'], ubtn, 1)
+            _blit_fit(screen, f, update_label, theme['card'],
+                      ubtn.x + 5, ty, ubtn.w - 10)
+            regions['update'] = ubtn
+            text_right = ubtn.x
+
+    if notice:
+        text = notice
+        color = theme.get(notice_color, theme['accent'])
+    else:
+        text = _formatted_strings(data)["status"]
+        color = theme['label']
+    _blit_fit(screen, f, text, color, rect.x + 6, ty,
+              text_right - rect.x - 12)
     _blit_fit(screen, f, hint, theme['label'], hint_x, ty,
               rect.right - hint_x)
+    return regions
 
 
 # Tier 1.2: keys whose payload failed to decode, stamped with the fetch ts
@@ -4964,6 +5765,1245 @@ def _compute_dirty_rects(state, panel_rects, active_tab,
     return dirty
 
 
+# ==========================================================================
+# Opt-in diagnostics report
+# ==========================================================================
+# The maintainer has no ARMv6 hardware, so every Pi wall-clock figure in this
+# project is extrapolated from x86 and unverified. This lets an operator who
+# WANTS to help answer that with one keypress.
+#
+# Three rules govern everything below, and they are not negotiable:
+#
+#   1. Nothing is ever sent unless the operator presses the button/key AND
+#      then confirms. Every single time. There is no boot-time send, no timer,
+#      no retry-on-failure (a retry loop is an unattended resend), and no code
+#      path from module import to a POST that does not pass through
+#      _report_confirm().
+#   2. The confirm dialog says, in plain language, exactly what leaves the
+#      device — including that the attached screenshot has the operator's
+#      callsign in the header, so a report with a screenshot is NOT anonymous.
+#      We say that rather than let someone assume otherwise.
+#   3. Nothing outside this project's own diagnostics is collected. No file
+#      contents, no credentials, no WiFi config. The one block we do not
+#      author ourselves — the local server's /api/diagnostics body — is walked
+#      and any secret-shaped key is dropped before it can be sent.
+#
+# Stdlib only (urllib/json/base64/uuid): the Pi must not grow a pip dependency
+# for this.
+
+TELEMETRY_URL = 'https://hamclock-reborn.org/api/telemetry'
+TELEMETRY_SCHEMA = 1
+# One attempt, 15 s. Long enough for a slow rural uplink to finish a ~130 KB
+# POST, short enough that the operator gets an answer while still looking at
+# the screen.
+TELEMETRY_TIMEOUT_S = 15.0
+TELEMETRY_UA = 'hamclock-pi1-report/1 (+https://hamclock-reborn.org)'
+
+# The local server's diagnostics endpoint, embedded verbatim (after scrubbing)
+# under payload['server']. Path only — the host comes from the live
+# HamClockData instance so a non-default --server URL is honoured.
+SERVER_DIAG_PATH = '/api/diagnostics'
+SERVER_DIAG_TIMEOUT_S = 2.0
+SERVER_DIAG_MAX_BYTES = 64 * 1024
+
+# A 720x450 antialiased frame is ~73 KB of PNG -> ~98 KB of base64. The cap is
+# ~3.5x that, so a legitimate frame always fits and a pathological one (a
+# corrupted surface, a future 1440x900 native mode) is DROPPED rather than
+# truncated: half a PNG is not a smaller screenshot, it is a broken one.
+SCREENSHOT_MAX_B64 = 350 * 1024
+
+# How long the status bar keeps a report outcome on screen.
+REPORT_NOTICE_TTL_S = 10.0
+
+# Key names that may never appear in the payload. Applied to the one block we
+# do not author (the local server's /api/diagnostics body) and asserted
+# against the whole payload by the test suite.
+_SECRET_KEY_RE = re.compile(
+    r'pass|pwd|secret|token|api[-_]?key|apikey|credential|auth|cookie|'
+    r'session|ssid|psk|wpa|wifi|private|privkey|ssh|bearer|salt|signature',
+    re.I)
+
+_DEVICE_ID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+
+
+def _mono():
+    """Monotonic seconds, falling back to the wall clock.
+
+    Looked up with getattr rather than imported at module scope on purpose:
+    the render-loop tests replace hamclock_pygame.time with a stub exposing
+    only time/sleep/gmtime/strftime, and an AttributeError raised per frame
+    would land in the loop's consecutive_errors counter."""
+    fn = getattr(time, 'monotonic', None)
+    if fn is None:
+        return time.time()
+    return fn()
+
+
+# ---- frame-time ring buffer ----------------------------------------------
+# Fixed-size, index-advanced, never grows, never allocates a container. 600
+# slots is 60 s of history at 10 FPS — long enough that a report taken any
+# time after the first minute of uptime describes steady state, small enough
+# (~5 KB) to be free on a 512 MB box.
+_FRAME_MS_CAP = 600
+_frame_ms_ring = [0.0] * _FRAME_MS_CAP
+_frame_ms_pos = 0
+_frame_ms_n = 0
+# Samples above this are not frame times: they are an NTP step (the loop reads
+# the wall clock when monotonic is unavailable), a VT switch, or the process
+# being descheduled. Recording them would move p99 by an order of magnitude
+# and make the whole measurement worthless.
+_FRAME_MS_SANE_MAX = 10_000.0
+
+# Last observed draw cost per panel, in ms. Bounded by the _CADENCE_S key set.
+_panel_ms: dict = {}
+
+_first_paint_s = None
+
+
+def _record_frame_ms(t0):
+    """Record one frame's render cost, measured from `t0` (a _mono() stamp).
+
+    Called once per frame from the render loop: no allocation beyond the
+    float itself, no growth, no sort. Percentiles are computed only when a
+    report is actually built."""
+    global _frame_ms_pos, _frame_ms_n
+    ms = (_mono() - t0) * 1000.0
+    if ms < 0.0 or ms > _FRAME_MS_SANE_MAX:
+        return
+    _frame_ms_ring[_frame_ms_pos] = ms
+    _frame_ms_pos = (_frame_ms_pos + 1) % _FRAME_MS_CAP
+    if _frame_ms_n < _FRAME_MS_CAP:
+        _frame_ms_n += 1
+
+
+def _record_panel_ms(name, t0):
+    """Record the last draw cost of one panel. Same no-allocation contract."""
+    ms = (_mono() - t0) * 1000.0
+    if 0.0 <= ms <= _FRAME_MS_SANE_MAX:
+        _panel_ms[name] = ms
+
+
+def _percentile(vals, q):
+    """Nearest-rank percentile of an already-sorted list. None when empty."""
+    if not vals:
+        return None
+    idx = int(round((len(vals) - 1) * q))
+    if idx < 0:
+        idx = 0
+    elif idx >= len(vals):
+        idx = len(vals) - 1
+    return vals[idx]
+
+
+def _frame_ms_summary():
+    """{'p50','p90','p99','n'} over the ring. Values are ms, 1 decimal."""
+    n = _frame_ms_n
+    if n <= 0:
+        return {'p50': None, 'p90': None, 'p99': None, 'n': 0}
+    vals = sorted(_frame_ms_ring[:n])
+    return {
+        'p50': round(_percentile(vals, 0.50), 1),
+        'p90': round(_percentile(vals, 0.90), 1),
+        'p99': round(_percentile(vals, 0.99), 1),
+        'n': n,
+    }
+
+
+def _note_first_paint():
+    """Stamp boot-to-first-paint the first time the dashboard is presented."""
+    global _first_paint_s
+    if _first_paint_s is not None:
+        return
+    age = _process_age_s()
+    _first_paint_s = age if age is not None else 0.0
+
+
+def _process_age_s():
+    """Seconds since THIS process started, from /proc.
+
+    Measured against process start rather than module import so the figure
+    includes interpreter startup and the pygame import — on an ARMv6 Pi 1 that
+    is a large and entirely unmeasured slice of boot-to-first-paint. None when
+    /proc is unavailable or unparseable."""
+    stat = _read_text('/proc/self/stat', 4096)
+    up = _read_text('/proc/uptime', 256)
+    if not stat or not up:
+        return None
+    try:
+        # comm (field 2) is parenthesised and may itself contain spaces.
+        tail = stat.rsplit(')', 1)[1].split()
+        start_ticks = float(tail[19])          # field 22 overall
+        hz = float(os.sysconf('SC_CLK_TCK'))
+        uptime = float(up.split()[0])
+        age = uptime - (start_ticks / hz)
+    except Exception:
+        return None
+    if age < 0.0 or age > 10.0 * 365 * 24 * 3600:
+        return None
+    return round(age, 2)
+
+
+# ---- collection ----------------------------------------------------------
+
+def _read_text(path, limit=65536):
+    """Read a small text file. Returns None on ANY failure.
+
+    Every /proc and /etc read in the collector goes through here so that a
+    missing, unreadable, or exploding file yields null for that one field
+    instead of aborting the whole report."""
+    try:
+        with open(path, 'r', errors='replace') as f:
+            return f.read(limit)
+    except Exception:
+        return None
+
+
+def _cpuinfo_fields():
+    """{Model, Hardware, Revision, model name, Processor} from /proc/cpuinfo.
+
+    Raspberry Pi OS reports the board as 'Model' and the SoC as 'Hardware' +
+    'Revision'; desktop x86 kernels report neither and use 'model name'."""
+    out = {}
+    txt = _read_text('/proc/cpuinfo')
+    if not txt:
+        return out
+    for line in txt.splitlines():
+        if ':' not in line:
+            continue
+        k, _, v = line.partition(':')
+        k = k.strip()
+        v = v.strip()
+        if k in ('Model', 'Hardware', 'Revision', 'model name', 'Processor'):
+            # Keep the FIRST occurrence: on a multi-core box every core
+            # repeats 'model name', and they are identical.
+            out.setdefault(k, v)
+    return out
+
+
+def _meminfo_total_kb():
+    txt = _read_text('/proc/meminfo', 8192)
+    if not txt:
+        return None
+    for line in txt.splitlines():
+        if line.startswith('MemTotal:'):
+            try:
+                return int(line.split()[1])
+            except Exception:
+                return None
+    return None
+
+
+def _uptime_s():
+    txt = _read_text('/proc/uptime', 256)
+    if not txt:
+        return None
+    try:
+        return int(float(txt.split()[0]))
+    except Exception:
+        return None
+
+
+def _os_pretty_name():
+    txt = _read_text('/etc/os-release', 8192)
+    if not txt:
+        return None
+    for line in txt.splitlines():
+        if line.startswith('PRETTY_NAME='):
+            return line.split('=', 1)[1].strip().strip('"') or None
+    return None
+
+
+def _uname():
+    """os.uname() when available, else platform.uname(). None on failure.
+
+    platform is imported lazily because it drags subprocess in with it, and
+    this client boots on a 512 MB single-core box."""
+    fn = getattr(os, 'uname', None)
+    if fn is not None:
+        try:
+            return fn()
+        except Exception:
+            pass
+    try:
+        import platform
+        return platform.uname()
+    except Exception:
+        return None
+
+
+def _collect_host():
+    """host block. Every field individually guarded -> null, never an except."""
+    cpu = _cpuinfo_fields()
+    un = _uname()
+
+    model = cpu.get('Model')
+    if not model:
+        # /proc/device-tree/model is NUL-terminated.
+        dt = _read_text('/proc/device-tree/model', 512)
+        model = dt.strip('\x00 \n') if dt else None
+    if not model and un is not None:
+        model = getattr(un, 'machine', None)
+
+    cpu_name = cpu.get('model name') or cpu.get('Processor') or (
+        getattr(un, 'machine', None) if un is not None else None)
+    hw = cpu.get('Hardware')
+    rev = cpu.get('Revision')
+    if cpu_name and (hw or rev):
+        cpu_name = '%s [%s%s]' % (
+            cpu_name, hw or '?', (' rev ' + rev) if rev else '')
+    elif hw:
+        cpu_name = '%s%s' % (hw, (' rev ' + rev) if rev else '')
+
+    try:
+        cores = os.cpu_count()
+    except Exception:
+        cores = None
+
+    return {
+        'model': model or None,
+        'cpu': cpu_name or None,
+        'cores': cores,
+        'mem_total_kb': _meminfo_total_kb(),
+        'kernel': (getattr(un, 'release', None) if un is not None else None),
+        'os': _os_pretty_name() or (
+            getattr(un, 'sysname', None) or getattr(un, 'system', None)
+            if un is not None else None),
+        'python': '%d.%d.%d' % sys.version_info[:3],
+        'uptime_s': _uptime_s(),
+    }
+
+
+def _collect_display(screen):
+    """display block — the single most valuable field in the whole report.
+
+    10-monitor.conf ships DefaultDepth 16 and pygame's smoothscale raises
+    ValueError on 8- and 16-bit surfaces (see _smoothscale_safe), so what the
+    kiosk actually gets for driver and depth has never been observed on real
+    hardware. This settles it."""
+    out = {'sdl_driver': None, 'bitsize': None, 'size': None,
+           'fullscreen': None}
+    try:
+        out['sdl_driver'] = pygame.display.get_driver()
+    except Exception:
+        pass
+    if screen is None:
+        return out
+    try:
+        out['bitsize'] = int(screen.get_bitsize())
+    except Exception:
+        pass
+    try:
+        w, h = screen.get_size()
+        out['size'] = [int(w), int(h)]
+    except Exception:
+        pass
+    try:
+        out['fullscreen'] = bool(screen.get_flags() & pygame.FULLSCREEN)
+    except Exception:
+        pass
+    return out
+
+
+def _cairosvg_version():
+    """cairosvg's version WITHOUT importing it.
+
+    Importing cairosvg pulls in cffi and the cairo shared library — tens of MB
+    of RSS in a client process that never rasterizes anything (server.py does
+    that, in its own process). importlib.metadata reads the dist-info instead."""
+    try:
+        from importlib import metadata as _md
+    except Exception:
+        return None
+    try:
+        return _md.version('cairosvg')
+    except Exception:
+        pass
+    # Installed without metadata (vendored, or a .pth): fall back to asking
+    # the import system whether the module exists, still without importing it.
+    try:
+        import importlib.util
+        return 'present' if importlib.util.find_spec('cairosvg') else None
+    except Exception:
+        return None
+
+
+def _collect_versions():
+    try:
+        pg = pygame.version.ver
+    except Exception:
+        pg = None
+    try:
+        sdl = '.'.join(str(int(x)) for x in pygame.get_sdl_version())
+    except Exception:
+        sdl = None
+    try:
+        import shutil
+        cpulimit = bool(shutil.which('cpulimit'))
+    except Exception:
+        cpulimit = None
+    return {
+        'pygame': pg,
+        'sdl': sdl,
+        'cairosvg': _cairosvg_version(),
+        'cpulimit': cpulimit,
+    }
+
+
+def _git_head_sha():
+    """Short HEAD sha read straight out of .git, or None.
+
+    Deliberately not `git rev-parse`: the installed kiosk has neither a git
+    checkout nor a git binary, and spawning a subprocess on ARMv6 to learn a
+    string that is sitting in a file is a poor trade."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    head = _read_text(os.path.join(here, '.git', 'HEAD'), 512)
+    if not head:
+        return None
+    head = head.strip()
+    if not head.startswith('ref:'):
+        return head[:12] if re.match(r'^[0-9a-f]{7,40}$', head) else None
+    ref = head.split(':', 1)[1].strip()
+    sha = _read_text(os.path.join(here, '.git', ref), 128)
+    if sha and sha.strip():
+        return sha.strip()[:12]
+    packed = _read_text(os.path.join(here, '.git', 'packed-refs'), 262144)
+    for line in (packed or '').splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == ref:
+            return parts[0][:12]
+    return None
+
+
+def _app_version():
+    """Release version and/or git sha, or 'unknown'.
+
+    Both when both are known ('1.0.0+2b52f68f'): the release string is what an
+    operator can quote, the sha is what pins the exact code a timing figure
+    was measured on, and a report that has to be matched to one of several
+    builds of the same release is worth much less."""
+    env = os.environ.get('HAMCLOCK_VERSION')
+    if env:
+        return env.strip()[:64]
+    here = os.path.dirname(os.path.abspath(__file__))
+    ver = None
+    for cand in (os.path.join(here, 'VERSION'),
+                 '/etc/hamclock-lite/version'):
+        txt = _read_text(cand, 256)
+        if txt and txt.strip():
+            ver = txt.strip().splitlines()[0][:32]
+            break
+    sha = _git_head_sha()
+    if ver and sha:
+        return ('%s+%s' % (ver, sha))[:64]
+    return ver or sha or 'unknown'
+
+
+def _install_kind():
+    """'kiosk' | 'offline' | None. Never guesses beyond what is on disk."""
+    env = os.environ.get('HAMCLOCK_INSTALL')
+    if env in ('kiosk', 'offline'):
+        return env
+    try:
+        if os.path.exists('/etc/hamclock-lite/offline-install'):
+            return 'offline'
+        if os.path.exists('/etc/systemd/system/hamclock-kiosk.service'):
+            return 'kiosk'
+    except OSError:
+        pass
+    return None
+
+
+def _scrub_secrets(obj, depth=0):
+    """Drop any secret-shaped key from a structure we did not author.
+
+    The /api/diagnostics body is written by the server, embedded verbatim, and
+    could grow a field we never reviewed. Defence in depth: walk it once and
+    drop anything whose KEY looks like a credential. Depth-limited so a
+    self-referential or absurdly nested body cannot blow the stack."""
+    if depth > 12:
+        return None
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            ks = str(k)
+            if _SECRET_KEY_RE.search(ks):
+                continue
+            out[ks] = _scrub_secrets(v, depth + 1)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_scrub_secrets(v, depth + 1) for v in obj[:200]]
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    return str(obj)[:512]
+
+
+def _fetch_server_diagnostics(base_url=None, timeout=SERVER_DIAG_TIMEOUT_S):
+    """GET the local server's /api/diagnostics. None on ANY failure.
+
+    Short timeout on purpose: this runs on the render thread, once, in
+    response to a keypress. The server is on loopback, so the realistic
+    failure is 'not running' (instant ECONNREFUSED), not a slow reply."""
+    base = (base_url or 'http://localhost:8080').rstrip('/')
+    try:
+        req = _Request(base + SERVER_DIAG_PATH)
+        req.add_header('Accept', 'application/json')
+        req.add_header('User-Agent', TELEMETRY_UA)
+        resp = _urlopen(req, timeout=timeout)
+    except Exception as e:
+        print('[report] server diagnostics unavailable: %s' % e,
+              file=sys.stderr)
+        return None
+    try:
+        raw = resp.read(SERVER_DIAG_MAX_BYTES + 1)
+    except Exception:
+        return None
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    if not raw or len(raw) > SERVER_DIAG_MAX_BYTES:
+        return None
+    try:
+        body = json.loads(raw.decode('utf-8', 'replace'))
+    except Exception:
+        return None
+    if not isinstance(body, (dict, list)):
+        return None
+    return _scrub_secrets(body)
+
+
+def _screenshot_b64(surface, cap=None):
+    """Base64 PNG of `surface`, or None.
+
+    Encoded string is capped: over the limit we drop the screenshot entirely
+    and send null. A truncated image is not a smaller screenshot."""
+    if surface is None:
+        return None
+    limit = SCREENSHOT_MAX_B64 if cap is None else cap
+    try:
+        buf = io.BytesIO()
+        pygame.image.save(surface, buf, 'shot.png')
+        raw = buf.getvalue()
+    except Exception as e:
+        print('[report] screenshot failed: %s' % e, file=sys.stderr)
+        return None
+    if not raw:
+        return None
+    # Cheap pre-check against the raw PNG (base64 is 4/3 of it) so an absurd
+    # frame never costs us the big encode allocation on a 512 MB box.
+    if len(raw) > (limit // 4) * 3:
+        print('[report] screenshot %d B exceeds the cap; sending none'
+              % len(raw), file=sys.stderr)
+        return None
+    try:
+        import base64
+        b64 = base64.b64encode(raw).decode('ascii')
+    except Exception as e:
+        print('[report] screenshot encode failed: %s' % e, file=sys.stderr)
+        return None
+    if len(b64) > limit:
+        print('[report] screenshot %d B base64 exceeds the cap; sending none'
+              % len(b64), file=sys.stderr)
+        return None
+    return b64
+
+
+def _get_or_create_device_id(settings, path=None):
+    """Return this Pi's report id, minting and persisting one on first use.
+
+    A uuid4 — random. Deliberately NOT derived from the MAC, the CPU serial,
+    or the callsign: its only job is to let two reports from the same Pi be
+    recognised as the same Pi, and nothing about the operator should be
+    recoverable from it. Persisted via the existing write_settings so it
+    survives reboots; a failed write is logged and the id is still used for
+    this session (a report with a fresh id beats no report)."""
+    if isinstance(settings, dict):
+        cur = settings.get(DEVICE_ID_KEY)
+        if isinstance(cur, str) and _DEVICE_ID_RE.match(cur):
+            return cur
+    try:
+        import uuid
+        new_id = str(uuid.uuid4())
+    except Exception:
+        return None
+    if isinstance(settings, dict):
+        settings[DEVICE_ID_KEY] = new_id
+        try:
+            write_settings(settings, SETTINGS_PATH if path is None else path)
+        except Exception as e:
+            print('[report] could not persist the report id: %s' % e,
+                  file=sys.stderr)
+    return new_id
+
+
+def _collect_telemetry(screen, data, fonts=None, settings=None,
+                       settings_path=None, screenshot=True):
+    """Build the diagnostics payload. Collects only; sends nothing.
+
+    `fonts` is accepted for call-site symmetry with the draw helpers and is
+    not read — no font metric goes into the report.
+
+    Every sub-collector is individually guarded, so a Pi with a hostile /proc
+    still produces a well-formed payload full of nulls rather than an
+    exception in the render loop."""
+    try:
+        sent_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    except Exception:
+        sent_at = None
+    base = getattr(data, 'server_url', None)
+    return {
+        'schema': TELEMETRY_SCHEMA,
+        'device_id': _get_or_create_device_id(settings, settings_path),
+        'sent_at': sent_at,
+        'app': {
+            'version': _app_version(),
+            'mode': 'pygame',
+            'install': _install_kind(),
+        },
+        'host': _collect_host(),
+        'display': _collect_display(screen),
+        'versions': _collect_versions(),
+        'perf': {
+            'frame_ms': _frame_ms_summary(),
+            'panel_ms': dict((k, round(v, 1)) for k, v in _panel_ms.items()),
+            'boot_to_first_paint_s': _first_paint_s,
+        },
+        'server': _fetch_server_diagnostics(base),
+        'screenshot_png_b64': (_screenshot_b64(screen) if screenshot
+                               else None),
+    }
+
+
+# ---- send ----------------------------------------------------------------
+
+def _post_telemetry(payload, url=None, timeout=None):
+    """POST the payload ONCE. Returns (ok, human message).
+
+    Exactly one attempt, by design. A retry loop here would be an unattended
+    resend of data the operator confirmed once — if it fails, the operator can
+    look at the reason and press the button again."""
+    dest = TELEMETRY_URL if url is None else url
+    tmo = TELEMETRY_TIMEOUT_S if timeout is None else timeout
+    try:
+        body = json.dumps(payload).encode('utf-8')
+    except Exception as e:
+        return (False, 'could not encode report: %s' % e)
+    try:
+        req = _Request(dest, data=body, method='POST')
+        req.add_header('Content-Type', 'application/json')
+        req.add_header('User-Agent', TELEMETRY_UA)
+        resp = _urlopen(req, timeout=tmo)
+    except urllib.error.HTTPError as e:
+        return (False, 'rejected: HTTP %s' % getattr(e, 'code', '?'))
+    except urllib.error.URLError as e:
+        return (False, 'could not reach the server: %s'
+                % (getattr(e, 'reason', None) or e))
+    except Exception as e:
+        return (False, 'send failed: %s' % e)
+    code = None
+    try:
+        code = resp.getcode()
+        resp.read(4096)
+    except Exception:
+        pass
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    try:
+        if code is not None and not (200 <= int(code) < 300):
+            return (False, 'rejected: HTTP %s' % code)
+    except Exception:
+        pass
+    return (True, 'report sent — thank you')
+
+
+def _send_telemetry_async(payload, holder, url=None):
+    """Run one _post_telemetry on a short-lived daemon thread.
+
+    The render loop must not block for up to 15 s at 10 FPS. The thread only
+    ever writes into `holder`, and sets 'done' LAST so the loop can poll a
+    single key without a lock."""
+    def _worker():
+        try:
+            ok, msg = _post_telemetry(payload, url=url)
+        except Exception as e:          # belt and braces; must never escape
+            ok, msg = (False, 'send failed: %s' % e)
+        holder['ok'] = ok
+        holder['msg'] = msg
+        holder['done'] = True
+
+    t = threading.Thread(target=_worker, name='hamclock-report', daemon=True)
+    t.start()
+    return t
+
+
+# ---- confirm-before-send UI ----------------------------------------------
+
+def _new_report_state():
+    """All report UI state, allocated once outside the render loop."""
+    return {
+        'stage': 'idle',        # idle -> confirm -> sending -> idle
+        'payload': None,
+        'lines': None,
+        'regions': {},
+        'result': None,
+        # Set by the render loop once the confirm box has actually been
+        # presented. _report_confirm refuses to send until it is True, so a
+        # 'T' and a 'Y' arriving in the SAME 100 ms event batch cannot send a
+        # report the operator was never shown.
+        'shown': False,
+        'notice': '',
+        'notice_color': 'accent',
+        'notice_until': 0.0,
+    }
+
+
+def _fmt_uptime(secs):
+    try:
+        secs = int(secs)
+    except Exception:
+        return '?'
+    if secs < 3600:
+        return '%dm' % (secs // 60)
+    if secs < 86400:
+        return '%dh %dm' % (secs // 3600, (secs % 3600) // 60)
+    return '%dd %dh' % (secs // 86400, (secs % 86400) // 3600)
+
+
+def _join_dash(*parts):
+    return ' - '.join(str(p) for p in parts if p not in (None, '', '--'))
+
+
+def _report_confirm_lines(payload, callsign=''):
+    """The plain-language inventory shown before anything is sent.
+
+    Returns [(text, theme-colour-key)]. Built once when the dialog opens, so
+    the overlay redraw allocates nothing."""
+    p = payload or {}
+    host = p.get('host') or {}
+    disp = p.get('display') or {}
+    ver = p.get('versions') or {}
+    perf = p.get('perf') or {}
+    fm = perf.get('frame_ms') or {}
+    shot = p.get('screenshot_png_b64')
+
+    mem = host.get('mem_total_kb')
+    mem_s = ('%d MB' % (mem // 1024)) if isinstance(mem, int) else None
+    frames = ('p50 %s / p90 %s / p99 %s ms  (n=%s)'
+              % (fm.get('p50'), fm.get('p90'), fm.get('p99'), fm.get('n')))
+    fp = perf.get('boot_to_first_paint_s')
+    depth = disp.get('bitsize')
+    shot_kb = (len(shot) * 3) // 4096 if shot else 0
+    try:
+        size_s = '%sx%s' % (disp['size'][0], disp['size'][1])
+    except Exception:
+        size_s = None
+
+    L = []
+    L.append(('Send a one-off diagnostics report to the HamClock project?',
+              'fg'))
+    L.append(('Destination:  ' + TELEMETRY_URL, 'accent'))
+    L.append(('', 'fg'))
+    L.append(('THIS IS EVERYTHING THAT LEAVES YOUR PI:', 'bright'))
+    L.append(('  Report id   %s' % (p.get('device_id') or '(none)'), 'label'))
+    L.append(('              random, made up on this Pi — not your callsign, '
+              'MAC or serial', 'muted'))
+    L.append(('  Hardware    %s' % (_join_dash(
+        host.get('model'), host.get('cpu'),
+        ('%s core' % host.get('cores')) if host.get('cores') else None,
+        mem_s) or '(unknown)'), 'label'))
+    L.append(('  System      %s' % (_join_dash(
+        host.get('os'), 'kernel %s' % host.get('kernel')
+        if host.get('kernel') else None,
+        'Python %s' % host.get('python') if host.get('python') else None,
+        'up %s' % _fmt_uptime(host.get('uptime_s'))
+        if host.get('uptime_s') is not None else None) or '(unknown)'),
+        'label'))
+    L.append(('  Display     %s' % (_join_dash(
+        'SDL %s' % disp.get('sdl_driver') if disp.get('sdl_driver') else None,
+        '%s-bit colour' % depth if depth else None,
+        size_s,
+        'fullscreen' if disp.get('fullscreen') else None) or '(unknown)'),
+        'label'))
+    L.append(('  Versions    %s' % (_join_dash(
+        'pygame %s' % ver.get('pygame') if ver.get('pygame') else None,
+        'SDL %s' % ver.get('sdl') if ver.get('sdl') else None,
+        'cairosvg %s' % ver.get('cairosvg') if ver.get('cairosvg')
+        else 'no cairosvg',
+        'cpulimit installed' if ver.get('cpulimit')
+        else 'no cpulimit') or '(unknown)'), 'label'))
+    L.append(('  Speed       frame %s%s' % (
+        frames,
+        (' - first paint %ss' % fp) if fp else ''), 'label'))
+    L.append(('  Server      this Pi\'s own %s (feed + cache health)'
+              % SERVER_DIAG_PATH, 'label'))
+    if shot:
+        L.append(('  Screenshot  ~%d KB PNG of the screen behind this box'
+                  % shot_kb, 'label'))
+        L.append(('', 'fg'))
+        L.append(('THAT SCREENSHOT SHOWS YOUR CALLSIGN%s IN THE HEADER, SO'
+                  % ((' (%s)' % callsign) if callsign else ''), 'poor'))
+        L.append(('THIS REPORT IS NOT ANONYMOUS. Cancel if that is not OK.',
+                  'poor'))
+    else:
+        L.append(('  Screenshot  none — could not be captured, nothing '
+                  'attached', 'label'))
+    L.append(('', 'fg'))
+    L.append(('NOT sent: passwords, tokens, Wi-Fi names or keys, SSH keys, '
+              'and no', 'good'))
+    L.append(('file contents beyond the diagnostics listed above.', 'good'))
+    L.append(('Nothing has been sent yet, and nothing ever is without this '
+              'box.', 'good'))
+    return L
+
+
+def _report_overlay_rect(screen_size, lines=None, fonts=None):
+    """Where the confirm box goes.
+
+    Sized to its content when the lines and fonts are known — a box padded out
+    to 92% of a 450 px screen with 200 px of empty violet under the text reads
+    as a broken dialog, and it hides more of the dashboard than it needs to.
+    Falls back to the maximum when called without them (tests, and the
+    display.update rect on the frame the box closes)."""
+    try:
+        sw, sh = screen_size
+    except Exception:
+        return None
+    w = max(240, min(sw - 12, int(sw * 0.95)))
+    h = max(140, min(sh - 12, int(sh * 0.92)))
+    if lines is not None and fonts is not None:
+        try:
+            title_f = fonts.get('panel') or fonts.get('small') or fonts['label']
+            body_f = fonts.get('small') or fonts.get('label') or title_f
+            need = (6 + title_f.get_height() + 4
+                    + len(lines) * (body_f.get_height() + 1)
+                    + (body_f.get_height() + 8) + 12 + 6)
+            h = max(140, min(h, need))
+        except Exception:
+            pass
+    return pygame.Rect((sw - w) // 2, (sh - h) // 2, w, h)
+
+
+def _draw_confirm_overlay(screen, rect, title, lines, fonts, theme,
+                          confirm_label, cancel_label,
+                          confirm_key='send', cancel_key='cancel'):
+    """Draw a modal confirm box. Returns {confirm_key: Rect, cancel_key: Rect}.
+
+    Shared by the diagnostics report and the updater, which ask the same
+    question in the same shape: here is exactly what will happen, say yes or
+    no, and nothing happens until you do.
+
+    Opaque (no per-pixel-alpha scrim): compositing a translucent full-screen
+    surface would allocate 1.3 MB every frame the box is up, on a box that has
+    512 MB and one core."""
+    regions = {}
+    if rect is None or rect.w <= 0 or rect.h <= 0:
+        return regions
+    pygame.draw.rect(screen, theme['card'], rect)
+    pygame.draw.rect(screen, theme['accent'], rect, 2)
+    title_f = fonts.get('panel') or fonts.get('small') or fonts['label']
+    body_f = fonts.get('small') or fonts.get('label') or title_f
+    x = rect.x + 10
+    max_w = rect.w - 20
+    if max_w <= 0:
+        return regions
+    y = rect.y + 6
+    _blit_fit(screen, title_f, title, theme['bright'], x, y, max_w)
+    y += title_f.get_height() + 4
+    pitch = body_f.get_height() + 1
+    btn_h = body_f.get_height() + 8
+    body_bottom = rect.bottom - btn_h - 12
+    for text, ckey in (lines or ()):
+        if y + body_f.get_height() > body_bottom:
+            break
+        if text:
+            _blit_fit(screen, body_f, text,
+                      theme.get(ckey, theme['fg']), x, y, max_w)
+        y += pitch
+    sw_ = body_f.size(confirm_label)[0] + 14
+    cw_ = body_f.size(cancel_label)[0] + 14
+    by = rect.bottom - btn_h - 6
+    sx = rect.x + 12
+    cx = sx + sw_ + 14
+    if by > y - pitch and cx + cw_ <= rect.right - 12 and by >= rect.y:
+        for bx, bw, col, lab, name in (
+                (sx, sw_, theme['good'], confirm_label, confirm_key),
+                (cx, cw_, theme['poor'], cancel_label, cancel_key)):
+            br = pygame.Rect(bx, by, bw, btn_h)
+            pygame.draw.rect(screen, theme['border'], br)
+            pygame.draw.rect(screen, col, br, 1)
+            _blit_fit(screen, body_f, lab, col, br.x + 7, br.y + 4, br.w - 14)
+            regions[name] = br
+    return regions
+
+
+def draw_report_overlay(screen, rect, lines, fonts, theme):
+    """The confirm-before-send box. Returns {'send': Rect, 'cancel': Rect}."""
+    return _draw_confirm_overlay(
+        screen, rect, 'SEND DIAGNOSTICS REPORT?', lines, fonts, theme,
+        '[Y] SEND IT ONCE', '[N] CANCEL')
+
+
+def draw_update_overlay(screen, rect, lines, fonts, theme):
+    """The confirm-before-update box. Returns {'install': Rect,
+    'cancel': Rect}."""
+    return _draw_confirm_overlay(
+        screen, rect, 'INSTALL THIS UPDATE?', lines, fonts, theme,
+        '[Y] INSTALL IT NOW', '[N] NOT NOW',
+        confirm_key='install', cancel_key='cancel')
+
+
+def _set_notice(state, text, color='accent', ttl=None, now=None):
+    """Post a message to the status bar's notice line.
+
+    The report state owns that line; the updater and the settings wizard post
+    through the same three keys rather than growing a third source the bar
+    would have to arbitrate between."""
+    state['notice'] = text
+    state['notice_color'] = color
+    state['notice_until'] = ((time.time() if now is None else now)
+                             + (REPORT_NOTICE_TTL_S if ttl is None else ttl))
+
+
+def _report_notice(state, text, color='accent', now=None):
+    _set_notice(state, text, color, REPORT_NOTICE_TTL_S, now)
+
+
+def _report_notice_text(state, now):
+    """The status-bar message, or None once it has aged out."""
+    if state.get('notice') and now < state.get('notice_until', 0.0):
+        return state['notice']
+    return None
+
+
+def _report_open(state, screen, data, fonts, settings, callsign='',
+                 settings_path=None):
+    """Arm the confirm dialog. Builds the payload; SENDS NOTHING.
+
+    The screenshot is taken from `screen` as it stands right now — i.e. the
+    dashboard frame the operator was looking at when they pressed the button,
+    before any overlay pixels exist — so the report shows the real display,
+    not this dialog."""
+    if state.get('stage') != 'idle':
+        return False
+    try:
+        payload = _collect_telemetry(screen, data, fonts, settings=settings,
+                                     settings_path=settings_path)
+        lines = _report_confirm_lines(payload, callsign)
+    except Exception as e:
+        print('[report] could not build the report: %s' % e, file=sys.stderr)
+        _report_notice(state, 'report failed: %s' % e, 'poor')
+        return False
+    state['payload'] = payload
+    state['lines'] = lines
+    state['regions'] = {}
+    state['shown'] = False
+    state['stage'] = 'confirm'
+    state['notice'] = ''
+    return True
+
+
+def _report_cancel(state):
+    """Dismiss without sending. Drops the payload (and its screenshot)."""
+    if state.get('stage') != 'confirm':
+        return False
+    state['stage'] = 'idle'
+    state['payload'] = None
+    state['lines'] = None
+    state['regions'] = {}
+    state['shown'] = False
+    _report_notice(state, 'report cancelled — nothing was sent', 'label')
+    return True
+
+
+def _report_confirm(state, url=None):
+    """The ONLY path from a built payload to the network.
+
+    Reachable exactly one way: the operator opened the dialog, the dialog was
+    put on screen, and they then explicitly confirmed it. Never called on a
+    timer, at boot, or on retry."""
+    if state.get('stage') != 'confirm' or state.get('payload') is None:
+        return False
+    if not state.get('shown'):
+        # The box has not been presented yet — this frame's events arrived
+        # before it was drawn. Refuse: consent requires having seen it.
+        return False
+    holder = {'done': False, 'ok': False, 'msg': ''}
+    state['result'] = holder
+    payload = state['payload']
+    # Drop the loop's reference now: the worker holds the only one, so the
+    # ~130 KB payload is freed the moment the POST finishes.
+    state['payload'] = None
+    state['lines'] = None
+    state['regions'] = {}
+    state['shown'] = False
+    state['stage'] = 'sending'
+    _report_notice(state, 'sending report…', 'accent')
+    _send_telemetry_async(payload, holder, url=url)
+    return True
+
+
+def _report_poll(state):
+    """Pick up the worker's result. True when the status bar must redraw."""
+    if state.get('stage') != 'sending':
+        return False
+    holder = state.get('result')
+    if not holder or not holder.get('done'):
+        return False
+    state['result'] = None
+    state['stage'] = 'idle'
+    if holder.get('ok'):
+        _report_notice(state, holder.get('msg') or 'report sent', 'good')
+    else:
+        _report_notice(state, 'report NOT sent: %s'
+                       % (holder.get('msg') or 'unknown error'), 'poor')
+    return True
+
+
+# ---- The UPDATE button ----
+#
+# hamclock-update-check.timer runs --check once a day at 07:00 and leaves its
+# verdict in /run/hamclock-lite/update-status.json. All this side does is read
+# that file, offer a button when it says an update exists, and — on an explicit
+# confirm — create /run/hamclock-lite/update.request. Root does the rest and
+# re-derives everything (manifest, digest, install, health check, rollback)
+# for itself.
+
+# The status file changes at most once a day at rest, so 30 s is already an
+# extravagant polling rate; it exists so a status written while the operator
+# is standing at the screen shows up without a reboot.
+UPDATE_POLL_S = 30.0
+# ...except while an update is actually running, when the file is rewritten
+# every few seconds and the operator is watching a progress line.
+UPDATE_APPLY_POLL_S = 5.0
+
+# How long an update message stays on the status bar. Terminal outcomes get a
+# minute; anything still in flight (or a broken install) stays until it is
+# superseded, because it is the most important thing on the display.
+UPDATE_NOTICE_TTL_S = 60.0
+UPDATE_PROGRESS_TTL_S = 3600.0
+
+_UPDATE_BUSY_STATES = ('applying', 'rollback', 'rebooting')
+_UPDATE_DONE_STATES = ('updated', 'rolled_back', 'broken', 'error', 'current')
+
+# A `detail` long enough to push the version out of the status bar defeats the
+# point of showing it.
+_UPDATE_DETAIL_MAX = 64
+
+
+def _new_update_state():
+    """All updater UI state, allocated once outside the render loop."""
+    return {
+        'stage': 'idle',      # idle -> confirm -> requested -> idle
+        'status': None,       # last parse of update-status.json, or None
+        'next_poll': 0.0,
+        'lines': None,
+        'regions': {},
+        # Same consent interlock the report dialog uses: the confirm is only
+        # honoured once the box has actually been put on screen, so a 'U' and
+        # a 'Y' arriving in one 100 ms event batch cannot request an update
+        # the operator was never shown.
+        'shown': False,
+        'button': None,       # cached status-bar label, or None
+        'notice': '',
+        'notice_color': 'accent',
+        'notice_until': 0.0,
+    }
+
+
+def _update_detail(status):
+    d = (status or {}).get('detail')
+    return d[:_UPDATE_DETAIL_MAX] if isinstance(d, str) else ''
+
+
+def _update_button_label(state):
+    """The status-bar chip's text, or None when there is nothing to offer.
+
+    Only 'available' produces a button. 'current', 'error', a mid-apply state
+    and a missing status file all mean there is nothing to press."""
+    st = state.get('status') or {}
+    if state.get('stage') != 'idle' or st.get('state') != 'available':
+        return None
+    ver = st.get('available')
+    if isinstance(ver, str) and ver:
+        return 'UPDATE %s [U]' % ver
+    return 'UPDATE [U]'
+
+
+def _update_refresh_button(state):
+    state['button'] = _update_button_label(state)
+    return state['button']
+
+
+def _update_progress_notice(state, now=None):
+    """Translate the root side's state machine into one line of English."""
+    st = state.get('status') or {}
+    s = st.get('state')
+    detail = _update_detail(st)
+    avail = st.get('available') or ''
+    inst = st.get('installed') or ''
+    if s == 'applying':
+        _set_notice(state, 'installing %s… %s' % (avail, detail),
+                    'accent', UPDATE_PROGRESS_TTL_S, now)
+    elif s == 'rollback':
+        _set_notice(state, 'update failed — rolling back to %s: %s'
+                    % (inst, detail), 'fair', UPDATE_PROGRESS_TTL_S, now)
+    elif s == 'rebooting':
+        _set_notice(state, 'update installed — rebooting (%s)' % detail,
+                    'accent', UPDATE_PROGRESS_TTL_S, now)
+    elif s == 'updated':
+        _set_notice(state, 'updated to %s — %s' % (inst or avail, detail),
+                    'good', UPDATE_NOTICE_TTL_S, now)
+    elif s == 'rolled_back':
+        _set_notice(state, 'update failed; rolled back to %s — %s'
+                    % (inst, detail), 'poor', UPDATE_NOTICE_TTL_S, now)
+    elif s == 'broken':
+        # Update AND rollback both failed. This one stays up.
+        _set_notice(state, 'UPDATE BROKEN — %s' % detail,
+                    'poor', UPDATE_PROGRESS_TTL_S, now)
+    elif s == 'error':
+        _set_notice(state, 'update check failed: %s' % detail,
+                    'poor', UPDATE_NOTICE_TTL_S, now)
+    if s in _UPDATE_DONE_STATES:
+        # Root is finished with us either way; re-arm the button logic.
+        state['stage'] = 'idle'
+
+
+def _update_poll(state, now=None, run_dir=None):
+    """Re-read the status file on the slow cadence.
+
+    Returns True when the status bar must redraw. A missing file is the normal
+    case and is not an error, is not logged, and does not raise."""
+    now = time.time() if now is None else now
+    if now < state.get('next_poll', 0.0):
+        return False
+    new = read_update_status(run_dir)
+    old = state.get('status')
+    changed = new != old
+    state['status'] = new
+    if changed and (new or {}).get('state') != (old or {}).get('state'):
+        _update_progress_notice(state, now)
+    # Scheduled from what we just read, not from what we knew a moment ago:
+    # the first poll after boot finds whatever the file already says, and an
+    # update running right then must not be watched at the once-a-day rate.
+    busy = (state.get('stage') == 'requested'
+            or (new or {}).get('state') in _UPDATE_BUSY_STATES)
+    state['next_poll'] = now + (UPDATE_APPLY_POLL_S if busy else UPDATE_POLL_S)
+    if not changed:
+        return False
+    _update_refresh_button(state)
+    return True
+
+
+def _update_confirm_lines(status):
+    """Exactly what confirming will do, in the order it will happen.
+
+    Everything here is a claim about hamclock-update.sh's behaviour, so it
+    stays honest about the two things an operator most needs to know before
+    pressing yes on a kiosk: the display goes away for a while, and it may
+    reboot."""
+    st = status or {}
+    inst = st.get('installed') or '(unknown)'
+    avail = st.get('available') or '(unknown)'
+    L = []
+    L.append(('Install HamClock Lite %s on this Pi?' % avail, 'fg'))
+    L.append(('', 'fg'))
+    L.append(('  Installed now   %s' % inst, 'label'))
+    L.append(('  Would install   %s' % avail, 'accent'))
+    L.append(('', 'fg'))
+    L.append(('IF YOU CONFIRM, THE PI WILL:', 'bright'))
+    L.append(('  1. download the installer over https and check it against',
+              'label'))
+    L.append(('     the published SHA-256 before running any part of it', 'label'))
+    L.append(('  2. back up the current install, then replace it', 'label'))
+    L.append(('  3. restart the HamClock services — THIS DISPLAY WILL GO',
+              'label'))
+    L.append(('     BLANK for a minute or two and come back on its own', 'label'))
+    L.append(('  4. REBOOT ITSELF if the boot configuration changed', 'fair'))
+    L.append(('', 'fg'))
+    L.append(('If the new version fails its health check, the Pi puts %s'
+              % inst, 'good'))
+    L.append(('back automatically — you do not have to be here for that.',
+              'good'))
+    L.append(('', 'fg'))
+    L.append(('Nothing is downloaded or installed unless you confirm here.',
+              'good'))
+    return L
+
+
+def _update_open(state):
+    """Arm the confirm box. Downloads nothing and requests nothing."""
+    if state.get('stage') != 'idle':
+        return False
+    st = state.get('status') or {}
+    if st.get('state') != 'available':
+        _set_notice(state, 'no update is available', 'label', 10.0)
+        return False
+    state['lines'] = _update_confirm_lines(st)
+    state['regions'] = {}
+    state['shown'] = False
+    state['stage'] = 'confirm'
+    state['notice'] = ''
+    _update_refresh_button(state)
+    return True
+
+
+def _update_cancel(state):
+    """Dismiss without asking for anything."""
+    if state.get('stage') != 'confirm':
+        return False
+    state['stage'] = 'idle'
+    state['lines'] = None
+    state['regions'] = {}
+    state['shown'] = False
+    _set_notice(state, 'update postponed — nothing was installed',
+                'label', 10.0)
+    _update_refresh_button(state)
+    return True
+
+
+def _update_confirm(state, run_dir=None):
+    """The ONLY path to /run/hamclock-lite/update.request.
+
+    And creating that empty file is the ONLY thing that happens here. No
+    download, no digest check, no unpack, no install, no service restart, no
+    reboot — a root-owned path unit sees the file and hands all of that to
+    hamclock-update.sh, which re-derives what to install and verifies it
+    itself. This side cannot choose what gets installed, only ask that
+    something be."""
+    if state.get('stage') != 'confirm':
+        return False
+    if not state.get('shown'):
+        # This frame's events arrived before the box was drawn. Consent
+        # requires having seen it.
+        return False
+    state['lines'] = None
+    state['regions'] = {}
+    state['shown'] = False
+    if request_update(run_dir):
+        state['stage'] = 'requested'
+        _set_notice(state, 'update requested — the Pi is installing it',
+                    'accent', UPDATE_PROGRESS_TTL_S)
+    else:
+        state['stage'] = 'idle'
+        _set_notice(state, 'could not ask for the update — no %s' % RUN_DIR,
+                    'poor')
+    state['next_poll'] = 0.0   # show progress on the very next frame
+    _update_refresh_button(state)
+    return True
+
+
+def _update_notice_text(state, now):
+    """The status-bar message, or None once it has aged out."""
+    if state.get('notice') and now < state.get('notice_until', 0.0):
+        return state['notice']
+    return None
+
+
 # ---- --inject-events debug flag (Phase 1 verification harness) ----
 # Gated by HAMCLOCK_DEBUG=1 so production never accepts injected events.
 # Reads a JSON list of {"type": "MOUSEBUTTONDOWN"|"KEYDOWN"|"QUIT", ...}
@@ -5135,6 +7175,11 @@ def main(argv=None):
         except OSError as e:
             print("[main] could not persist settings: %s" % e,
                   file=sys.stderr)
+        else:
+            # Ask root to apply the NTP server. We cannot write the timesyncd
+            # drop-in ourselves and must not try; hamclock-apply-settings.sh
+            # re-reads settings.json and re-validates the value from scratch.
+            request_settings_apply()
 
     theme = THEMES.get(settings.get('theme', 'kstate'), THEMES['kstate'])
 
@@ -5155,6 +7200,52 @@ def _parse_args_known(argv):
     return args, unknown
 
 
+def _reopen_setup(screen, fonts, theme, settings, settings_path=None):
+    """'S' on the dashboard: re-run the wizard over the current settings.
+
+    Before this existed the wizard ran only when settings.json was absent, so
+    once a Pi was set up the operator could never change their NTP server,
+    timezone or theme from the device again — the only route was an SSH
+    session and a text editor, on a kiosk that may well have neither a network
+    nor a keyboard-shell.
+
+    Returns (new_settings_or_None, notice_text, notice_colour_key). None means
+    nothing changed, which is also what a cancel produces."""
+    path = SETTINGS_PATH if settings_path is None else settings_path
+    try:
+        new = setup_screen(screen, fonts, theme, initial=settings,
+                           allow_cancel=True,
+                           # The dashboard has been up and fetching for a
+                           # while, so the clock is already whatever it is
+                           # going to be; blocking ten seconds for a sync here
+                           # would only stall an operator at the keyboard.
+                           wait_ntp=False)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print('[setup] wizard failed: %s' % e, file=sys.stderr)
+        return (None, 'settings unchanged: %s' % e, 'poor')
+    finally:
+        try:
+            pygame.mouse.set_visible(True)
+        except Exception:
+            pass
+    if new is None:
+        return (None, 'settings unchanged', 'label')
+    merged = dict(settings)
+    merged.update(new)
+    try:
+        write_settings(merged, path)
+    except OSError as e:
+        print('[setup] could not persist settings: %s' % e, file=sys.stderr)
+        return (None, 'could not save settings: %s' % e, 'poor')
+    # All we may do about the NTP server is ask. Root re-reads settings.json
+    # and re-validates the value itself; nothing is passed through this call.
+    if request_settings_apply():
+        return (merged, 'settings saved', 'good')
+    return (merged, 'settings saved (could not ask root to apply NTP)', 'fair')
+
+
 def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
     """The dashboard render loop, factored out of main() so that the
     Phase-4 first-boot wizard can run beforehand and tests can patch this
@@ -5173,6 +7264,17 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
     image_cache = {}
     image_cache_ts = {}
     tab_regions = {}
+    # Opt-in diagnostics: the status bar's SEND REPORT chip is hit-tested from
+    # here exactly like the propagation tabs above, and the state dict is
+    # allocated once, outside the loop.
+    status_regions = {}
+    report = _new_report_state()
+    # The UPDATE chip lives in the same bar and is hit-tested the same way.
+    # Its state is polled off /run/hamclock-lite/update-status.json on a slow
+    # cadence — the file is written at most once a day — so the loop pays a
+    # stat and a ~150-byte read every 300 frames, and nothing at all in
+    # between.
+    update = _new_update_state()
     tab_image_key = PROP_TAB_IMAGE_KEY
     dirty_state = {
         'prev_active_tab': None,
@@ -5196,22 +7298,147 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
     consecutive_errors = 0
     while running:
         try:
+            frame_t0 = _mono()
             frame_events = (next(injected_iter)
                             if injected_iter is not None
                             else pygame.event.get())
+            callsign = settings.get('callsign') or os.environ.get(
+                'HAMCLOCK_CALLSIGN', 'N0CALL')
             for event in frame_events:
                 if event.type == pygame.QUIT:
                     running = False
+                elif report['stage'] == 'confirm':
+                    # The confirm box owns the keyboard while it is up: ESC
+                    # and Q must dismiss the report, NOT quit the kiosk out
+                    # from under an operator who is still reading it.
+                    if event.type == pygame.KEYDOWN:
+                        if event.key in (pygame.K_y, pygame.K_RETURN,
+                                         pygame.K_KP_ENTER):
+                            _report_confirm(report)
+                        elif event.key in (pygame.K_n, pygame.K_ESCAPE,
+                                           pygame.K_q):
+                            _report_cancel(report)
+                    elif event.type == pygame.MOUSEBUTTONDOWN:
+                        pos = event.pos
+                        send_r = report['regions'].get('send')
+                        cancel_r = report['regions'].get('cancel')
+                        if send_r is not None and send_r.collidepoint(pos):
+                            _report_confirm(report)
+                        elif (cancel_r is not None
+                                and cancel_r.collidepoint(pos)):
+                            _report_cancel(report)
+                    if report['stage'] != 'confirm':
+                        # Box just closed: repaint the dashboard under it and
+                        # surface the outcome without waiting a cadence tick.
+                        dirty_state['full_flip_pending'] = True
+                        _panel_due_at['status'] = 0.0
+                elif update['stage'] == 'confirm':
+                    # Same rule as the report box: while it is up, ESC and Q
+                    # answer the question in front of the operator, they do
+                    # not quit the kiosk.
+                    if event.type == pygame.KEYDOWN:
+                        if event.key in (pygame.K_y, pygame.K_RETURN,
+                                         pygame.K_KP_ENTER):
+                            _update_confirm(update)
+                        elif event.key in (pygame.K_n, pygame.K_ESCAPE,
+                                           pygame.K_q):
+                            _update_cancel(update)
+                    elif event.type == pygame.MOUSEBUTTONDOWN:
+                        pos = event.pos
+                        go_r = update['regions'].get('install')
+                        no_r = update['regions'].get('cancel')
+                        if go_r is not None and go_r.collidepoint(pos):
+                            _update_confirm(update)
+                        elif no_r is not None and no_r.collidepoint(pos):
+                            _update_cancel(update)
+                    if update['stage'] != 'confirm':
+                        dirty_state['full_flip_pending'] = True
+                        _panel_due_at['status'] = 0.0
                 elif event.type == pygame.KEYDOWN:
                     if event.key in (pygame.K_ESCAPE, pygame.K_q):
                         running = False
+                    elif event.key == pygame.K_t:
+                        # Opens the confirm box only. This never sends.
+                        _report_open(report, screen, data, fonts, settings,
+                                     callsign)
+                    elif event.key == pygame.K_u:
+                        # Opens the confirm box only. This never installs.
+                        # Bound as well as clickable because a kiosk is
+                        # routinely run with no mouse.
+                        _update_open(update)
+                        _panel_due_at['status'] = 0.0
+                    elif event.key == pygame.K_s:
+                        # Re-open the setup wizard over the live settings.
+                        new_settings, _note, _col = _reopen_setup(
+                            screen, fonts, theme, settings)
+                        if new_settings is not None:
+                            settings = new_settings
+                            _nt = THEMES.get(settings.get('theme'))
+                            if _nt is not None:
+                                theme = _nt
+                                if '_band_lut' not in theme:
+                                    theme['_band_lut'] = dict(
+                                        zip(HF_BANDS, theme['band_palette']))
+                        _report_notice(report, _note, _col)
+                        # The wizard painted over the whole display; every
+                        # panel has to come back, not just the due ones.
+                        dirty_state['full_flip_pending'] = True
+                        for _name in _panel_due_at:
+                            _panel_due_at[_name] = 0.0
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     pos = event.pos
-                    for name, r in tab_regions.items():
-                        if r.collidepoint(pos):
-                            active_tab = name
-                            dirty_state['full_flip_pending'] = True
-                            break
+                    send_btn = status_regions.get('send_report')
+                    update_btn = status_regions.get('update')
+                    if send_btn is not None and send_btn.collidepoint(pos):
+                        _report_open(report, screen, data, fonts, settings,
+                                     callsign)
+                    elif (update_btn is not None
+                            and update_btn.collidepoint(pos)):
+                        _update_open(update)
+                        _panel_due_at['status'] = 0.0
+                    else:
+                        for name, r in tab_regions.items():
+                            if r.collidepoint(pos):
+                                active_tab = name
+                                dirty_state['full_flip_pending'] = True
+                                break
+
+            if _report_poll(report):
+                _panel_due_at['status'] = 0.0
+            if _update_poll(update):
+                _panel_due_at['status'] = 0.0
+
+            if report['stage'] == 'confirm':
+                # Freeze the dashboard behind the box: the pixels underneath
+                # stay as they were, we present only the box's own rect, and
+                # the full repaint is deferred to the frame it closes on.
+                orect = _report_overlay_rect(screen.get_size(),
+                                             report['lines'], fonts)
+                report['regions'] = draw_report_overlay(
+                    screen, orect, report['lines'], fonts, theme)
+                if orect is not None:
+                    pygame.display.update(orect)
+                # The operator has now actually seen it; only from here can a
+                # confirm be accepted.
+                report['shown'] = True
+                dirty_state['full_flip_pending'] = True
+                clock.tick(10)
+                consecutive_errors = 0
+                continue
+
+            if update['stage'] == 'confirm':
+                # Identical treatment to the report box above.
+                orect = _report_overlay_rect(screen.get_size(),
+                                             update['lines'], fonts)
+                update['regions'] = draw_update_overlay(
+                    screen, orect, update['lines'], fonts, theme)
+                if orect is not None:
+                    pygame.display.update(orect)
+                update['shown'] = True
+                dirty_state['full_flip_pending'] = True
+                clock.tick(10)
+                consecutive_errors = 0
+                continue
 
             sw, sh = screen.get_size()
             # Tier-0 perf: only memset the whole 720x450 framebuffer when this
@@ -5251,16 +7478,32 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
             redrawn_this_frame = set()
 
             header = layout["header"]
-            callsign = settings.get('callsign') or os.environ.get(
-                'HAMCLOCK_CALLSIGN', 'N0CALL')
             if _panel_due('header'):
+                _t0 = _mono()
                 draw_header(screen, header, callsign, fonts, theme, data=data)
+                _record_panel_ms('header', _t0)
                 redrawn_this_frame.add('header')
                 _panel_due_at['header'] = now_ts + _CADENCE_S['header']
 
             status = layout["status"]
             if _panel_due('status'):
-                draw_status_bar(screen, status, data, fonts, theme)
+                _t0 = _mono()
+                # One notice line, two sources. A report outcome is a direct
+                # answer to something the operator just did, so it wins; an
+                # update message is the fallback and is the longer-lived of
+                # the two anyway.
+                _msg = _report_notice_text(report, now_ts)
+                _msg_col = report['notice_color']
+                if _msg is None:
+                    _msg = _update_notice_text(update, now_ts)
+                    _msg_col = update['notice_color']
+                _sr = draw_status_bar(
+                    screen, status, data, fonts, theme,
+                    notice=_msg, notice_color=_msg_col,
+                    update_label=update['button'])
+                _record_panel_ms('status', _t0)
+                if _sr is not None:
+                    status_regions = _sr
                 redrawn_this_frame.add('status')
                 _panel_due_at['status'] = now_ts + _CADENCE_S['status']
 
@@ -5283,18 +7526,22 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 panel_rects.append(inner)
 
             if _panel_due('solar'):
+                _t0 = _mono()
                 try:
                     draw_solar(screen, panel_rects[0], data.solar or {},
                                fonts, theme, data_refresh_ts=data_ts)
                 except Exception:
                     pass
+                _record_panel_ms('solar', _t0)
                 redrawn_this_frame.add('solar')
                 _panel_due_at['solar'] = now_ts + _CADENCE_S['solar']
             if _panel_due('bands'):
+                _t0 = _mono()
                 try:
                     draw_bands(screen, panel_rects[1], data.bands or {}, fonts, theme)
                 except Exception:
                     pass
+                _record_panel_ms('bands', _t0)
                 redrawn_this_frame.add('bands')
                 _panel_due_at['bands'] = now_ts + _CADENCE_S['bands']
             if _panel_due('sdo'):
@@ -5303,6 +7550,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 # loop's consecutive_errors counter instead of this panel's
                 # own except.
                 sdo_surf = None
+                _t0 = _mono()
                 try:
                     sdo_surf = _get_cached_image(data, 'solar-image', image_cache, image_cache_ts)
                     draw_image(screen, panel_rects[2], sdo_surf, fonts, theme,
@@ -5311,69 +7559,83 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                                status=_image_status_text(data, 'solar-image'))
                 except Exception:
                     pass
+                _record_panel_ms('sdo', _t0)
                 redrawn_this_frame.add('sdo')
                 _panel_due_at['sdo'] = now_ts + (
                     _CADENCE_S['sdo'] if sdo_surf is not None
                     else _CADENCE_S_NO_IMAGE.get('sdo', _CADENCE_S['sdo']))
             if _panel_due('geomag'):
+                _t0 = _mono()
                 try:
                     draw_geomag(screen, panel_rects[3], data.solar or {},
                                 fonts, theme, data_refresh_ts=data_ts)
                 except Exception:
                     pass
+                _record_panel_ms('geomag', _t0)
                 redrawn_this_frame.add('geomag')
                 _panel_due_at['geomag'] = now_ts + _CADENCE_S['geomag']
             if _panel_due('xray'):
+                _t0 = _mono()
                 try:
                     draw_xray(screen, panel_rects[4], data.solar or {},
                               fonts, theme, data_refresh_ts=data_ts)
                 except Exception:
                     pass
+                _record_panel_ms('xray', _t0)
                 redrawn_this_frame.add('xray')
                 _panel_due_at['xray'] = now_ts + _CADENCE_S['xray']
             if _panel_due('open_bands'):
+                _t0 = _mono()
                 try:
                     draw_open_bands(screen, panel_rects[5], data.bands or {},
                                     fonts, theme, data_refresh_ts=data_ts)
                 except Exception:
                     pass
+                _record_panel_ms('open_bands', _t0)
                 redrawn_this_frame.add('open_bands')
                 _panel_due_at['open_bands'] = now_ts + _CADENCE_S['open_bands']
 
             # ---- MIDDLE COLUMN ----
             mid_rect = layout["muf"]
             if _panel_due('muf_text'):
+                _t0 = _mono()
                 mid_inner = draw_panel(screen, mid_rect, 'MUF STATUS', fonts, theme)
                 try:
                     draw_muf_text(screen, mid_inner, data.solar or {}, fonts, theme)
                 except Exception:
                     pass
+                _record_panel_ms('muf_text', _t0)
                 redrawn_this_frame.add('muf_text')
                 _panel_due_at['muf_text'] = now_ts + _CADENCE_S['muf_text']
 
             # ---- RIGHT COLUMN ----
             dx_r = layout["dx_spots"]
             if _panel_due('dx_spots'):
+                _t0 = _mono()
                 dx_inner = draw_panel(screen, dx_r, 'DX SPOTS', fonts, theme)
                 try:
                     draw_dx_spots(screen, dx_inner, data.dxspots or [], fonts, theme)
                 except Exception:
                     pass
+                _record_panel_ms('dx_spots', _t0)
                 redrawn_this_frame.add('dx_spots')
                 _panel_due_at['dx_spots'] = now_ts + _CADENCE_S['dx_spots']
 
             ba_r = layout["band_activity"]
             if _panel_due('band_activity'):
+                _t0 = _mono()
                 ba_inner = draw_panel(screen, ba_r, 'BAND ACTIVITY', fonts, theme)
                 try:
                     draw_band_activity(screen, ba_inner, data.dxspots or [], fonts, theme)
                 except Exception:
                     pass
+                _record_panel_ms('band_activity', _t0)
                 redrawn_this_frame.add('band_activity')
                 _panel_due_at['band_activity'] = now_ts + _CADENCE_S['band_activity']
 
             prop_r = layout["propagation"]
             if _panel_due('propagation'):
+                _t0 = _mono()
                 prop_inner = draw_panel(screen, prop_r, 'PROPAGATION', fonts, theme)
                 tab_bar = pygame.Rect(prop_inner.x, prop_inner.y, prop_inner.w, 20)
                 tab_regions = draw_tabs(screen, tab_bar, PROP_TABS,
@@ -5391,6 +7653,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                                status=_image_status_text(data, key))
                 except Exception:
                     pass
+                _record_panel_ms('propagation', _t0)
                 redrawn_this_frame.add('propagation')
                 _panel_due_at['propagation'] = now_ts + (
                     _CADENCE_S['propagation'] if surf is not None
@@ -5420,11 +7683,17 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 dirty_state['full_flip_pending'] = False
                 dirty_state['prev_active_tab'] = active_tab
                 pygame.display.flip()
+                _note_first_paint()
             else:
                 rects = [panel_rects_map[n] for n in redrawn_this_frame
                          if n in panel_rects_map]
                 if rects:
                     pygame.display.update(rects)
+            # Diagnostics: one ring-buffer slot, written in place. Measures
+            # the render work, not the tick() sleep that pads it out to the
+            # frame budget — the question this answers is whether an ARMv6 Pi
+            # can do a frame inside 100 ms, and a sleep would mask that.
+            _record_frame_ms(frame_t0)
             clock.tick(10)
             consecutive_errors = 0
         except Exception as e:
@@ -5439,6 +7708,20 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 running = False
             else:
                 time.sleep(backoff_ms / 1000.0)
+
+    # A report the operator confirmed a moment before pressing Q is in flight
+    # on a daemon thread, which the interpreter kills on exit. Give it a short
+    # grace period rather than silently dropping it; deliberately far below
+    # TELEMETRY_TIMEOUT_S so a dead uplink cannot hold up a kiosk restart.
+    if report['stage'] == 'sending':
+        print('[report] finishing an in-flight report before exit…',
+              file=sys.stderr)
+        for t in threading.enumerate():
+            if t.name == 'hamclock-report':
+                try:
+                    t.join(timeout=3.0)
+                except Exception:
+                    pass
 
     try:
         data.stop()
@@ -5467,26 +7750,76 @@ def _drop_privileges_if_root():
         print("[setup] could not drop privileges: %s" % e, file=sys.stderr)
 
 
-def _apply_ntp(ntp_value, conf_path, restart):
-    """Write systemd-timesyncd drop-in and optionally restart the unit."""
+def _restart_timesyncd():
+    import subprocess as _sp
     try:
-        socket.gethostbyname(ntp_value)
-    except socket.gaierror as e:
-        print("[setup] NTP host %r does not resolve: %s"
-              % (ntp_value, e), file=sys.stderr)
-        return 2
+        _sp.run(["systemctl", "restart", "systemd-timesyncd"], check=False)
+    except FileNotFoundError:
+        print("[setup] systemctl not found; skipping restart",
+              file=sys.stderr)
+
+
+def _apply_ntp(ntp_value, conf_path, restart):
+    """Write the systemd-timesyncd drop-in, or remove it. Returns an exit code.
+
+    Validation is by FORMAT, first, and it is what decides whether anything is
+    written:
+
+      * The old implementation's only check was socket.gethostbyname(), and
+        gethostbyname("") RESOLVES — so an empty value sailed straight through
+        and wrote a bare `NTP=` line, which systemd cannot parse. Empty now
+        means what the operator meant by it: remove the drop-in and go back to
+        the distro's default time servers.
+      * systemd's NTP= takes a space-separated LIST, which is how fallbacks
+        are specified; the old check passed the whole string to
+        gethostbyname() and so rejected every list out of hand.
+      * Resolution is now advisory and happens AFTER the file is written.
+        Refusing to save an internal time server because the LAN is not up yet
+        — on a machine with no RTC, at first boot, which is exactly when this
+        runs — was the wrong call.
+    """
+    value = normalize_ntp(ntp_value)
+
+    if not value:
+        try:
+            os.remove(conf_path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print("[setup] could not remove %s: %s" % (conf_path, e),
+                  file=sys.stderr)
+            return 2
+        else:
+            print("[setup] NTP cleared; removed %s (using distro defaults)"
+                  % conf_path, file=sys.stderr)
+            if restart:
+                _restart_timesyncd()
+        return 0
+
+    ok, err = validate_ntp_list(value)
+    if not ok:
+        print("[setup] REFUSING invalid NTP value %r: %s" % (ntp_value, err),
+              file=sys.stderr)
+        return 3
+
     os.makedirs(os.path.dirname(conf_path) or ".", exist_ok=True)
     with open(conf_path, "w") as f:
-        f.write("[Time]\nNTP=%s\n" % ntp_value)
+        f.write("[Time]\nNTP=%s\n" % value)
     os.chmod(conf_path, 0o644)
-    if restart:
-        import subprocess as _sp
+
+    # Advisory only: worth telling the operator, never worth refusing over.
+    # Skipped for IP literals, which have nothing to resolve — and on which
+    # gethostbyname() would report a bogus failure for every IPv6 address.
+    first = value.split()[0]
+    if ":" not in first and not _NTP_DIGITS_DOTS_RE.match(first):
         try:
-            _sp.run(["systemctl", "restart", "systemd-timesyncd"],
-                    check=False)
-        except FileNotFoundError:
-            print("[setup] systemctl not found; skipping restart",
-                  file=sys.stderr)
+            socket.gethostbyname(first)
+        except OSError as e:
+            print("[setup] warning: NTP host %r does not resolve yet: %s"
+                  % (first, e), file=sys.stderr)
+
+    if restart:
+        _restart_timesyncd()
     return 0
 
 
@@ -5526,18 +7859,32 @@ def _cli_main(argv):
     if not ok:
         print("[setup] invalid timezone: %s" % err, file=sys.stderr)
         return 2
+    ok, err = validate_ntp(args.ntp)
+    if not ok:
+        print("[setup] invalid ntp: %s" % err, file=sys.stderr)
+        return 2
 
     d = {
         "callsign": args.callsign.upper(),
         "timezone": args.timezone,
         "theme": args.theme,
-        "ntp": args.ntp,
+        "ntp": normalize_ntp(args.ntp),
     }
+    # Re-running setup must not churn the diagnostics report id: reports from
+    # this Pi should still correlate after the operator fixes a typo in their
+    # callsign. Only carried through if one already exists; never created here.
+    prior = load_settings(args.settings_path).get(DEVICE_ID_KEY)
+    if isinstance(prior, str) and prior:
+        d[DEVICE_ID_KEY] = prior
 
     _drop_privileges_if_root()
     write_settings(d, args.settings_path)
-    if args.apply_ntp and args.ntp:
-        rc = _apply_ntp(args.ntp, args.ntp_conf_path,
+    # Deliberately not `and args.ntp`: an empty value is a real instruction
+    # ("go back to the distro defaults"), and _apply_ntp implements it by
+    # removing the drop-in. Gating on truthiness made clearing the setting
+    # impossible from here.
+    if args.apply_ntp:
+        rc = _apply_ntp(d["ntp"], args.ntp_conf_path,
                         restart=not args.no_restart_timesyncd)
         if rc != 0:
             return rc
@@ -6205,6 +8552,480 @@ if __name__ == '__main__':
     main()
 HCTKEOF
 
+# ── Step 4a: Root-executed helper scripts + the version stamp ───────
+#
+# hamclock-update.sh and hamclock-apply-settings.sh are run BY ROOT, started by
+# the systemd units written near the end of this script. The dashboard runs as
+# an unprivileged SERVICE_USER and is granted no sudo whatsoever; the single
+# privileged thing it can do is create an empty flag file under
+# /run/hamclock-lite, which a root-owned path unit notices. That boundary holds
+# only while these two scripts are root-owned and NOT writable by SERVICE_USER
+# — a service user who can edit a script that root executes already has root.
+#
+# So the ownership is asserted after the write rather than inherited from
+# whatever umask is in effect, or from whatever ownership $INSTALL_DIR happens
+# to carry on a Pi that has been hand-fixed at some point in its life.
+assert_root_owned() {
+    # assert_root_owned <file> <expected-octal-mode>
+    local f="$1" want="$2" owner mode
+    owner="$(stat -c '%U:%G' "$f" 2>/dev/null || echo '?')"
+    mode="$(stat -c '%a' "$f" 2>/dev/null || echo '?')"
+    if [ "$owner" != "root:root" ] || [ "$mode" != "$want" ]; then
+        echo "FATAL: $f is owned by $owner with mode $mode; expected root:root $want." >&2
+        echo "Refusing to continue: the unprivileged dashboard user must never be" >&2
+        echo "able to modify a file that systemd executes as root." >&2
+        exit 1
+    fi
+}
+
+echo "Writing root helper scripts..."
+# Delimiters are deliberately not EOF/PY: hamclock-update.sh contains its own
+# `<<EOF` status heredoc and hamclock-apply-settings.sh contains a `<<'PY'`
+# block, either of which would terminate this one early and pipe the rest of
+# the file into the shell. Quoted so nothing inside expands.
+sudo tee "$INSTALL_DIR/hamclock-update.sh" > /dev/null << 'HCUPDATESH'
+#!/bin/bash
+# HamClock Lite updater — runs as root, triggered by an unprivileged request.
+#
+# SECURITY MODEL
+# --------------
+# The dashboard server runs as SERVICE_USER (non-root). Granting it sudo to
+# install software would hand a network-facing process a route to root, so it
+# gets none. Instead it writes an empty flag file, and a root-owned systemd
+# path unit starts this script.
+#
+# The critical property: the unprivileged side can only say "please update".
+# It cannot say WHAT to install. This script does its own fetch, from a URL
+# compiled in below, and refuses to execute anything whose SHA-256 does not
+# match the signed-in-place manifest. A compromised or merely buggy dashboard
+# process therefore cannot cause arbitrary code to run as root.
+#
+# This file must be root:root and NOT writable by SERVICE_USER — if the service
+# user can edit the script that root executes, the whole model collapses.
+# install_updater() in the installer enforces 0755 root:root.
+#
+# Exit codes: 0 ok / 1 usage / 2 network / 3 integrity / 4 apply failed
+#             (rolled back) / 5 apply failed AND rollback failed
+set -o pipefail
+
+BASE_URL="https://hamclock-reborn.org"
+MANIFEST_URL="$BASE_URL/downloads/pi1-install.version.json"
+INSTALLER_URL="$BASE_URL/downloads/pi1-install.sh"
+
+INSTALL_DIR="/opt/hamclock-lite"
+RUN_DIR="/run/hamclock-lite"
+STATE_DIR="/var/lib/hamclock-lite"
+STATUS_FILE="$RUN_DIR/update-status.json"
+REQUEST_FILE="$RUN_DIR/update.request"
+BACKUP_DIR="$STATE_DIR/backup"
+LOG_TAG="hamclock-update"
+
+log() { echo "[$(date -u +%H:%M:%S)] $*"; logger -t "$LOG_TAG" -- "$*" 2>/dev/null || true; }
+
+# Status is written to tmpfs so the dashboard can read it without any shared
+# privilege. Never put anything secret in here.
+write_status() {
+    mkdir -p "$RUN_DIR" 2>/dev/null || true
+    cat > "$STATUS_FILE.tmp" <<EOF
+{"state":"$1","installed":"$2","available":"$3","detail":"$4","checked":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+EOF
+    mv -f "$STATUS_FILE.tmp" "$STATUS_FILE" 2>/dev/null || true
+    chmod 0644 "$STATUS_FILE" 2>/dev/null || true
+}
+
+installed_version() {
+    # The single-file installer has no git, which is the entire reason it
+    # exists, so never ask git. Read what the install stamped.
+    if [ -r "$INSTALL_DIR/VERSION" ]; then
+        sanitize_version "$(tr -d ' \t\r\n' < "$INSTALL_DIR/VERSION")"
+    else
+        echo "0.0.0"
+    fi
+}
+
+# Pure-shell semver compare. Returns 0 when $1 is strictly newer than $2.
+# sort -V would be shorter but is not guaranteed on a minimal Pi OS image.
+version_gt() {
+    local a b i
+    IFS='.' read -r -a a <<< "${1%%-*}"
+    IFS='.' read -r -a b <<< "${2%%-*}"
+    for i in 0 1 2; do
+        local x=${a[$i]:-0} y=${b[$i]:-0}
+        # Strip anything non-numeric so a malformed field cannot inject.
+        x=${x//[^0-9]/}; y=${y//[^0-9]/}
+        x=${x:-0}; y=${y:-0}
+        if [ "$x" -gt "$y" ] 2>/dev/null; then return 0; fi
+        if [ "$x" -lt "$y" ] 2>/dev/null; then return 1; fi
+    done
+    return 1
+}
+
+json_field() {
+    # Extract one string field without needing python/jq on the target.
+    sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<< "$1" | head -1
+}
+
+# Everything below comes off the network. Even though the manifest is served
+# from our own site over TLS, it is parsed by a hand-rolled sed and then
+# interpolated into the JSON status file, so a stray quote would corrupt that
+# file and a stray shell metacharacter has no business being here at all.
+# Whitelist rather than escape.
+sanitize_version() {
+    local v="${1//[^0-9A-Za-z.+-]/}"
+    printf '%s' "${v:0:32}"
+}
+
+# A digest that is not exactly 64 hex characters is not a digest, and treating
+# it as one would let a malformed manifest slip past the integrity gate.
+sanitize_sha256() {
+    local s="${1,,}"
+    s="${s//[^0-9a-f]/}"
+    [ ${#s} -eq 64 ] || return 1
+    printf '%s' "$s"
+}
+
+fetch_manifest() {
+    curl -fsS --max-time 20 --proto '=https' --tlsv1.2 "$MANIFEST_URL" 2>/dev/null
+}
+
+do_check() {
+    local cur mani avail
+    cur=$(installed_version)
+    mani=$(fetch_manifest) || {
+        log "check: manifest unreachable"
+        write_status "error" "$cur" "" "cannot reach $BASE_URL"
+        return 2
+    }
+    avail=$(sanitize_version "$(json_field "$mani" version)")
+    if [ -z "$avail" ]; then
+        log "check: manifest has no version field"
+        write_status "error" "$cur" "" "malformed manifest"
+        return 3
+    fi
+    if version_gt "$avail" "$cur"; then
+        log "check: update available $cur -> $avail"
+        write_status "available" "$cur" "$avail" ""
+    else
+        log "check: up to date ($cur)"
+        write_status "current" "$cur" "$avail" ""
+    fi
+    return 0
+}
+
+health_ok() {
+    # An update that leaves the API dead is a failed update, no matter what
+    # the installer's exit code said.
+    local i
+    for i in $(seq 1 30); do
+        if curl -fsS --max-time 3 http://localhost:8080/api/health >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+do_apply() {
+    local cur mani avail want_sha tmp got_sha
+    cur=$(installed_version)
+
+    mani=$(fetch_manifest) || { write_status "error" "$cur" "" "cannot reach $BASE_URL"; return 2; }
+    avail=$(sanitize_version "$(json_field "$mani" version)")
+    want_sha=$(sanitize_sha256 "$(json_field "$mani" sha256)") || want_sha=""
+    [ -n "$avail" ] || { write_status "error" "$cur" "" "malformed manifest"; return 3; }
+
+    if ! version_gt "$avail" "$cur"; then
+        log "apply: already at $cur, nothing to do"
+        write_status "current" "$cur" "$avail" ""
+        return 0
+    fi
+
+    # An unverifiable download is not installed. Refusing here is the whole
+    # point of the manifest; without the digest this is just curl | bash.
+    if [ -z "$want_sha" ]; then
+        log "apply: REFUSING — manifest carries no sha256"
+        write_status "error" "$cur" "$avail" "manifest has no sha256; refusing to install"
+        return 3
+    fi
+
+    write_status "applying" "$cur" "$avail" "downloading"
+    tmp=$(mktemp /tmp/hamclock-install.XXXXXX.sh) || return 2
+    trap 'rm -f "$tmp"' RETURN
+
+    if ! curl -fsS --max-time 180 --proto '=https' --tlsv1.2 -o "$tmp" "$INSTALLER_URL"; then
+        log "apply: download failed"
+        write_status "error" "$cur" "$avail" "download failed"
+        return 2
+    fi
+
+    got_sha=$(sha256sum "$tmp" | awk '{print $1}')
+    if [ "$got_sha" != "$want_sha" ]; then
+        log "apply: REFUSING — sha256 mismatch (want $want_sha got $got_sha)"
+        write_status "error" "$cur" "$avail" "integrity check failed; nothing installed"
+        return 3
+    fi
+    log "apply: integrity verified ($got_sha)"
+
+    # Back up what we are about to overwrite. A headless kiosk with a broken
+    # display and no keyboard is not somewhere you want to debug an update.
+    rm -rf "$BACKUP_DIR.prev" 2>/dev/null
+    [ -d "$BACKUP_DIR" ] && mv "$BACKUP_DIR" "$BACKUP_DIR.prev"
+    mkdir -p "$BACKUP_DIR"
+    cp -a "$INSTALL_DIR/." "$BACKUP_DIR/" 2>/dev/null || {
+        log "apply: backup failed; refusing to continue without a rollback path"
+        write_status "error" "$cur" "$avail" "backup failed; nothing installed"
+        return 4
+    }
+
+    write_status "applying" "$cur" "$avail" "installing"
+    log "apply: running installer $cur -> $avail"
+    if bash "$tmp" >>/var/log/hamclock-update.log 2>&1 && health_ok; then
+        log "apply: success, now $(installed_version)"
+        write_status "updated" "$(installed_version)" "$avail" "restart complete"
+        maybe_reboot
+        return 0
+    fi
+
+    # Roll back. Restore files first, then prove the service actually recovers.
+    log "apply: FAILED — rolling back to $cur"
+    write_status "rollback" "$cur" "$avail" "update failed; restoring previous version"
+    rm -rf "$INSTALL_DIR.failed" 2>/dev/null
+    mv "$INSTALL_DIR" "$INSTALL_DIR.failed" 2>/dev/null
+    mkdir -p "$INSTALL_DIR"
+    if cp -a "$BACKUP_DIR/." "$INSTALL_DIR/" 2>/dev/null; then
+        systemctl restart hamclock-lite 2>/dev/null
+        if health_ok; then
+            log "rollback: restored $cur and service is healthy"
+            write_status "rolled_back" "$cur" "$avail" "update failed; previous version restored"
+            return 4
+        fi
+    fi
+    log "rollback: FAILED — manual recovery needed; failed tree kept at $INSTALL_DIR.failed"
+    write_status "broken" "$cur" "$avail" "update and rollback both failed; see /var/log/hamclock-update.log"
+    return 5
+}
+
+maybe_reboot() {
+    # Almost nothing this project ships needs a reboot — restarting the two
+    # units is enough, and the installer already does that. Rebooting a kiosk
+    # is disruptive and risks not coming back, so it happens only when
+    # something outside our services genuinely changed.
+    local need=0
+    [ -f /var/run/reboot-required ] && need=1
+    if [ -f "$STATE_DIR/boot-config.sha" ]; then
+        local now
+        now=$(cat /boot/config.txt /boot/cmdline.txt 2>/dev/null | sha256sum | awk '{print $1}')
+        [ "$now" != "$(cat "$STATE_DIR/boot-config.sha")" ] && need=1
+    fi
+    if [ "$need" = "1" ]; then
+        log "reboot: boot configuration changed; rebooting in 10s"
+        write_status "rebooting" "$(installed_version)" "" "boot config changed"
+        ( sleep 10; systemctl reboot ) &
+    else
+        log "reboot: not required; services restarted in place"
+    fi
+}
+
+record_boot_config() {
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    cat /boot/config.txt /boot/cmdline.txt 2>/dev/null \
+        | sha256sum | awk '{print $1}' > "$STATE_DIR/boot-config.sha" 2>/dev/null || true
+}
+
+case "${1:-}" in
+    --check)
+        record_boot_config
+        do_check
+        ;;
+    --apply)
+        rm -f "$REQUEST_FILE" 2>/dev/null    # consume the trigger first, so a
+                                             # failure cannot spin the path unit
+        record_boot_config
+        do_apply
+        ;;
+    *)
+        echo "usage: $0 --check | --apply" >&2
+        exit 1
+        ;;
+esac
+HCUPDATESH
+sudo tee "$INSTALL_DIR/hamclock-apply-settings.sh" > /dev/null << 'HCSETTINGSSH'
+#!/bin/bash
+# Apply the parts of settings.json that need root. Runs as root, triggered by
+# an unprivileged request, exactly like hamclock-update.sh.
+#
+# Right now that means the NTP server. The on-device setup wizard runs as
+# SERVICE_USER and can write /etc/hamclock-lite/settings.json, but the thing
+# that actually changes the clock source is
+# /etc/systemd/timesyncd.conf.d/hamclock.conf, which is root-owned. Rather than
+# grant the wizard sudo, it saves its choice and asks for it to be applied.
+#
+# SECURITY: settings.json is writable by an unprivileged user, and this script
+# takes a value out of it and puts it into a systemd unit config as root. That
+# is a privilege boundary, so the value is validated against a strict whitelist
+# HERE, before it is trusted — never on the assumption that the wizard already
+# checked. A hostile settings.json must not be able to inject directives.
+#
+# Exit codes: 0 applied / 1 usage / 2 no/!readable settings / 3 invalid value
+set -o pipefail
+
+SETTINGS="/etc/hamclock-lite/settings.json"
+CONF="/etc/systemd/timesyncd.conf.d/hamclock.conf"
+RUN_DIR="/run/hamclock-lite"
+REQUEST_FILE="$RUN_DIR/settings.request"
+STATUS_FILE="$RUN_DIR/settings-status.json"
+LOG_TAG="hamclock-settings"
+
+log() { echo "[$(date -u +%H:%M:%S)] $*"; logger -t "$LOG_TAG" -- "$*" 2>/dev/null || true; }
+
+write_status() {
+    mkdir -p "$RUN_DIR" 2>/dev/null || true
+    printf '{"state":"%s","ntp":"%s","detail":"%s","at":"%s"}\n' \
+        "$1" "$2" "$3" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATUS_FILE.tmp" 2>/dev/null
+    mv -f "$STATUS_FILE.tmp" "$STATUS_FILE" 2>/dev/null || true
+    chmod 0644 "$STATUS_FILE" 2>/dev/null || true
+}
+
+# One NTP server: a hostname or an IPv4/IPv6 literal. Deliberately strict —
+# no spaces, no '#', no '=', no newlines, nothing that could start a second
+# directive inside timesyncd.conf.
+valid_one() {
+    local s="$1"
+    [ -n "$s" ] || return 1
+    [ ${#s} -le 253 ] || return 1
+    [[ "$s" =~ ^[A-Za-z0-9]([A-Za-z0-9.:-]*[A-Za-z0-9])?$ ]] || return 1
+    # A bare run of digits and dots that is not a valid IPv4 is a typo, not a
+    # hostname; catching it here beats a silently broken time source.
+    if [[ "$s" =~ ^[0-9.]+$ ]]; then
+        local IFS=. o n=0
+        for o in $s; do
+            [[ "$o" =~ ^[0-9]{1,3}$ ]] || return 1
+            [ "$o" -le 255 ] || return 1
+            n=$((n+1))
+        done
+        [ "$n" -eq 4 ] || return 1
+    fi
+    return 0
+}
+
+# systemd's NTP= takes a space-separated list, which is how an operator
+# specifies fallbacks. Every element must pass on its own.
+valid_ntp_list() {
+    local v="$1" one
+    [ -n "$v" ] || return 1
+    [ ${#v} -le 512 ] || return 1
+    for one in $v; do
+        valid_one "$one" || return 1
+    done
+    return 0
+}
+
+read_ntp() {
+    # No jq on a minimal Pi OS image, and python3 is guaranteed here because
+    # the whole application is written in it.
+    python3 - "$SETTINGS" <<'PY' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        v = json.load(f).get("ntp", "")
+    print(v if isinstance(v, str) else "")
+except Exception:
+    print("")
+PY
+}
+
+apply_ntp() {
+    local ntp
+    [ -r "$SETTINGS" ] || { log "no readable $SETTINGS"; return 2; }
+    ntp=$(read_ntp)
+
+    if [ -z "$ntp" ]; then
+        # Empty means "use the distro default". Remove our drop-in rather than
+        # writing an empty NTP= line, which systemd treats as a parse error.
+        # (The old python path validated with gethostbyname alone, and
+        # gethostbyname("") RESOLVES — so an empty value used to sail through
+        # and produce exactly that broken config.)
+        if [ -f "$CONF" ]; then
+            rm -f "$CONF"
+            log "ntp cleared; removed $CONF and reverted to distro defaults"
+            systemctl restart systemd-timesyncd 2>/dev/null
+        fi
+        write_status "cleared" "" "using distro default time servers"
+        return 0
+    fi
+
+    if ! valid_ntp_list "$ntp"; then
+        log "REFUSING invalid ntp value from settings.json"
+        write_status "invalid" "" "rejected; not a valid host or address list"
+        return 3
+    fi
+
+    # Normalise whitespace before writing. Word-splitting already treats a tab
+    # or a run of spaces as a separator, so 'a.com<TAB>b' validates as the
+    # two-server list it is — but the config file should record it as one clean
+    # space-separated line rather than echoing whatever spacing was in the JSON.
+    ntp=$(echo $ntp)
+
+    mkdir -p "$(dirname "$CONF")" 2>/dev/null
+    printf '[Time]\nNTP=%s\n' "$ntp" > "$CONF.tmp" || return 2
+    chmod 0644 "$CONF.tmp"
+    mv -f "$CONF.tmp" "$CONF" || return 2
+    log "ntp set to '$ntp'"
+
+    if systemctl restart systemd-timesyncd 2>/dev/null; then
+        # Resolution is checked AFTER saving, not before. An operator setting an
+        # internal time server on a network that is not up yet must still be
+        # able to configure it; a name that does not resolve is worth reporting,
+        # not worth refusing.
+        local first="${ntp%% *}"
+        if getent hosts "$first" >/dev/null 2>&1; then
+            write_status "applied" "$ntp" "timesyncd restarted"
+        else
+            write_status "applied" "$ntp" "saved, but '$first' does not resolve yet"
+            log "warning: '$first' does not currently resolve"
+        fi
+    else
+        write_status "applied" "$ntp" "saved; could not restart timesyncd"
+    fi
+    return 0
+}
+
+case "${1:-}" in
+    --apply)
+        rm -f "$REQUEST_FILE" 2>/dev/null   # consume the trigger first so a
+                                            # failure cannot re-arm the path unit
+        apply_ntp
+        ;;
+    --validate)
+        # For tests and for the wizard to shell out to if it wants a check.
+        valid_ntp_list "${2:-}" && { echo valid; exit 0; } || { echo invalid; exit 3; }
+        ;;
+    *)
+        echo "usage: $0 --apply | --validate <value>" >&2
+        exit 1
+        ;;
+esac
+HCSETTINGSSH
+
+for _hc_root in hamclock-update.sh hamclock-apply-settings.sh; do
+    sudo chown root:root "$INSTALL_DIR/$_hc_root"
+    sudo chmod 0755 "$INSTALL_DIR/$_hc_root"
+    assert_root_owned "$INSTALL_DIR/$_hc_root" 755
+done
+
+# installed_version() in hamclock-update.sh reads this file and nothing else.
+# It deliberately never asks git — this single-file installer exists precisely
+# for Pis with no checkout — so the version has to be baked into the installer
+# text itself. scripts/sync_installers.py stamps it from the repo VERSION file
+# and --check fails the build if the two drift.
+sudo tee "$INSTALL_DIR/VERSION" > /dev/null << 'HCVERSIONTXT'
+1.0.0
+HCVERSIONTXT
+sudo chown root:root "$INSTALL_DIR/VERSION"
+sudo chmod 0644 "$INSTALL_DIR/VERSION"
+assert_root_owned "$INSTALL_DIR/VERSION" 644
+echo "Installed version: $(cat "$INSTALL_DIR/VERSION")"
+
 # ── Step 4b: Remove stale files left by earlier versions ────────────
 # $INSTALL_DIR is owned exclusively by this installer, so any program file in it
 # that we no longer ship is a leftover from an older version.
@@ -6222,7 +9043,11 @@ HCTKEOF
 # stale and are not touched here.
 #
 # Set HAMCLOCK_SKIP_CLEAN=1 to skip this step.
-HAMCLOCK_SHIPPED_FILES="server.py index.html hamclock_data.py hamclock_pygame.py hamclock_tkinter.py kiosk.sh"
+# hamclock-update.sh and hamclock-apply-settings.sh MUST be listed: the sweep
+# below deletes every *.sh in $INSTALL_DIR that is not shipped, so omitting them
+# would delete the two root helpers moments after installing them and leave the
+# path units pointing at nothing.
+HAMCLOCK_SHIPPED_FILES="server.py index.html hamclock_data.py hamclock_pygame.py hamclock_tkinter.py kiosk.sh hamclock-update.sh hamclock-apply-settings.sh VERSION"
 
 cleanup_stale_install() {
     if [ "${HAMCLOCK_SKIP_CLEAN:-0}" = "1" ]; then
@@ -6314,6 +9139,19 @@ Type=simple
 User=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR
 CacheDirectory=hamclock-lite
+# The request directory for the privilege boundary. The dashboard's ONLY
+# privileged action is creating an empty flag file in here; the root path units
+# watch for it. RuntimeDirectory= makes systemd create /run/hamclock-lite owned
+# by this same User=, so the service user can write flag files while the status
+# files root drops alongside them stay root-owned.
+# It has to be systemd's job rather than a one-time mkdir at install: /run is a
+# tmpfs and is empty again after every reboot.
+# Preserve=yes keeps the directory across a restart of THIS unit — the updater
+# restarts hamclock-lite mid-apply, and without it the directory and the status
+# file the dashboard is polling would disappear underneath the update.
+RuntimeDirectory=hamclock-lite
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
 $LITE_PYGAME_ENV
 $LITE_PYGAME_PRE
 ExecStart=/usr/bin/python3 $INSTALL_DIR/server.py
@@ -6718,10 +9556,163 @@ if [ -n "$BOOT_CONFIG" ]; then
     grep -q "hdmi_drive" "$BOOT_CONFIG" || sudo sh -c "echo 'hdmi_drive=2' >> $BOOT_CONFIG"
 fi
 
+# ── Step 11b: Root-owned update / settings units ────────────────────
+# The root half of the privilege model: two path units watching for the flag
+# files the dashboard is allowed to create, the services they trigger, the
+# daily check timer, and the boot-time NTP applier.
+HAMCLOCK_ROOT_UNITS="hamclock-update.path hamclock-update.service hamclock-update-check.timer hamclock-update-check.service hamclock-apply-settings.path hamclock-apply-settings.service hamclock-apply-settings-boot.service"
+# Only these four are activated directly. The three left out are *triggered*
+# units — a .path or the .timer starts them. Enabling a triggered unit would
+# additionally run it unconditionally at every boot, which for
+# hamclock-update.service means attempting an update on every reboot.
+HAMCLOCK_ENABLE_UNITS="hamclock-update-check.timer hamclock-update.path hamclock-apply-settings.path hamclock-apply-settings-boot.service"
+
+enable_hamclock_root_units() {
+    sudo systemctl daemon-reload
+    local _u
+    for _u in $HAMCLOCK_ENABLE_UNITS; do
+        sudo systemctl enable "$_u"
+        # A unit that will not start right now (no network yet, no settings
+        # file yet) is not a reason to fail the install — it is enabled, and
+        # the next boot will run it.
+        sudo systemctl start "$_u" \
+            || echo "note: $_u did not start now; it is enabled and runs at boot" >&2
+    done
+}
+
+echo "Installing update/settings systemd units..."
+sudo mkdir -p /etc/systemd/system
+sudo tee "/etc/systemd/system/hamclock-update.path" > /dev/null << 'HCUNIT_UPDATE_PATH'
+[Unit]
+Description=HamClock Lite update request watcher
+# This is the privilege boundary. The dashboard runs as an unprivileged user and
+# is granted no sudo at all; the single thing it can do is create this empty
+# file. systemd (as root) notices and starts the updater, which then decides for
+# itself what to install and verifies it. The unprivileged side can ask for an
+# update but can never choose its contents.
+
+[Path]
+PathExists=/run/hamclock-lite/update.request
+Unit=hamclock-update.service
+
+[Install]
+WantedBy=multi-user.target
+HCUNIT_UPDATE_PATH
+sudo tee "/etc/systemd/system/hamclock-update.service" > /dev/null << 'HCUNIT_UPDATE_SERVICE'
+[Unit]
+Description=HamClock Lite update apply
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as root: it writes /opt/hamclock-lite, rewrites units, and may reboot.
+# The script consumes the request file first thing, so a crash cannot leave the
+# path unit re-triggering in a loop.
+ExecStart=/opt/hamclock-lite/hamclock-update.sh --apply
+# Long enough for a slow ARMv6 download plus install plus the health probe.
+TimeoutStartSec=900
+HCUNIT_UPDATE_SERVICE
+sudo tee "/etc/systemd/system/hamclock-update-check.timer" > /dev/null << 'HCUNIT_CHECK_TIMER'
+[Unit]
+Description=HamClock Lite daily update check
+Documentation=file:///opt/hamclock-lite/docs/versioning.md
+
+[Timer]
+# 07:00 local time, every day.
+OnCalendar=*-*-* 07:00:00
+# The Pi 1 has NO RTC. If the box was powered off at 07:00 — or the clock was
+# still wrong at 07:00 because NTP had not synced yet — Persistent makes systemd
+# run the check as soon as it can instead of silently skipping a day.
+Persistent=true
+# Nothing else is contending at 07:00, but a spread keeps a shack full of Pis
+# from hitting the site in the same second.
+RandomizedDelaySec=900
+AccuracySec=1m
+Unit=hamclock-update-check.service
+
+[Install]
+WantedBy=timers.target
+HCUNIT_CHECK_TIMER
+sudo tee "/etc/systemd/system/hamclock-update-check.service" > /dev/null << 'HCUNIT_CHECK_SERVICE'
+[Unit]
+Description=HamClock Lite update check (writes status, installs nothing)
+# Checking before the clock is right produces a bogus "checked" timestamp, and
+# TLS certificate validation itself fails when the date is wildly wrong — which
+# on an RTC-less Pi 1 is the normal state for the first minute after boot.
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# --check only ever fetches a small manifest and writes a status file.
+# It cannot install anything; that is a separate unit with a separate trigger.
+ExecStart=/opt/hamclock-lite/hamclock-update.sh --check
+TimeoutStartSec=120
+Nice=19
+IOSchedulingClass=idle
+HCUNIT_CHECK_SERVICE
+sudo tee "/etc/systemd/system/hamclock-apply-settings.path" > /dev/null << 'HCUNIT_SETTINGS_PATH'
+[Unit]
+Description=HamClock Lite settings-apply request watcher
+# Same privilege boundary as the updater: the setup wizard runs as an
+# unprivileged user and can save settings.json, but the NTP source lives in a
+# root-owned timesyncd drop-in. The wizard creates this empty file to ask; root
+# reads the value, re-validates it from scratch, and applies it.
+
+[Path]
+PathExists=/run/hamclock-lite/settings.request
+Unit=hamclock-apply-settings.service
+
+[Install]
+WantedBy=multi-user.target
+HCUNIT_SETTINGS_PATH
+sudo tee "/etc/systemd/system/hamclock-apply-settings.service" > /dev/null << 'HCUNIT_SETTINGS_SERVICE'
+[Unit]
+Description=HamClock Lite apply root-owned settings (NTP)
+# No network ordering on purpose: an operator must be able to configure an
+# internal time server before that network is reachable. The script saves the
+# value regardless and only reports whether it resolves.
+
+[Service]
+Type=oneshot
+ExecStart=/opt/hamclock-lite/hamclock-apply-settings.sh --apply
+TimeoutStartSec=120
+HCUNIT_SETTINGS_SERVICE
+sudo tee "/etc/systemd/system/hamclock-apply-settings-boot.service" > /dev/null << 'HCUNIT_SETTINGS_BOOT'
+[Unit]
+Description=HamClock Lite apply NTP setting at boot
+ConditionPathExists=/etc/hamclock-lite/settings.json
+# NOTE: do NOT add Before=systemd-timesyncd.service. timesyncd is pulled in by
+# sysinit.target, and this unit is WantedBy=multi-user.target which is ordered
+# after it — so Before= forms a cycle, and systemd breaks that cycle by DELETING
+# the timesyncd start job. On a Pi 1 with no RTC that means no time sync at all,
+# which then breaks TLS, the update check, and every timestamp on the box.
+# (systemd-analyze verify catches this; keep it in the pre-ship checks.)
+# Applying the drop-in late and restarting timesyncd is correct and cycle-free.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/hamclock-lite/hamclock-apply-settings.sh --apply
+
+[Install]
+WantedBy=multi-user.target
+HCUNIT_SETTINGS_BOOT
+
+for _hc_unit in $HAMCLOCK_ROOT_UNITS; do
+    sudo chown root:root "/etc/systemd/system/$_hc_unit"
+    sudo chmod 0644 "/etc/systemd/system/$_hc_unit"
+    assert_root_owned "/etc/systemd/system/$_hc_unit" 644
+done
+enable_hamclock_root_units
+
 # ── Step 12: Enable and start both services ─────────────────────────
 sudo systemctl daemon-reload
 sudo systemctl enable hamclock-lite hamclock-kiosk
-# Always restart to pick up any file changes
+# Always restart to pick up any file changes. This is also what gives
+# /run/hamclock-lite its RuntimeDirectory= ownership on an upgrade of a Pi
+# whose hamclock-lite unit predates that setting.
 sudo systemctl restart hamclock-lite
 sudo systemctl restart hamclock-kiosk
 

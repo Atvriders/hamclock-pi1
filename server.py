@@ -89,6 +89,172 @@ MUF_URL = 'https://prop.kc2g.com/renders/current/mufd-normal-now.svg'
 
 
 # ---------------------------------------------------------------------------
+# Diagnostics counters — the read side is GET /api/diagnostics
+#
+# The maintainer owns no ARMv6 hardware, so every Pi figure in this project is
+# extrapolated from x86 and unverified. These counters exist to answer the
+# questions that extrapolation cannot: is the 45 s rasterize budget actually
+# firing, is the conditional GET actually producing 304s, did the disk cache
+# come back warm.
+#
+# Rules every counter here follows:
+#   * plain module-level ints/floats updated at call sites that ALREADY exist.
+#     No new threads, no locks, no work added to a request path.
+#   * every dict is created with its complete key set and never grows, so the
+#     handler thread can copy one while the fetcher thread writes values into
+#     it. A dict that could gain a key mid-copy would raise RuntimeError
+#     ("changed size during iteration") inside the diagnostics handler.
+#   * nothing in here is transmitted by itself. /api/diagnostics is a local
+#     read; the operator's explicit press is what sends anything anywhere.
+# ---------------------------------------------------------------------------
+
+_BOOT_EPOCH = time.time()
+_BOOT_MONOTONIC = time.monotonic()
+
+# Rasterize outcome counts since boot. The whole point of splitting timeout
+# from fail: a timeout means PHASE2_TIMEOUT_S/_muf_timeout() is too low for
+# this hardware, a fail means cairosvg or cpulimit is broken/absent. They are
+# indistinguishable in the log line, which prints "rasterize failed" for both.
+_MUF_RASTERIZE_OK = 0
+_MUF_RASTERIZE_TIMEOUT = 0
+_MUF_RASTERIZE_FAIL = 0
+
+# Wall clock of the last SUCCESSFUL rasterize, and the budget that was in
+# force the last time one timed out (i.e. the number that fired).
+_MUF_LAST_RENDER_S = None
+_MUF_LAST_TIMEOUT_BUDGET_S = None
+
+# Byte sizes from the last rasterize attempt. slim_bytes is None when
+# _slim_muf_svg declined the document (upstream re-render), which is exactly
+# the case where the render cost doubles.
+_MUF_LAST_SVG_BYTES = None
+_MUF_LAST_SLIM_BYTES = None
+_MUF_LAST_PNG_BYTES = None
+_MUF_SLIM_OK = 0
+_MUF_SLIM_DECLINED = 0
+_MUF_UNSLIMMED_RETRIES = 0
+
+# What /api/muf-map last wrote to a client: 'png', 'svg' or 'none' (503).
+# Distinct from _MUF_PNG_SOURCE, which says where the PNG we hold came from
+# ('live' = rendered here, 'disk' = restored at boot).
+_MUF_LAST_SERVED = 'none'
+
+# Filled by _load_persisted() at boot, before any thread starts. A tuple, not
+# a mutable set, so the handler never observes it half-built.
+_DISK_RESTORED = ()
+_BOOT_DISK_WARM = False
+
+# One entry per fetcher. 'hamqsl' covers both solar and bands (one XML).
+_FETCH_NAMES = ('hamqsl', 'dx', 'muf', 'sdo', 'enlil', 'drap', 'real_drap')
+
+# product -> (CACHE payload key, CACHE stamp key). The five image products,
+# in the same order as _PERSIST_KEYS.
+_DIAG_PRODUCTS = (
+    ('muf', 'muf_image_png', 'muf_image_png_updated'),
+    ('sdo', 'solar_image', 'solar_image_updated'),
+    ('enlil', 'enlil_image', 'enlil_image_updated'),
+    ('drap', 'drap_image', 'drap_image_updated'),
+    ('real_drap', 'real_drap_image', 'real_drap_image_updated'),
+)
+
+
+def _new_fetch_stat():
+    """Fixed key set — see the no-resize rule above."""
+    return {
+        'last_ms': None,
+        'last_status': None,
+        'last_error': None,
+        'last_at': None,
+        'consecutive_failures': 0,
+        'ok': 0,
+        'not_modified': 0,
+        'errors': 0,
+    }
+
+
+_FETCH_STATS = {name: _new_fetch_stat() for name in _FETCH_NAMES}
+
+# name -> seconds from process start to the first fetch that came back with
+# usable data. Pre-seeded with every name so the dict never resizes.
+_FIRST_OK_S = {name: None for name in _FETCH_NAMES}
+
+
+def _diag_error_name(error):
+    """A short, safe label for a failure.
+
+    Deliberately the exception TYPE, never str(e): an exception message can
+    carry a proxy URL with credentials in it, and this structure is what the
+    operator transmits.
+    """
+    if error is None:
+        return None
+    if isinstance(error, HTTPError):
+        try:
+            return 'HTTPError:%d' % int(error.code)
+        except Exception:
+            return 'HTTPError'
+    if isinstance(error, BaseException):
+        return type(error).__name__
+    return str(error)[:40]
+
+
+def _diag_fetch(name, status, started, error=None):
+    """Record the outcome of ONE fetcher call. MUST NOT RAISE.
+
+    Called from the fetcher thread only, at the points where the fetchers
+    already return or log. `started` is a time.monotonic() reading taken at
+    the top of the fetcher.
+
+    `status` is one of:
+      'ok'            — we now hold new bytes.
+      'not_modified'  — upstream confirmed (304) the copy we already hold.
+      'error'         — nothing usable came back.
+
+    The first two are both successes for boot timing: a 304 means the panel
+    has current data, which is the question first_ok_s is asked to answer.
+
+    For fetch_muf this records the HTTP exchange only, stamped BEFORE the
+    rasterize — the rasterize has its own three counters and its own wall
+    clock, and folding a 45 s render into 'last_ms' would hide the fetch.
+    """
+    try:
+        stat = _FETCH_STATS.get(name)
+        if stat is None:
+            return
+        stat['last_ms'] = int(max(0.0, time.monotonic() - started) * 1000)
+        stat['last_status'] = status
+        stat['last_at'] = time.time()
+        if status == 'error':
+            stat['errors'] += 1
+            stat['consecutive_failures'] += 1
+            stat['last_error'] = _diag_error_name(error)
+            return
+        stat['consecutive_failures'] = 0
+        stat['last_error'] = None
+        if status == 'not_modified':
+            stat['not_modified'] += 1
+        else:
+            stat['ok'] += 1
+        if _FIRST_OK_S.get(name) is None:
+            _FIRST_OK_S[name] = round(
+                max(0.0, time.monotonic() - _BOOT_MONOTONIC), 1)
+    except Exception:
+        # A diagnostics counter may never be the reason a fetch is lost.
+        pass
+
+
+def _note_muf_served(kind):
+    """Remember what /api/muf-map last wrote ('png' / 'svg' / 'none').
+
+    A module-level function so the handler branch stays free of a `global`
+    declaration; the cost on that path is one call and one store, on an
+    endpoint the client hits about once every 15 minutes.
+    """
+    global _MUF_LAST_SERVED
+    _MUF_LAST_SERVED = kind
+
+
+# ---------------------------------------------------------------------------
 # Tier 2.1 — disk persistence for the five image products
 #
 # CACHE is RAM-only, so every restart (and every power cut on a box with no
@@ -278,7 +444,7 @@ def _load_persisted():
     tell the operator how old the picture is, and stamping now() would make a
     week-old map claim to be seconds fresh.
     """
-    global _MUF_PNG_SOURCE
+    global _MUF_PNG_SOURCE, _DISK_RESTORED, _BOOT_DISK_WARM
     loaded = []
     try:
         entries = _read_manifest().get('entries') or {}
@@ -329,6 +495,11 @@ def _load_persisted():
                   f'cached image(s) from {CACHE_DIR}: {", ".join(loaded)}')
     except Exception as e:
         print(f'[{time.strftime("%H:%M:%S")}] cache restore failed: {e}')
+    # Rebound (not mutated) so the diagnostics handler can never see this
+    # half-built, and stamped even on the failure path so a restore that blew
+    # up reports an honest "cold".
+    _DISK_RESTORED = tuple(loaded)
+    _BOOT_DISK_WARM = bool(loaded)
     return loaded
 
 
@@ -650,6 +821,8 @@ def _muf_timeout():
 
 def _rasterize_once(payload, timeout_s):
     """One cpulimit+cairosvg subprocess round trip. None on any failure."""
+    global _MUF_RASTERIZE_OK, _MUF_RASTERIZE_TIMEOUT, _MUF_RASTERIZE_FAIL
+    global _MUF_LAST_TIMEOUT_BUDGET_S
     argv = ['cpulimit', '-l', '50', '-q', '--',
             'python3', '-c',
             'import sys, cairosvg; cairosvg.svg2png('
@@ -675,9 +848,23 @@ def _rasterize_once(payload, timeout_s):
             raise
         if p.returncode:
             raise subprocess.CalledProcessError(p.returncode, argv, output=out)
+        # A zero exit with an empty stdout is still a failed render as far as
+        # every caller is concerned (`if out:`), so count it as one.
+        if out:
+            _MUF_RASTERIZE_OK += 1
+        else:
+            _MUF_RASTERIZE_FAIL += 1
         return out
     # FileNotFoundError (cpulimit not installed) is an OSError subclass.
     except (subprocess.SubprocessError, OSError) as e:
+        # The log line below says "rasterize failed" for a 45 s timeout and
+        # for a missing cpulimit alike. Splitting the two counters is what
+        # tells the maintainer which one the Pi is actually hitting.
+        if isinstance(e, subprocess.TimeoutExpired):
+            _MUF_RASTERIZE_TIMEOUT += 1
+            _MUF_LAST_TIMEOUT_BUDGET_S = timeout_s
+        else:
+            _MUF_RASTERIZE_FAIL += 1
         print('[muf] rasterize failed: %s' % e, file=sys.stderr)
         return None
     finally:
@@ -715,9 +902,24 @@ def _rasterize_muf(svg_bytes):
     Returns the PNG bytes, or None on subprocess error / timeout /
     missing cpulimit / cairosvg ImportError inside the child.
     """
+    global _MUF_LAST_RENDER_S, _MUF_LAST_SVG_BYTES, _MUF_LAST_SLIM_BYTES
+    global _MUF_LAST_PNG_BYTES, _MUF_SLIM_OK, _MUF_SLIM_DECLINED
+    global _MUF_UNSLIMMED_RETRIES
+
     timeout_s = _muf_timeout()
     slimmed = _slim_muf_svg(svg_bytes)
     payload = slimmed if slimmed else svg_bytes
+
+    # Slimmed vs original is the lever on render cost (257 <use> -> 114,
+    # 1157 ms -> 561 ms on x86). If a future upstream re-render makes
+    # _slim_muf_svg decline, slim_bytes goes null and the render doubles —
+    # this is where that shows up.
+    _MUF_LAST_SVG_BYTES = len(svg_bytes) if svg_bytes else 0
+    _MUF_LAST_SLIM_BYTES = len(slimmed) if slimmed else None
+    if slimmed:
+        _MUF_SLIM_OK += 1
+    else:
+        _MUF_SLIM_DECLINED += 1
 
     started = time.monotonic()
     out = _rasterize_once(payload, timeout_s)
@@ -725,6 +927,8 @@ def _rasterize_muf(svg_bytes):
 
     if out:
         _record_muf_render(elapsed)
+        _MUF_LAST_RENDER_S = round(elapsed, 3)
+        _MUF_LAST_PNG_BYTES = len(out)
         return out
 
     # Tier 2.3 safety net: if the SLIMMED payload failed quickly, that is a
@@ -737,10 +941,14 @@ def _rasterize_muf(svg_bytes):
     if slimmed and elapsed < timeout_s * 0.5:
         print('[muf] slimmed SVG did not render in %.1fs; retrying unslimmed'
               % elapsed, file=sys.stderr)
+        _MUF_UNSLIMMED_RETRIES += 1
         started = time.monotonic()
         out = _rasterize_once(svg_bytes, timeout_s)
         if out:
-            _record_muf_render(time.monotonic() - started)
+            retry_elapsed = time.monotonic() - started
+            _record_muf_render(retry_elapsed)
+            _MUF_LAST_RENDER_S = round(retry_elapsed, 3)
+            _MUF_LAST_PNG_BYTES = len(out)
             return out
     return None
 
@@ -812,6 +1020,7 @@ def lookup_callsign(call):
 
 def fetch_hamqsl():
     """Fetch solar and band data from HamQSL XML"""
+    started = time.monotonic()
     try:
         req = Request('https://www.hamqsl.com/solarxml.php', headers={'User-Agent': UA})
         # Tier 1b perf: 8 s is well above HamQSL's median response (~1 s);
@@ -822,6 +1031,7 @@ def fetch_hamqsl():
         root = ElementTree.fromstring(xml_data)
         sd = root.find('.//solardata')
         if sd is None:
+            _diag_fetch('hamqsl', 'error', started, 'no_solardata')
             return
 
         def gt(tag, default=''):
@@ -871,8 +1081,10 @@ def fetch_hamqsl():
         stamp = time.time()
         CACHE['solar_updated'] = stamp
         CACHE['bands_updated'] = stamp
+        _diag_fetch('hamqsl', 'ok', started)
         print(f'[{time.strftime("%H:%M:%S")}] Solar/bands updated: SFI={solar["sfi"]} Kp={solar["kIndex"]}')
     except Exception as e:
+        _diag_fetch('hamqsl', 'error', started, e)
         print(f'[{time.strftime("%H:%M:%S")}] HamQSL fetch failed: {e}')
 
 
@@ -916,6 +1128,11 @@ def fetch_dx():
         'https://www.hamqth.com/dxc_csv.php?limit=15',
         'https://www.ha8tks.hu/dx/dxc_csv.php?limit=15',
     ]
+    # One diagnostics record per CALL, not per URL: recording inside the loop
+    # would count a primary failure that the fallback rescued as a fetch
+    # failure, and inflate consecutive_failures by 2 per cycle when both fail.
+    started = time.monotonic()
+    last_error = None
     for url in urls:
         try:
             req = Request(url, headers={'User-Agent': UA})
@@ -961,10 +1178,13 @@ def fetch_dx():
                 # is the ETag and a request racing between the two would be
                 # 304'd against a body it never received.
                 CACHE['dx_updated'] = time.time()
+                _diag_fetch('dx', 'ok', started)
                 print(f'[{time.strftime("%H:%M:%S")}] DX spots updated: {len(spots)} spots from {url.split("/")[2]}')
                 return
         except Exception as e:
+            last_error = e
             print(f'[{time.strftime("%H:%M:%S")}] DX fetch failed ({url.split("/")[2]}): {e}')
+    _diag_fetch('dx', 'error', started, last_error)
     print(f'[{time.strftime("%H:%M:%S")}] All DX sources failed')
 
 
@@ -988,6 +1208,10 @@ def fetch_muf():
     the wire with gzip, 0 B on a 304).
     """
     global _MUF_PNG_SOURCE
+    # Stamped before the rasterize on every path below, so fetch.muf.last_ms
+    # is the HTTP exchange only. The render has its own wall clock
+    # (muf.last_render_s) and its own three outcome counters.
+    started = time.monotonic()
     try:
         data, not_modified = _conditional_get(MUF_URL, timeout=20)
         if not_modified:
@@ -997,18 +1221,25 @@ def fetch_muf():
             # strand /api/muf-map on 503 permanently, because the only code
             # path that renders is the one that just returned early.
             if CACHE.get('muf_image_png'):
+                _diag_fetch('muf', 'not_modified', started)
                 print(f'[{time.strftime("%H:%M:%S")}] MUF map unchanged (304)')
                 return
             data = CACHE.get('muf_image')
             if not data:
+                # A validator with nothing behind it: the map is missing and
+                # upstream will keep telling us it has not changed. Counted as
+                # an error, not a 304, because no data reached the panel.
+                _diag_fetch('muf', 'error', started, '304_no_body')
                 print(f'[{time.strftime("%H:%M:%S")}] MUF map unchanged (304), '
                       f'nothing cached to rasterize')
                 return
+            _diag_fetch('muf', 'not_modified', started)
             print(f'[{time.strftime("%H:%M:%S")}] MUF map unchanged (304), '
                   f're-rasterizing the cached SVG')
         else:
             CACHE['muf_image'] = data
             CACHE['muf_image_updated'] = time.time()
+            _diag_fetch('muf', 'ok', started)
         # The PNG inherits the SVG's epoch, not now(): re-rendering a
         # six-hour-old SVG must not make the map claim to be fresh, or the
         # /api/health age label (and MUF_STALE_MAX_S) start lying.
@@ -1035,6 +1266,7 @@ def fetch_muf():
                 print(f'[{time.strftime("%H:%M:%S")}] MUF map updated '
                       f'({len(data)} B SVG, PNG rasterize failed)')
     except Exception as e:
+        _diag_fetch('muf', 'error', started, e)
         print(f'[{time.strftime("%H:%M:%S")}] MUF map fetch failed: {e}')
 
 
@@ -1062,6 +1294,9 @@ def fetch_enlil():
         'https://services.swpc.noaa.gov/images/animations/enlil/latest.jpg',
         'https://services.swpc.noaa.gov/products/animations/enlil.json',
     ]
+    # One record per call — see the note in fetch_dx.
+    started = time.monotonic()
+    last_error = None
     for url in urls:
         try:
             data, not_modified = _conditional_get(url, timeout=20)
@@ -1069,6 +1304,7 @@ def fetch_enlil():
                 if _note_unchanged('Enlil', 'enlil_image', url):
                     # return, not continue: falling through would re-download
                     # the same product from the fallback URL every cycle.
+                    _diag_fetch('enlil', 'not_modified', started)
                     return
                 continue
             if url.endswith('.json'):
@@ -1090,10 +1326,13 @@ def fetch_enlil():
             CACHE['enlil_image'] = data
             CACHE['enlil_image_updated'] = time.time()
             _persist('enlil_image')
+            _diag_fetch('enlil', 'ok', started)
             print(f'[{time.strftime("%H:%M:%S")}] Enlil updated ({len(data)} bytes)')
             return
         except Exception as e:
+            last_error = e
             print(f'[{time.strftime("%H:%M:%S")}] Enlil fetch failed ({url}): {e}')
+    _diag_fetch('enlil', 'error', started, last_error)
 
 
 def fetch_drap():
@@ -1102,11 +1341,15 @@ def fetch_drap():
         'https://services.swpc.noaa.gov/images/aurora-forecast-northern-hemisphere.jpg',
         'https://services.swpc.noaa.gov/images/swx-overview-large.gif',
     ]
+    # One record per call — see the note in fetch_dx.
+    started = time.monotonic()
+    last_error = None
     for url in urls:
         try:
             data, not_modified = _conditional_get(url, timeout=20)
             if not_modified:
                 if _note_unchanged('Aurora', 'drap_image', url):
+                    _diag_fetch('drap', 'not_modified', started)
                     return
                 continue
             if not data:
@@ -1114,13 +1357,16 @@ def fetch_drap():
             CACHE['drap_image'] = data
             CACHE['drap_image_updated'] = time.time()
             _persist('drap_image')
+            _diag_fetch('drap', 'ok', started)
             # 'Aurora', not 'DRAP': fetch_real_drap logs the D-RAP global map.
             # Two identical "DRAP updated" lines made the journal useless for
             # telling which of the two products actually landed.
             print(f'[{time.strftime("%H:%M:%S")}] Aurora updated ({len(data)} bytes)')
             return
         except Exception as e:
+            last_error = e
             print(f'[{time.strftime("%H:%M:%S")}] Aurora fetch failed ({url}): {e}')
+    _diag_fetch('drap', 'error', started, last_error)
 
 
 def fetch_real_drap():
@@ -1129,11 +1375,15 @@ def fetch_real_drap():
         'https://services.swpc.noaa.gov/images/animations/d-rap/global/latest.png',
         'https://services.swpc.noaa.gov/images/d-rap/global_f10.png',
     ]
+    # One record per call — see the note in fetch_dx.
+    started = time.monotonic()
+    last_error = None
     for url in urls:
         try:
             data, not_modified = _conditional_get(url, timeout=20)
             if not_modified:
                 if _note_unchanged('DRAP', 'real_drap_image', url):
+                    _diag_fetch('real_drap', 'not_modified', started)
                     return
                 continue
             if not data:
@@ -1141,10 +1391,13 @@ def fetch_real_drap():
             CACHE['real_drap_image'] = data
             CACHE['real_drap_image_updated'] = time.time()
             _persist('real_drap_image')
+            _diag_fetch('real_drap', 'ok', started)
             print(f'[{time.strftime("%H:%M:%S")}] DRAP updated ({len(data)} bytes)')
             return
         except Exception as e:
+            last_error = e
             print(f'[{time.strftime("%H:%M:%S")}] DRAP fetch failed ({url}): {e}')
+    _diag_fetch('real_drap', 'error', started, last_error)
 
 
 def fetch_sdo():
@@ -1160,18 +1413,26 @@ def fetch_sdo():
     Assigns on success only: writing None over a good image would blank the
     SDO panel on a single transient upstream failure.
     """
+    started = time.monotonic()
     try:
         data, not_modified = _conditional_get(SDO_URL, timeout=20)
         if not_modified:
-            _note_unchanged('SDO', 'solar_image', SDO_URL)
+            # False => a validator with no body behind it (the slot was
+            # cleared after the validator was recorded). SDO has no fallback
+            # URL to fall through to, so that is a miss, not a hit.
+            held = _note_unchanged('SDO', 'solar_image', SDO_URL)
+            _diag_fetch('sdo', 'not_modified' if held else 'error', started,
+                        '304_no_body')
             return
         if not data:
             raise ValueError('empty body')
         CACHE['solar_image'] = data
         CACHE['solar_image_updated'] = time.time()
         _persist('solar_image')
+        _diag_fetch('sdo', 'ok', started)
         print(f'[{time.strftime("%H:%M:%S")}] SDO updated ({len(data)} bytes)')
     except Exception as e:
+        _diag_fetch('sdo', 'error', started, e)
         print(f'[{time.strftime("%H:%M:%S")}] SDO image fetch failed: {e}')
 
 
@@ -1417,6 +1678,174 @@ def _age_of(stamp_key, now):
     return max(0, int(now - stamp))
 
 
+# ---------------------------------------------------------------------------
+# GET /api/diagnostics — the read side of the counters above
+#
+# Read-only, and it must NEVER block: no upstream fetch, no subprocess, no
+# import of cairosvg. (Doing upstream I/O on a handler thread is the mistake
+# that was just removed from /api/solar-image; it burned the native client's
+# entire serial image budget on one 20 s stall.) Everything here is either a
+# counter we already keep or a single small /proc read.
+#
+# The client embeds this body verbatim under "server" in the diagnostics
+# payload, and that payload is only ever transmitted by an explicit operator
+# press. Nothing in this structure is a credential, a network name, or file
+# content from outside this project: failures are recorded as exception TYPE
+# names (see _diag_error_name), and no URL, hostname or path is echoed.
+# ---------------------------------------------------------------------------
+
+_DEPS_SNAPSHOT = None
+
+
+def _deps_snapshot():
+    """cairosvg + cpulimit availability. Computed once, then memoised.
+
+    Deliberately does NOT import cairosvg. The rasterize runs in a subprocess
+    precisely because that import costs ~48 MB RSS on a 512 MB box, and a
+    diagnostics request must never make the long-lived server pay it.
+    importlib.util.find_spec and importlib.metadata answer both questions from
+    the filesystem without executing the package.
+
+    Memoised because the answer cannot change without a restart (installing
+    cairosvg under a running server does not make the render work — the child
+    process is what imports it), and because find_spec walks sys.path.
+    """
+    global _DEPS_SNAPSHOT
+    if _DEPS_SNAPSHOT is not None:
+        return _DEPS_SNAPSHOT
+    info = {'cairosvg': False, 'cairosvg_version': None, 'cpulimit': False}
+    try:
+        import importlib.util
+        info['cairosvg'] = importlib.util.find_spec('cairosvg') is not None
+    except Exception:
+        # ModuleNotFoundError/ValueError from a broken sys.path entry.
+        info['cairosvg'] = False
+    if info['cairosvg']:
+        try:
+            from importlib.metadata import version
+            info['cairosvg_version'] = version('cairosvg')
+        except Exception:
+            info['cairosvg_version'] = None
+    try:
+        import shutil
+        # The bool only. The resolved path would leak the account name if
+        # cpulimit ever came off a PATH entry under /home.
+        info['cpulimit'] = shutil.which('cpulimit') is not None
+    except Exception:
+        pass
+    _DEPS_SNAPSHOT = info
+    return info
+
+
+def _proc_self_status():
+    """(VmRSS kB, thread count) from /proc/self/status.
+
+    Either value is None when the field is missing or the file cannot be
+    read — a non-Linux dev box, or a container with a hidden /proc. Guarded
+    because an endpoint that can 500 is worse than one that reports null.
+    """
+    rss = None
+    threads = None
+    try:
+        with open('/proc/self/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    rss = int(line.split()[1])
+                elif line.startswith('Threads:'):
+                    threads = int(line.split()[1])
+                if rss is not None and threads is not None:
+                    break
+    except Exception:
+        pass
+    return rss, threads
+
+
+def _diagnostics_snapshot():
+    """Build the /api/diagnostics body. Pure reads; never raises."""
+    now = time.time()
+    png = CACHE.get('muf_image_png')
+    svg = CACHE.get('muf_image')
+    ewma = _muf_render_ewma
+
+    # dict(stat) copies a fixed-key dict the fetcher thread may be writing
+    # values into. Safe: values change, the key set never does, so no resize
+    # can happen mid-copy.
+    fetch = {}
+    for name in _FETCH_NAMES:
+        fetch[name] = dict(_FETCH_STATS[name])
+
+    cache = {}
+    for product, payload_key, stamp_key in _DIAG_PRODUCTS:
+        body = CACHE.get(payload_key)
+        cache[payload_key] = {
+            'bytes': len(body) if body else 0,
+            'age_s': _age_of(stamp_key, now),
+            'from_disk': payload_key in _DISK_RESTORED,
+            # 304 vs full is the field measurement of Tier 2.2's conditional
+            # GET: on a working install the 304 count should dominate.
+            'http_304': fetch[product]['not_modified'],
+            'http_full': fetch[product]['ok'],
+        }
+
+    rss_kb, threads = _proc_self_status()
+
+    return {
+        'schema': 1,
+        'now': now,
+        'muf': {
+            # Seconds of the last SUCCESSFUL rasterize, the smoothed cost the
+            # adaptive budget is derived from, and the budget itself. If
+            # timeout_s is pinned at timeout_floor_s while rasterize_timeout
+            # climbs, PHASE2_TIMEOUT_S is too low for this hardware — the
+            # EWMA only learns from renders that finish.
+            'last_render_s': _MUF_LAST_RENDER_S,
+            'render_ewma_s': round(ewma, 3) if ewma else None,
+            'timeout_s': _muf_timeout(),
+            'timeout_floor_s': PHASE2_TIMEOUT_S,
+            'timeout_max_s': PHASE2_TIMEOUT_MAX_S,
+            'timeout_factor': MUF_TIMEOUT_FACTOR,
+            'last_timeout_budget_s': _MUF_LAST_TIMEOUT_BUDGET_S,
+            'rasterize_ok': _MUF_RASTERIZE_OK,
+            'rasterize_timeout': _MUF_RASTERIZE_TIMEOUT,
+            'rasterize_fail': _MUF_RASTERIZE_FAIL,
+            'slim_ok': _MUF_SLIM_OK,
+            'slim_declined': _MUF_SLIM_DECLINED,
+            'unslimmed_retries': _MUF_UNSLIMMED_RETRIES,
+            'svg_bytes': _MUF_LAST_SVG_BYTES,
+            'slim_bytes': _MUF_LAST_SLIM_BYTES,
+            'png_bytes': _MUF_LAST_PNG_BYTES,
+            # Where the PNG we hold came from vs what the endpoint last
+            # served. 'disk' + 'png' means the map on screen is a restored
+            # one, which is also what /api/health labels it.
+            'png_source': _MUF_PNG_SOURCE if png else 'none',
+            'last_served': _MUF_LAST_SERVED,
+            'svg_cached_bytes': len(svg) if svg else 0,
+            'svg_age_s': _age_of('muf_image_updated', now),
+            'png_cached_bytes': len(png) if png else 0,
+            'png_age_s': _age_of('muf_image_png_updated', now),
+            'stale_max_s': MUF_STALE_MAX_S,
+        },
+        'deps': _deps_snapshot(),
+        'cache': cache,
+        'fetch': fetch,
+        'boot': {
+            'started_at': _BOOT_EPOCH,
+            'uptime_s': int(max(0.0, time.monotonic() - _BOOT_MONOTONIC)),
+            'disk_warm': _BOOT_DISK_WARM,
+            'restored': list(_DISK_RESTORED),
+            # Seconds from process start to the first fetch that produced
+            # usable data (a 304 counts — it means the panel has current
+            # data). null = it has never succeeded.
+            'first_ok_s': dict(_FIRST_OK_S),
+        },
+        'process': {
+            'rss_kb': rss_kb,
+            'threads': threads,
+            'python': '%d.%d.%d' % sys.version_info[:3],
+        },
+    }
+
+
 class Handler(SimpleHTTPRequestHandler):
     # Socket timeout so a stalled client can't pin a thread (and its buffered
     # response) forever — unbounded stuck threads are a memory-pressure source.
@@ -1513,13 +1942,17 @@ class Handler(SimpleHTTPRequestHandler):
             if png:
                 body = png
                 ctype = 'image/png'
+                _note_muf_served('png')
             elif want_png:
+                _note_muf_served('none')
                 self.send_error(503, 'MUF PNG not yet rendered')
                 return
             elif svg:
                 body = svg
                 ctype = 'image/svg+xml'
+                _note_muf_served('svg')
             else:
+                _note_muf_served('none')
                 self.send_error(503, 'MUF map not yet loaded')
                 return
             self.send_response(200)
@@ -1578,6 +2011,13 @@ class Handler(SimpleHTTPRequestHandler):
                 'drap_age': _age_of('drap_image_updated', now),
                 'real_drap_age': _age_of('real_drap_image_updated', now),
             })
+        elif path == '/api/diagnostics':
+            # Opt-in diagnostics: a read-only snapshot of counters this
+            # process already keeps. No upstream I/O, no subprocess, no
+            # cairosvg import — see _diagnostics_snapshot. The client embeds
+            # this body under "server" and transmits it only when the operator
+            # presses the button.
+            self.send_json(_diagnostics_snapshot())
         else:
             if self.command == 'HEAD':
                 super().do_HEAD()

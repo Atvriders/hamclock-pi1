@@ -192,6 +192,56 @@ for _hc_file in server.py index.html hamclock_data.py hamclock_pygame.py hamcloc
 done
 sudo chmod +x "$INSTALL_DIR/server.py" 2>/dev/null || true
 
+# ---- Root-executed helper scripts + the version stamp ----------------------
+#
+# hamclock-update.sh and hamclock-apply-settings.sh are run BY ROOT, started by
+# the systemd units installed near the end of this script. The dashboard runs
+# as an unprivileged SERVICE_USER and is granted no sudo whatsoever; the single
+# privileged thing it can do is create an empty flag file under
+# /run/hamclock-lite, which a root-owned path unit notices. That boundary holds
+# only while these two scripts are root-owned and NOT writable by SERVICE_USER
+# — a service user who can edit a script that root executes already has root.
+#
+# So the ownership is asserted after the install rather than inherited from
+# whatever umask is in effect, or from whatever ownership $INSTALL_DIR happens
+# to carry on a Pi that has been hand-fixed at some point in its life.
+assert_root_owned() {
+    # assert_root_owned <file> <expected-octal-mode>
+    local f="$1" want="$2" owner mode
+    owner="$(stat -c '%U:%G' "$f" 2>/dev/null || echo '?')"
+    mode="$(stat -c '%a' "$f" 2>/dev/null || echo '?')"
+    if [ "$owner" != "root:root" ] || [ "$mode" != "$want" ]; then
+        echo "FATAL: $f is owned by $owner with mode $mode; expected root:root $want." >&2
+        echo "Refusing to continue: the unprivileged dashboard user must never be" >&2
+        echo "able to modify a file that systemd executes as root." >&2
+        exit 1
+    fi
+}
+
+for _hc_root in hamclock-update.sh hamclock-apply-settings.sh; do
+    if [ ! -f "$SCRIPT_DIR/scripts/$_hc_root" ]; then
+        echo "ERROR: $SCRIPT_DIR/scripts/$_hc_root is missing — it is what the" >&2
+        echo "root-side systemd units execute; refusing to install half of the" >&2
+        echo "update/settings mechanism." >&2
+        exit 1
+    fi
+    sudo install -o root -g root -m 0755 "$SCRIPT_DIR/scripts/$_hc_root" "$INSTALL_DIR/$_hc_root"
+    assert_root_owned "$INSTALL_DIR/$_hc_root" 755
+done
+
+# installed_version() in hamclock-update.sh reads this file and nothing else.
+# It deliberately never asks git — the single-file installer exists precisely
+# for Pis with no checkout — so without the stamp every daily check would read
+# 0.0.0 and report an update available forever.
+if [ ! -f "$SCRIPT_DIR/VERSION" ]; then
+    echo "ERROR: $SCRIPT_DIR/VERSION is missing; the update check has no way to" >&2
+    echo "know what is installed." >&2
+    exit 1
+fi
+sudo install -o root -g root -m 0644 "$SCRIPT_DIR/VERSION" "$INSTALL_DIR/VERSION"
+assert_root_owned "$INSTALL_DIR/VERSION" 644
+echo "Installed version: $(cat "$INSTALL_DIR/VERSION")"
+
 # ---- Remove stale files left by earlier versions ---------------------------
 # $INSTALL_DIR is owned exclusively by this installer, so any program file in it
 # that we no longer ship is a leftover from an older version.
@@ -209,7 +259,11 @@ sudo chmod +x "$INSTALL_DIR/server.py" 2>/dev/null || true
 # stale and are not touched here.
 #
 # Set HAMCLOCK_SKIP_CLEAN=1 to skip this step.
-HAMCLOCK_SHIPPED_FILES="server.py index.html hamclock_data.py hamclock_pygame.py hamclock_tkinter.py kiosk.sh"
+# hamclock-update.sh and hamclock-apply-settings.sh MUST be listed: the sweep
+# below deletes every *.sh in $INSTALL_DIR that is not shipped, so omitting them
+# would delete the two root helpers moments after installing them and leave the
+# path units pointing at nothing.
+HAMCLOCK_SHIPPED_FILES="server.py index.html hamclock_data.py hamclock_pygame.py hamclock_tkinter.py kiosk.sh hamclock-update.sh hamclock-apply-settings.sh VERSION"
 
 cleanup_stale_install() {
     if [ "${HAMCLOCK_SKIP_CLEAN:-0}" = "1" ]; then
@@ -339,6 +393,19 @@ Type=simple
 User=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR
 CacheDirectory=hamclock-lite
+# The request directory for the privilege boundary. The dashboard's ONLY
+# privileged action is creating an empty flag file in here; the root path units
+# watch for it. RuntimeDirectory= makes systemd create /run/hamclock-lite owned
+# by this same User=, so the service user can write flag files while the status
+# files root drops alongside them stay root-owned.
+# It has to be systemd's job rather than a one-time mkdir at install: /run is a
+# tmpfs and is empty again after every reboot.
+# Preserve=yes keeps the directory across a restart of THIS unit — the updater
+# restarts hamclock-lite mid-apply, and without it the directory and the status
+# file the dashboard is polling would disappear underneath the update.
+RuntimeDirectory=hamclock-lite
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
 $LITE_PYGAME_ENV
 $LITE_PYGAME_PRE
 ExecStart=/usr/bin/python3 $INSTALL_DIR/server.py
@@ -566,9 +633,47 @@ WantedBy=multi-user.target
 EOF
 fi
 
+# ---- Root-owned update / settings units ------------------------------------
+# The root half of the privilege model: two path units watching for the flag
+# files the dashboard is allowed to create, the services they trigger, the
+# daily check timer, and the boot-time NTP applier.
+HAMCLOCK_ROOT_UNITS="hamclock-update.path hamclock-update.service hamclock-update-check.timer hamclock-update-check.service hamclock-apply-settings.path hamclock-apply-settings.service hamclock-apply-settings-boot.service"
+# Only these four are activated directly. The three left out are *triggered*
+# units — a .path or the .timer starts them. Enabling a triggered unit would
+# additionally run it unconditionally at every boot, which for
+# hamclock-update.service means attempting an update on every reboot.
+HAMCLOCK_ENABLE_UNITS="hamclock-update-check.timer hamclock-update.path hamclock-apply-settings.path hamclock-apply-settings-boot.service"
+
+enable_hamclock_root_units() {
+    sudo systemctl daemon-reload
+    local _u
+    for _u in $HAMCLOCK_ENABLE_UNITS; do
+        sudo systemctl enable "$_u"
+        # A unit that will not start right now (no network yet, no settings
+        # file yet) is not a reason to fail the install — it is enabled, and
+        # the next boot will run it.
+        sudo systemctl start "$_u" \
+            || echo "note: $_u did not start now; it is enabled and runs at boot" >&2
+    done
+}
+
+for _hc_unit in $HAMCLOCK_ROOT_UNITS; do
+    if [ ! -f "$SCRIPT_DIR/systemd/$_hc_unit" ]; then
+        echo "ERROR: $SCRIPT_DIR/systemd/$_hc_unit is missing; refusing to install" >&2
+        echo "a partial update/settings mechanism." >&2
+        exit 1
+    fi
+    sudo install -o root -g root -m 0644 "$SCRIPT_DIR/systemd/$_hc_unit" \
+        "/etc/systemd/system/$_hc_unit"
+    assert_root_owned "/etc/systemd/system/$_hc_unit" 644
+done
+enable_hamclock_root_units
+
 sudo systemctl daemon-reload
 sudo systemctl enable hamclock-lite hamclock-kiosk
-# Always restart to pick up any file changes
+# Always restart to pick up any file changes. This is also what gives
+# /run/hamclock-lite its RuntimeDirectory= ownership on an upgrade of a Pi
+# whose hamclock-lite unit predates that setting.
 sudo systemctl restart hamclock-lite
 sudo systemctl restart hamclock-kiosk
 

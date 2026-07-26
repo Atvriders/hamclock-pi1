@@ -1,0 +1,19 @@
+[Unit]
+Description=HamClock Lite daily update check
+Documentation=file:///opt/hamclock-lite/docs/versioning.md
+
+[Timer]
+# 07:00 local time, every day.
+OnCalendar=*-*-* 07:00:00
+# The Pi 1 has NO RTC. If the box was powered off at 07:00 — or the clock was
+# still wrong at 07:00 because NTP had not synced yet — Persistent makes systemd
+# run the check as soon as it can instead of silently skipping a day.
+Persistent=true
+# Nothing else is contending at 07:00, but a spread keeps a shack full of Pis
+# from hitting the site in the same second.
+RandomizedDelaySec=900
+AccuracySec=1m
+Unit=hamclock-update-check.service
+
+[Install]
+WantedBy=timers.target

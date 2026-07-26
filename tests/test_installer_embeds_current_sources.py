@@ -272,30 +272,85 @@ def _hamclockdata_attributes(src):
     return attrs
 
 
+def _is_self_data(v):
+    """`self.data` — always the HamClockData instance, never a local."""
+    return (isinstance(v, ast.Attribute) and v.attr == "data"
+            and isinstance(v.value, ast.Name) and v.value.id == "self")
+
+
+def _binds_own_data(fn, inherited):
+    """Does `fn` bind a local name `data` of its own?
+
+    A bare `data` only means the HamClockData instance when the function did
+    not make its own. `load_settings()` does exactly that -- `data =
+    json.load(f)` is a plain dict, and reading `data.get(...)` off it is
+    correct code that has nothing to do with HamClockData. Without this the
+    walk reports `get` as a missing HamClockData attribute, which is a false
+    alarm on correct code and trains people to ignore this guard.
+
+    A `data` PARAMETER is the instance being passed in, so it un-shadows.
+    """
+    a = fn.args
+    params = [p.arg for p in (list(getattr(a, "posonlyargs", []))
+                              + list(a.args) + list(a.kwonlyargs))]
+    if a.vararg:
+        params.append(a.vararg.arg)
+    if a.kwarg:
+        params.append(a.kwarg.arg)
+    if "data" in params:
+        return False
+
+    # Any binding of `data` in this function's own body. Nested functions and
+    # classes have their own scope and are not descended into here.
+    stack = list(fn.body)
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                          ast.ClassDef, ast.Lambda)):
+            continue
+        if (isinstance(n, ast.Name) and n.id == "data"
+                and isinstance(n.ctx, ast.Store)):
+            return True
+        stack.extend(ast.iter_child_nodes(n))
+    return inherited
+
+
 def _data_attributes_used(src):
     """{attr: lineno} for `data.<attr>`, `self.data.<attr>` and
-    `getattr(data, '<attr>', ...)` in a client module."""
+    `getattr(data, '<attr>', ...)` in a client module.
+
+    Scope-aware: a bare `data` is only counted where the enclosing function
+    has not bound a `data` of its own (see _binds_own_data)."""
     tree = ast.parse(src)
     used = {}
 
-    def is_data(v):
-        if isinstance(v, ast.Name) and v.id == "data":
+    def is_data(v, shadowed):
+        if _is_self_data(v):
             return True
-        return (isinstance(v, ast.Attribute) and v.attr == "data"
-                and isinstance(v.value, ast.Name) and v.value.id == "self")
+        return (isinstance(v, ast.Name) and v.id == "data" and not shadowed)
 
-    for n in ast.walk(tree):
-        if isinstance(n, ast.Attribute) and is_data(n.value):
+    def record(n, shadowed):
+        if isinstance(n, ast.Attribute) and is_data(n.value, shadowed):
             used.setdefault(n.attr, n.lineno)
         elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
                 and n.func.id == "getattr" and len(n.args) >= 2
-                and is_data(n.args[0])
+                and is_data(n.args[0], shadowed)
                 and isinstance(n.args[1], ast.Constant)
                 and isinstance(n.args[1].value, str)):
             # A guarded getattr does not crash, but a missing attribute still
             # means the feature it drives silently never runs -- which is
             # exactly how the SDO/PROPAGATION panels went dark.
             used.setdefault(n.args[1].value, n.lineno)
+
+    def walk(node, shadowed):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                walk(child, _binds_own_data(child, shadowed))
+            else:
+                record(child, shadowed)
+                walk(child, shadowed)
+
+    walk(tree, False)
     return used
 
 

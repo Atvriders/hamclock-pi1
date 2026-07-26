@@ -1,0 +1,14 @@
+[Unit]
+Description=HamClock Lite update request watcher
+# This is the privilege boundary. The dashboard runs as an unprivileged user and
+# is granted no sudo at all; the single thing it can do is create this empty
+# file. systemd (as root) notices and starts the updater, which then decides for
+# itself what to install and verifies it. The unprivileged side can ask for an
+# update but can never choose its contents.
+
+[Path]
+PathExists=/run/hamclock-lite/update.request
+Unit=hamclock-update.service
+
+[Install]
+WantedBy=multi-user.target

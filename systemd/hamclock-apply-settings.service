@@ -1,0 +1,10 @@
+[Unit]
+Description=HamClock Lite apply root-owned settings (NTP)
+# No network ordering on purpose: an operator must be able to configure an
+# internal time server before that network is reachable. The script saves the
+# value regardless and only reports whether it resolves.
+
+[Service]
+Type=oneshot
+ExecStart=/opt/hamclock-lite/hamclock-apply-settings.sh --apply
+TimeoutStartSec=120

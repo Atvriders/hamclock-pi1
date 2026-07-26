@@ -1,0 +1,18 @@
+[Unit]
+Description=HamClock Lite apply NTP setting at boot
+ConditionPathExists=/etc/hamclock-lite/settings.json
+# NOTE: do NOT add Before=systemd-timesyncd.service. timesyncd is pulled in by
+# sysinit.target, and this unit is WantedBy=multi-user.target which is ordered
+# after it — so Before= forms a cycle, and systemd breaks that cycle by DELETING
+# the timesyncd start job. On a Pi 1 with no RTC that means no time sync at all,
+# which then breaks TLS, the update check, and every timestamp on the box.
+# (systemd-analyze verify catches this; keep it in the pre-ship checks.)
+# Applying the drop-in late and restarting timesyncd is correct and cycle-free.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/hamclock-lite/hamclock-apply-settings.sh --apply
+
+[Install]
+WantedBy=multi-user.target

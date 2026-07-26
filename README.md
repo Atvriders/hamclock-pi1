@@ -224,6 +224,86 @@ Running the installer again is safe — it will update the files and restart the
 
 ---
 
+## Sending a Diagnostics Report (Optional)
+
+The project has no Raspberry Pi 1 hardware to test on. Every Pi speed figure in
+this README is an estimate made on a much faster computer, not a measurement.
+If you want to help fix that, the pygame client can send one diagnostics report.
+
+**This is entirely optional. If you do nothing, nothing is ever sent.**
+
+### How to send one
+
+1. Press **`T`**, or click the **`REPORT [T]`** chip in the status bar at the
+   bottom of the screen. (The chip is hidden on very narrow screens; the `T`
+   key always works, including with no mouse attached.)
+2. A box appears listing **exactly** what would be sent. Nothing has left the
+   Pi at this point.
+3. Press **`Y`** or **Enter** to send. Press **`N`** or **Esc** to cancel.
+
+That confirm box appears **every single time**. There is no "remember my
+choice", no send at boot, no timer, and no automatic retry if it fails. One
+press, one confirm, one report.
+
+### What it sends
+
+- **A random report ID** — a UUID made up on your Pi, stored in your settings
+  file. It is not your callsign, MAC address, or serial number.
+- **Hardware** — Pi model, CPU, core count, total RAM.
+- **System** — OS, kernel, Python version, how long the Pi has been up.
+- **Display** — the SDL driver, colour depth, resolution, fullscreen or not.
+  (This is the big unknown: the shipped X11 config asks for 16-bit colour, and
+  parts of pygame refuse to work at that depth.)
+- **Versions** — pygame, SDL, cairosvg, and whether `cpulimit` is installed.
+- **Speed** — frame render times (median/90th/99th percentile over the last
+  60 seconds) and time from boot to first paint.
+- **This Pi's own `/api/diagnostics`** — the local server's feed and cache
+  health, including how long the MUF map actually takes to rasterize.
+- **A screenshot** of the dashboard, as a PNG.
+
+### Read this part before you press Y
+
+**The screenshot shows your callsign in the header. A report sent with a
+screenshot is therefore NOT anonymous** — it ties that hardware, that location
+setting, and that dashboard to your call. The confirm box says so in plain
+language, and names your callsign, so you can decide with the facts in front of
+you. If that is not OK, press `N`. Cancelling costs nothing and the rest of the
+dashboard works exactly the same.
+
+### What it never sends
+
+No passwords, tokens, or API keys. No Wi-Fi network names or passphrases. No
+SSH keys. No `/etc/shadow`. No contents of any file on your Pi beyond the
+diagnostics listed above. The one block the client does not write itself — your
+local server's diagnostics — is filtered for anything credential-shaped before
+it is attached.
+
+### Where it goes
+
+`POST https://hamclock-reborn.org/api/telemetry`, over HTTPS, one attempt, then
+it gives up. The status bar tells you whether it actually went.
+
+Reports land in a log file and a screenshot folder on that server. Be aware
+that the **summary list is publicly readable** at
+`https://hamclock-reborn.org/api/telemetry/reports` — that listing shows the
+hardware, display, versions, and timing metadata plus the random report ID.
+**Screenshots are not in it**, and neither is your server diagnostics blob or
+your IP address (which is only ever stored hashed and truncated).
+
+### How to never use this
+
+Don't press `T`, and don't click the chip. There is nothing to disable, no
+setting to change, and no service to mask — the code has no path to the network
+that does not go through that confirm box.
+
+If you sent one and want a different random ID next time, delete the
+`device_id` line from your settings file (`sudo nano
+/etc/hamclock-lite/settings.json`); a new one is generated on the next report.
+Reports already sent cannot be recalled from here — email the project if you
+want one removed.
+
+---
+
 ## Data Sources
 
 All data comes from free public APIs — no API keys or accounts needed:

@@ -25,8 +25,27 @@ Design notes (deliberate, do not "simplify" away):
 
 * Blocks are located by an **opener regex**, never by line number -- line
   numbers move every time any embedded file changes length.
+* Two families of block are managed: the files written into ``$INSTALL_DIR``
+  (``BLOCKS``) and the systemd units written into ``/etc/systemd/system``
+  (``UNIT_BLOCKS``).  The unit opener requires a **quoted destination path**,
+  which is what distinguishes a unit synced from ``systemd/`` from the two
+  mode-templated units the installer composes itself (``hamclock-lite.service``
+  and ``hamclock-kiosk.service`` interpolate ``$SERVICE_USER`` and are written
+  with an unquoted path and an unquoted ``EOF`` on purpose).
 * The delimiter must be quoted in the installer (``<< 'DELIM'``).  An unquoted
-  heredoc would expand ``$`` and backticks inside Python source.
+  heredoc would expand ``$`` and backticks inside Python source.  Note that
+  ``hamclock-update.sh`` contains its own ``<<EOF`` and
+  ``hamclock-apply-settings.sh`` contains a ``<<'PY'``, so their delimiters here
+  must be neither -- ``read_source`` refuses the collision rather than emitting
+  an installer that terminates a heredoc early and pipes source into bash.
+* The version is stamped by treating repo ``VERSION`` as just another embedded
+  source.  The single-file installer runs where there is no git, so the version
+  has to live in the installer text; making it a block means ``--check`` fails
+  the build the moment the two disagree.
+* After the mirror is written, the sidecar update manifest is regenerated **from
+  the published bytes**.  Order matters: the digest has to be of exactly what is
+  being served, or the Pi refuses the update (safe, but indistinguishable from a
+  broken updater).
 * We refuse to run -- rather than emit a broken installer -- when a source file
   contains a line equal to its delimiter, contains CRLF, lacks a trailing
   newline, or is not valid UTF-8.  Any of those silently truncates or corrupts
@@ -42,6 +61,9 @@ Design notes (deliberate, do not "simplify" away):
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.util
+import json
 import os
 import re
 import sys
@@ -51,16 +73,40 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 INSTALLER = REPO / "offline-install.sh"
 MIRROR = Path("/home/kasm-user/hamclock-reborn/public/downloads/pi1-install.sh")
+MANIFEST_SCRIPT = Path(__file__).resolve().parent / "make_version_manifest.py"
 
 #: Every file the installer writes into $INSTALL_DIR, mapped to the repo file
 #: that is the single source of truth for it.  Keys are the basenames used in
 #: the `sudo tee "$INSTALL_DIR/<key>"` line; values are repo-relative paths.
+#:
+#: The two shell scripts are executed BY ROOT on the target (systemd starts
+#: them), so a stale embedded copy is not a cosmetic bug the way a stale panel
+#: would be -- it is the wrong privileged code running.  VERSION is here so the
+#: stamp the update check reads cannot drift from the repo.
 BLOCKS = {
     "server.py": "server.py",
     "index.html": "index.html",
     "hamclock_data.py": "hamclock_data.py",
     "hamclock_pygame.py": "hamclock_pygame.py",
     "hamclock_tkinter.py": "hamclock_tkinter.py",
+    "hamclock-update.sh": "scripts/hamclock-update.sh",
+    "hamclock-apply-settings.sh": "scripts/hamclock-apply-settings.sh",
+    "VERSION": "VERSION",
+}
+
+#: Units the installer drops verbatim into /etc/systemd/system, mapped to the
+#: repo file that owns them.  hamclock-lite.service and hamclock-kiosk.service
+#: are deliberately NOT here: the installer composes them per kiosk mode with
+#: $SERVICE_USER interpolated, so there is no static file to sync them from.
+UNIT_BLOCKS = {
+    "hamclock-update.path": "systemd/hamclock-update.path",
+    "hamclock-update.service": "systemd/hamclock-update.service",
+    "hamclock-update-check.timer": "systemd/hamclock-update-check.timer",
+    "hamclock-update-check.service": "systemd/hamclock-update-check.service",
+    "hamclock-apply-settings.path": "systemd/hamclock-apply-settings.path",
+    "hamclock-apply-settings.service": "systemd/hamclock-apply-settings.service",
+    "hamclock-apply-settings-boot.service":
+        "systemd/hamclock-apply-settings-boot.service",
 }
 
 #: `sudo tee "$INSTALL_DIR/server.py" > /dev/null << 'SERVEREOF'`
@@ -68,6 +114,15 @@ BLOCKS = {
 #: quoting of the delimiter (checked separately so we can explain the failure).
 OPENER_RE = re.compile(
     r"^sudo tee \"\$INSTALL_DIR/(?P<dest>[^\"]+)\"\s*>\s*/dev/null\s*<<\s*"
+    r"(?P<q1>['\"]?)(?P<delim>[A-Za-z_][A-Za-z0-9_]*)(?P<q2>['\"]?)\s*$"
+)
+
+#: `sudo tee "/etc/systemd/system/hamclock-update.path" > /dev/null << 'DELIM'`
+#: The QUOTED destination path is load-bearing: it is what separates a unit
+#: copied verbatim from systemd/ from the two units the installer templates
+#: itself, which are written as `sudo tee /etc/systemd/system/... <<EOF`.
+UNIT_OPENER_RE = re.compile(
+    r"^sudo tee \"/etc/systemd/system/(?P<dest>[^\"]+)\"\s*>\s*/dev/null\s*<<\s*"
     r"(?P<q1>['\"]?)(?P<delim>[A-Za-z_][A-Za-z0-9_]*)(?P<q2>['\"]?)\s*$"
 )
 
@@ -92,18 +147,18 @@ class Block:
             self.dest, self.delim, self.open_idx, self.close_idx)
 
 
-def find_blocks(text):
-    """Locate every `$INSTALL_DIR` heredoc in *text*, in file order.
+def find_blocks(text, opener=OPENER_RE):
+    """Locate every heredoc matching *opener* in *text*, in file order.
 
-    Raises SyncError if a heredoc is never closed or uses an unquoted
-    delimiter.
+    Defaults to the `$INSTALL_DIR` family.  Raises SyncError if a heredoc is
+    never closed or uses an unquoted delimiter.
     """
     lines = text.split("\n")
     blocks = []
     i = 0
     n = len(lines)
     while i < n:
-        m = OPENER_RE.match(lines[i])
+        m = opener.match(lines[i])
         if not m:
             i += 1
             continue
@@ -129,30 +184,33 @@ def find_blocks(text):
     return blocks
 
 
-def check_coverage(blocks):
-    """Every located heredoc must be declared in BLOCKS, exactly once."""
+def check_coverage(blocks, table=None, where="$INSTALL_DIR", name="BLOCKS"):
+    """Every located heredoc must be declared in *table*, exactly once."""
+    if table is None:
+        table = BLOCKS
     seen = {}
     for b in blocks:
         seen.setdefault(b.dest, []).append(b)
-    unknown = sorted(d for d in seen if d not in BLOCKS)
+    unknown = sorted(d for d in seen if d not in table)
     if unknown:
         raise SyncError(
-            "offline-install.sh writes %s into $INSTALL_DIR but scripts/"
+            "offline-install.sh writes %s into %s but scripts/"
             "sync_installers.py does not know how to regenerate %s. Add it to "
-            "BLOCKS (or the installer will ship a stale hand-edited copy)."
-            % (", ".join(unknown), "them" if len(unknown) > 1 else "it")
+            "%s (or the installer will ship a stale hand-edited copy)."
+            % (", ".join(unknown), where,
+               "them" if len(unknown) > 1 else "it", name)
         )
-    missing = sorted(d for d in BLOCKS if d not in seen)
+    missing = sorted(d for d in table if d not in seen)
     if missing:
         raise SyncError(
-            "offline-install.sh no longer contains a $INSTALL_DIR heredoc for "
-            "%s" % ", ".join(missing)
+            "offline-install.sh no longer contains a %s heredoc for "
+            "%s" % (where, ", ".join(missing))
         )
     dupes = sorted(d for d, v in seen.items() if len(v) > 1)
     if dupes:
         raise SyncError(
-            "offline-install.sh contains more than one $INSTALL_DIR heredoc "
-            "for %s; refusing to guess which one to update" % ", ".join(dupes)
+            "offline-install.sh contains more than one %s heredoc "
+            "for %s; refusing to guess which one to update" % (where, ", ".join(dupes))
         )
 
 
@@ -196,15 +254,49 @@ def read_source(path, delim):
     return text
 
 
+def find_unit_blocks(text):
+    """Locate every `/etc/systemd/system` heredoc synced from systemd/."""
+    return find_blocks(text, UNIT_OPENER_RE)
+
+
+def managed_blocks(installer_text):
+    """[(block, repo-relative source)] for every heredoc this script owns.
+
+    Both families are located and coverage-checked, then merged into one
+    file-ordered list so a single splice can rewrite them all.
+    """
+    app = find_blocks(installer_text)
+    check_coverage(app, BLOCKS, "$INSTALL_DIR", "BLOCKS")
+    units = find_unit_blocks(installer_text)
+    check_coverage(units, UNIT_BLOCKS, "/etc/systemd/system", "UNIT_BLOCKS")
+
+    pairs = ([(b, BLOCKS[b.dest]) for b in app]
+             + [(b, UNIT_BLOCKS[b.dest]) for b in units])
+    pairs.sort(key=lambda p: p[0].open_idx)
+
+    # The two families are located by two independent scans over the same text,
+    # so in principle a line inside one block could look like the other's
+    # opener.  Splicing overlapping ranges would silently corrupt the installer,
+    # so refuse rather than guess.
+    last = -1
+    for b, _ in pairs:
+        if b.open_idx <= last:
+            raise SyncError(
+                "heredoc for %s at line %d overlaps the previous block; the "
+                "installer contains a line that looks like a heredoc opener "
+                "inside an embedded source" % (b.dest, b.open_idx + 1)
+            )
+        last = b.close_idx
+    return pairs
+
+
 def render(installer_text, repo=REPO):
     """Return *installer_text* with every declared heredoc body replaced."""
-    blocks = find_blocks(installer_text)
-    check_coverage(blocks)
     lines = installer_text.split("\n")
     out = []
     prev = 0
-    for b in blocks:
-        src = read_source(repo / BLOCKS[b.dest], b.delim)
+    for b, rel in managed_blocks(installer_text):
+        src = read_source(repo / rel, b.delim)
         # `src` always ends with "\n", so split("\n") gives a trailing "" that
         # would become a spurious blank line before the delimiter.
         body = src.split("\n")[:-1]
@@ -252,6 +344,71 @@ def atomic_write(path, data, mode=None):
         os.close(dfd)
 
 
+def manifest_module(path=MANIFEST_SCRIPT):
+    """Load scripts/make_version_manifest.py by path.
+
+    Imported rather than shelled out to so the manifest and this script cannot
+    disagree about what "the published bytes" means, and by path because
+    scripts/ is not importable when this module is itself loaded by path (which
+    is how the tests load it).
+    """
+    spec = importlib.util.spec_from_file_location(
+        "hamclock_make_version_manifest", str(path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def manifest_path_for(installer_path):
+    """pi1-install.sh -> pi1-install.version.json, beside it."""
+    installer_path = Path(installer_path)
+    return installer_path.with_name(installer_path.stem + ".version.json")
+
+
+def sync_manifest(published, published_bytes, check=False, log=print,
+                  repo=REPO):
+    """Regenerate the sidecar manifest for *published*. Returns drift notes.
+
+    Called only AFTER the published file holds *published_bytes*: the whole
+    point of the manifest is that its digest is of the exact bytes being
+    served.  A manifest that disagrees makes every Pi refuse the update — the
+    safe failure, but one that reads as a broken updater.
+    """
+    published = Path(published)
+    manifest = manifest_path_for(published)
+    mv = manifest_module()
+
+    want_sha = hashlib.sha256(published_bytes).hexdigest()
+    want_version = mv.read_version(str(repo / "VERSION"))
+
+    have = None
+    if manifest.exists():
+        try:
+            have = json.loads(manifest.read_text())
+        except Exception as exc:
+            log("%s: unreadable (%s); regenerating" % (manifest, exc))
+
+    if (isinstance(have, dict)
+            and have.get("sha256") == want_sha
+            and have.get("version") == want_version):
+        return []
+
+    drift = ["%s: does not describe the published installer" % manifest]
+    if not check:
+        if not published.exists():
+            raise SyncError("cannot write %s: %s does not exist"
+                            % (manifest, published))
+        if published.read_bytes() != published_bytes:
+            raise SyncError(
+                "refusing to write %s: %s does not hold the bytes being "
+                "hashed" % (manifest, published))
+        rc = mv.main([str(published)])
+        if rc != 0:
+            raise SyncError("make_version_manifest failed for %s" % published)
+        log("wrote %s" % manifest)
+    return drift
+
+
 def sync(installer=INSTALLER, mirror=MIRROR, repo=REPO, check=False,
          do_mirror=True, log=print):
     """Regenerate *installer* (and the mirror). Returns a list of drift notes.
@@ -282,6 +439,10 @@ def sync(installer=INSTALLER, mirror=MIRROR, repo=REPO, check=False,
             if not check:
                 atomic_write(mirror, new)
                 log("mirrored to %s" % mirror)
+        # Strictly after the mirror is on disk: the manifest is the integrity
+        # anchor for a script the Pi runs as root, and it must describe the
+        # bytes actually being served, not the ones we intended to serve.
+        drift.extend(sync_manifest(mirror, new, check=check, log=log, repo=repo))
     if not drift:
         log("installers already up to date")
     return drift
