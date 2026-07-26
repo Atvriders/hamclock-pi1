@@ -47,12 +47,21 @@ def test_make_fonts_includes_tiny():
         pygame.quit()
 
 
-def test_make_fonts_aa_flag_only_on_title():
-    """Tier-1a perf: _make_fonts must register each Font in _font_aa with
-    AA only enabled for 'title' (22 px). The smaller fonts render flat to
-    dodge the 5-10x AA cost on the Pi 1 armv6 CPU. _blit_text reads the
-    flag via the side-channel because pygame.font.Font rejects attribute
-    assignment. Regression guard: a flip in either direction is a perf bug.
+def test_make_fonts_registers_aa_for_every_font():
+    """_make_fonts must register EVERY Font in the _font_aa side-channel with
+    AA enabled. _blit_text reads the flag there because pygame.font.Font
+    rejects attribute assignment.
+
+    This supersedes the Tier-1a 'AA on title only' policy. That rule cited a
+    5-10x cost for the AA glyph path, but it predates the Tier-1a glyph cache:
+    measured, AA is ~10-20% slower per render (2.1 -> 2.3 us at size 9) and
+    each unique string is rendered once and reused, so steady-state cost is a
+    few clock digits per second. Rendering flat at 7-9 px and letting the HVS
+    double it to a 1440x900 panel is what made the display look pixelated to
+    the operators reading it.
+
+    Regression guard: a font silently dropping out of the map falls back to
+    AA=True in _blit_text, so assert on presence, not just truthiness.
     """
     import pygame
     pygame.init()
@@ -60,11 +69,11 @@ def test_make_fonts_aa_flag_only_on_title():
         import hamclock_pygame
         fonts = hamclock_pygame._make_fonts()
         aa_map = hamclock_pygame._font_aa
-        assert aa_map.get(id(fonts['title'])) is True, \
-            "'title' font must be registered with AA=True (22 px needs it)"
-        for name in ('panel', 'body', 'label', 'small', 'tiny'):
-            assert aa_map.get(id(fonts[name])) is False, \
-                "'%s' font must be registered with AA=False (perf)" % name
+        for name in ('title', 'panel', 'body', 'label', 'small', 'tiny'):
+            assert id(fonts[name]) in aa_map, \
+                "'%s' font was never registered in _font_aa" % name
+            assert aa_map[id(fonts[name])] is True, \
+                "'%s' font must be antialiased" % name
     finally:
         pygame.quit()
 

@@ -3946,20 +3946,47 @@ def _make_fonts():
             return pygame.font.Font(None, size + 4)
     _glyph_cache.clear()
     _font_aa.clear()
+    # Sizes render at the 720x450 native framebuffer and are doubled by the
+    # HVS on the way to a 1440x900 panel, so the effective on-screen size is
+    # 2x each number below. Tier 2a had halved these (13/9/9/8/7/7) alongside
+    # the resolution drop, which put body text at 9 px -> 18 px effective with
+    # antialiasing off — legible, but visibly pixelated on a real monitor, and
+    # this display is read by operators who should not have to squint.
+    # Antialiasing, not size, is what fixes the pixelated look — so the sizes
+    # move only where there is genuinely room.
+    #
+    # 'title' and 'panel' head up panels and the big MUF STATUS readouts, which
+    # have space to spare, and go up.
+    #
+    # 'body' and 'label' stay at the Tier 2a sizes because SOLAR sets a hard
+    # ceiling: ten label+value pairs inside a 132 px inner rect is ~66 px per
+    # column, split between the two. Rendering that at 10 px clips live
+    # readings — verified on screen, C1.0 became "C1…" and 456.9 became "45…".
+    # A bigger font that eats the measurement is a bad trade; the operator can
+    # read the large values in MUF STATUS, and _fit_text now marks anything
+    # that does clip.
     fonts = {
-        'title': mk(13),    # was 22
-        'panel': mk(9),     # was 14
-        'body':  mk(9),     # was 14
-        'label': mk(8),     # was 12
-        'small': mk(7),     # was 11
-        'tiny':  mk(7),     # was 11
+        'title': mk(15),    # 30 px effective on the 1440x900 panel
+        'panel': mk(11),    # 22 px effective
+        'body':  mk(9),     # SOLAR-limited; do not raise without widening it
+        'label': mk(8),     # SOLAR-limited
+        'small': mk(8),
+        'tiny':  mk(8),
     }
-    # Tier-1a perf: AA only on 'title'. On a 700 MHz armv6 the AA glyph path
-    # is 5-10x flat render; body/panel/label/small/tiny look acceptable
-    # without it and AA-off compositing is much cheaper. Side-channel via
-    # id() because pygame.font.Font rejects attribute assignment.
+    # Antialias everything. The old policy (AA on 'title' only) cited a 5-10x
+    # cost for the AA glyph path, but that predates the Tier-1a glyph cache:
+    # measured here, AA is ~10-20% slower per render (2.1 -> 2.3 us at size 9)
+    # and every unique string is rendered once and reused, so the steady-state
+    # cost is a few clock digits per second. The real price is memory — an AA
+    # glyph is a 32-bit SRCALPHA surface, 4x the 8-bit flat one — which at
+    # _GLYPH_CACHE_CAP=256 tops out around 1.4 MB. That is affordable on 512 MB
+    # and buys smooth edges on every panel instead of just the header.
+    # Side-channel via id() because pygame.font.Font rejects attribute
+    # assignment. NOTE: _blit_text must preserve per-pixel alpha for these —
+    # see the convert() guard there, without which AA glyphs paint as solid
+    # filled rectangles.
     for name, f in fonts.items():
-        _font_aa[id(f)] = (name == 'title')
+        _font_aa[id(f)] = True
     return fonts
 
 
@@ -4028,20 +4055,34 @@ def _fit_text(font, text, max_w):
     neighbour. Fast path is a single Font.size() and the original string back
     (no allocation); the binary search only runs when the text overflows, and
     only on a panel's cadence tick, not per frame.
+
+    Truncation is always MARKED. Cutting by character alone turns an SFI of
+    148 into "14" and a solar wind of 456.9 into "45" - still perfectly
+    plausible numbers, so the operator has no way to know they are reading a
+    fragment. A trailing marker makes a clipped value obviously clipped. It
+    costs one character of width, which is the correct trade against silently
+    reporting wrong space weather.
     """
     try:
         if max_w <= 0:
             return ''
         if font.size(text)[0] <= max_w:
             return text
+        for mark in ('…', '~'):     # ellipsis, then ASCII fallback
+            mark_w = font.size(mark)[0]
+            if mark_w <= max_w:
+                break
+        else:
+            return ''
+        budget = max_w - mark_w
         lo, hi = 0, len(text)
         while lo < hi:
             mid = (lo + hi + 1) // 2
-            if font.size(text[:mid])[0] <= max_w:
+            if font.size(text[:mid])[0] <= budget:
                 lo = mid
             else:
                 hi = mid - 1
-        return text[:lo]
+        return text[:lo] + mark
     except Exception:
         return text
 
@@ -4172,7 +4213,7 @@ def draw_solar(screen, rect, solar, fonts, theme, data_refresh_ts=None):
     if v is not None:
         rows = [
             ('SFI', v['sfi']), ('Kp', v['kIndex']), ('SSN', v['ssn']),
-            ('A', v['aIndex']), ('X-Ray', v['xray']),
+            ('A', v['aIndex']), ('Xray', v['xray']),
             ('Wind', v['solarWind']), ('Bz', v['bz']),
             ('Geo', v['geomagField']), ('S/N', v['signalNoise']),
             ('foF2', v['fof2']),
@@ -4183,7 +4224,7 @@ def draw_solar(screen, rect, solar, fonts, theme, data_refresh_ts=None):
             ('Kp', _safe(solar, 'kIndex')),
             ('SSN', _safe(solar, 'ssn')),
             ('A', _safe(solar, 'aIndex')),
-            ('X-Ray', _safe(solar, 'xray')),
+            ('Xray', _safe(solar, 'xray')),
             ('Wind', _safe(solar, 'solarWind')),
             ('Bz', _safe(solar, 'bz')),
             ('Geo', _safe(solar, 'geomagField')),
@@ -4209,7 +4250,13 @@ def draw_solar(screen, rect, solar, fonts, theme, data_refresh_ts=None):
     pitch = lab_h if per_col < 2 else max(
         lab_h, min(lab_h + 4, (rect.h - glyph_h) // (per_col - 1)))
     col_w = rect.w // ncols
-    val_x = min(col_w // 2, lab_f.size('MMMMMM')[0] + 4)
+    # Give the labels exactly the width they need and hand the rest to the
+    # values. The old 'MMMMMM' constant reserved six monospace M's for every
+    # label, which at a 66 px column left the value under half the cell —
+    # enough to clip a live 456.9 down to a plausible-looking 45. The reading
+    # is the payload here; the label is only context.
+    lab_max = max((lab_f.size(l)[0] for l, _ in rows), default=0)
+    val_x = min(col_w // 2, lab_max + 4)
     lab_w = val_x - 2
     val_w = col_w - val_x - 2
     for i, (label, value) in enumerate(rows):
