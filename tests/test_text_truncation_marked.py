@@ -69,7 +69,8 @@ def test_degenerate_widths_do_not_crash(screen):
     assert hp._fit_text(f, "", 50) == ""
 
 
-def test_real_solar_values_fit_without_truncation(screen):
+@pytest.mark.parametrize("mode", [(720, 450), (800, 600), (1024, 768), (1440, 900)])
+def test_real_solar_values_fit_without_truncation(screen, mode):
     """The font sizes must be chosen so live numbers never clip.
 
     SOLAR is the tightest panel on the grid; if a real reading truncates here
@@ -79,8 +80,8 @@ def test_real_solar_values_fit_without_truncation(screen):
     Mirrors draw_solar's own cell arithmetic: labels take the width they need,
     values get the remainder of the column.
     """
-    fonts = hp._make_fonts()
-    layout = hp._get_layout((720, 450))
+    fonts = hp._make_fonts(mode)
+    layout = hp._get_layout(mode)
     r = layout["solar"]
     rect = pygame.Rect(r.x + 4, r.y + 18, r.w - 8, r.h - 22)
     lab_f, val_f = fonts["label"], fonts["body"]

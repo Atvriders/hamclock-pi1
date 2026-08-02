@@ -28,7 +28,9 @@ import hamclock_pygame as hp
 SENTINEL = (1, 2, 3)          # not a colour any theme paints
 SENTINEL_B = bytes(SENTINEL)
 
-SIZES = [(720, 450), (1440, 900)]
+# 800x600 is what a Pi 1 on a 1440x900 panel actually gets under KMSDRM:
+# 720x450 is not a real DRM mode, so SDL snaps to the nearest one.
+SIZES = [(720, 450), (800, 600), (1024, 768), (1440, 900)]
 
 
 # --- worst-case-ish sample data (long strings, full row counts) -------------
@@ -78,7 +80,10 @@ def env():
     pygame.display.init()
     pygame.font.init()
     screen = pygame.display.set_mode((1440, 900))
-    fonts = hp._make_fonts()
+    # NOTE: fonts are built per-size inside each test now — _make_fonts scales
+    # to the surface, so a single 1440x900 set rendered into a 720x450 surface
+    # would overflow every rect and the failure would look like a layout bug.
+    fonts = hp._make_fonts((1440, 900))
     theme = hp.THEMES['kstate']
     yield screen, fonts, theme
     pygame.display.quit()
@@ -127,6 +132,7 @@ def _inner(size, key):
 def test_solar_contained(env, size):
     _, fonts, theme = env
     surf = _fresh(size)
+    fonts = hp._make_fonts(size)
     rect = _inner(size, 'solar')
     hp.draw_solar(surf, rect, SOLAR, fonts, theme)
     _assert_contained(surf, rect, 'draw_solar@%dx%d' % size)
@@ -138,6 +144,7 @@ def test_solar_contained_with_cached_view(env, size):
     geometry, different value source; both paths must stay inside."""
     _, fonts, theme = env
     surf = _fresh(size)
+    fonts = hp._make_fonts(size)
     rect = _inner(size, 'solar')
     hp.draw_solar(surf, rect, SOLAR, fonts, theme, data_refresh_ts=12345.0)
     _assert_contained(surf, rect, 'draw_solar(ts)@%dx%d' % size)
@@ -147,6 +154,7 @@ def test_solar_contained_with_cached_view(env, size):
 def test_bands_contained(env, size):
     _, fonts, theme = env
     surf = _fresh(size)
+    fonts = hp._make_fonts(size)
     rect = _inner(size, 'bands')
     hp.draw_bands(surf, rect, BANDS, fonts, theme)
     _assert_contained(surf, rect, 'draw_bands@%dx%d' % size)
@@ -156,6 +164,7 @@ def test_bands_contained(env, size):
 def test_geomag_contained(env, size):
     _, fonts, theme = env
     surf = _fresh(size)
+    fonts = hp._make_fonts(size)
     rect = _inner(size, 'geomag')
     hp.draw_geomag(surf, rect, SOLAR, fonts, theme)
     _assert_contained(surf, rect, 'draw_geomag@%dx%d' % size)
@@ -165,6 +174,7 @@ def test_geomag_contained(env, size):
 def test_xray_contained(env, size):
     _, fonts, theme = env
     surf = _fresh(size)
+    fonts = hp._make_fonts(size)
     rect = _inner(size, 'xray')
     hp.draw_xray(surf, rect, SOLAR, fonts, theme)
     _assert_contained(surf, rect, 'draw_xray@%dx%d' % size)
@@ -174,6 +184,7 @@ def test_xray_contained(env, size):
 def test_open_bands_contained(env, size):
     _, fonts, theme = env
     surf = _fresh(size)
+    fonts = hp._make_fonts(size)
     rect = _inner(size, 'open_bands')
     hp._open_bands_cache['ts'] = None
     # A real ts (not None) or _open_bands_strings short-circuits on its own
@@ -187,6 +198,7 @@ def test_open_bands_contained(env, size):
 def test_sdo_image_placeholder_contained(env, size):
     _, fonts, theme = env
     surf = _fresh(size)
+    fonts = hp._make_fonts(size)
     rect = _inner(size, 'sdo')
     hp.draw_image(surf, rect, None, fonts, theme)
     _assert_contained(surf, rect, 'draw_image(loading)@%dx%d' % size)
@@ -198,6 +210,7 @@ def test_sdo_image_placeholder_contained(env, size):
 def test_muf_text_contained(env, size):
     _, fonts, theme = env
     surf = _fresh(size)
+    fonts = hp._make_fonts(size)
     rect = _inner(size, 'muf')
     hp.draw_muf_text(surf, rect, SOLAR, fonts, theme)
     _assert_contained(surf, rect, 'draw_muf_text@%dx%d' % size)
@@ -209,6 +222,7 @@ def test_muf_text_contained(env, size):
 def test_dx_spots_contained(env, size):
     _, fonts, theme = env
     surf = _fresh(size)
+    fonts = hp._make_fonts(size)
     rect = _inner(size, 'dx_spots')
     hp.draw_dx_spots(surf, rect, DXSPOTS, fonts, theme)
     _assert_contained(surf, rect, 'draw_dx_spots@%dx%d' % size)
@@ -218,6 +232,7 @@ def test_dx_spots_contained(env, size):
 def test_band_activity_contained(env, size):
     _, fonts, theme = env
     surf = _fresh(size)
+    fonts = hp._make_fonts(size)
     rect = _inner(size, 'band_activity')
     hp.draw_band_activity(surf, rect, DXSPOTS, fonts, theme)
     _assert_contained(surf, rect, 'draw_band_activity@%dx%d' % size)
@@ -229,12 +244,14 @@ def test_propagation_tabs_and_image_contained(env, size):
     a 20 px tab bar at the top of the inner rect, the image below it."""
     _, fonts, theme = env
     surf = _fresh(size)
+    fonts = hp._make_fonts(size)
     inner = _inner(size, 'propagation')
     tab_bar = pygame.Rect(inner.x, inner.y, inner.w, 20)
     hp.draw_tabs(surf, tab_bar, hp.PROP_TABS, 'drap', fonts, theme)
     _assert_contained(surf, tab_bar, 'draw_tabs@%dx%d' % size)
 
     surf = _fresh(size)
+    fonts = hp._make_fonts(size)
     img_rect = pygame.Rect(inner.x, inner.y + 24, inner.w, inner.h - 24)
     big = pygame.Surface((1024, 1024))
     big.fill((200, 30, 30))
@@ -264,6 +281,7 @@ def test_draw_image_does_not_upscale_past_rect(env, size):
 def test_header_contained(env, size):
     _, fonts, theme = env
     surf = _fresh(size)
+    fonts = hp._make_fonts(size)
     rect = hp._get_layout(size)['header']
     hp._strfmt_cache['key'] = None
     hp.draw_header(surf, rect, 'VE3ABCD/QRP', fonts, theme, data=_StubData())
@@ -274,6 +292,7 @@ def test_header_contained(env, size):
 def test_status_bar_contained(env, size):
     _, fonts, theme = env
     surf = _fresh(size)
+    fonts = hp._make_fonts(size)
     rect = hp._get_layout(size)['status']
     hp._strfmt_cache['key'] = None
     hp.draw_status_bar(surf, rect, _StubData(), fonts, theme)
@@ -290,6 +309,7 @@ def test_panel_chrome_contained(env, size, key):
     latter on frames where a panel's cadence has not elapsed)."""
     _, fonts, theme = env
     surf = _fresh(size)
+    fonts = hp._make_fonts(size)
     rect = hp._get_layout(size)[key]
     inner = hp.draw_panel(surf, rect, 'TEST TITLE', fonts, theme)
     _assert_contained(surf, rect, 'draw_panel[%s]@%dx%d' % (key, size[0], size[1]))

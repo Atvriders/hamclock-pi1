@@ -4474,8 +4474,13 @@ def _get_layout(screen_size):
     if _layout_cache["size"] == screen_size:
         return _layout_cache["rects"]
     sw, sh = screen_size
-    header_h = 30
-    status_h = 20
+    # Chrome heights scale with the framebuffer for the same reason the fonts
+    # do: at 1440x900 the title face is 35 px, and a hardcoded 30 px header
+    # bar meant the callsign painted straight out of its own rect and over the
+    # panel below. Derived from the same factor so the two can never drift.
+    _s = _font_scale(screen_size)
+    header_h = int(round(30 * _s))
+    status_h = int(round(20 * _s))
     content_top = header_h + 2
     content_bot = sh - status_h - 2
     content_h = content_bot - content_top
@@ -4667,12 +4672,46 @@ _scaled_cache = collections.OrderedDict()
 _font_aa = {}
 
 
-def _make_fonts():
+#: The framebuffer the base font sizes below were measured against. Every
+#: size is scaled by the ratio of the real surface to this, so the layout is
+#: tuned for whatever mode we actually get rather than one we hoped for.
+FONT_REF_W, FONT_REF_H = 720, 450
+
+#: Keep the scale sane if a mode is wildly different from the reference — a
+#: 4x font on a huge panel would look absurd, and shrinking below 1.0 makes an
+#: already-small face illegible on a display being read across a room.
+FONT_SCALE_MIN, FONT_SCALE_MAX = 1.0, 2.5
+
+
+def _font_scale(size):
+    """Scale factor for the fonts given the real surface size.
+
+    Under KMS the framebuffer is a REAL DRM mode, not an arbitrary size: the
+    legacy framebuffer_width/height knobs only worked with the old firmware
+    scaler, which KMS removed. Asking for 720x450 therefore gets snapped to the
+    nearest mode the connector actually offers — a Pi 1 on a 1440x900 panel
+    lands on 800x600 — so hardcoding sizes for 720x450 means the layout is
+    tuned for a mode that never appears. Derive from the surface instead.
+
+    Uses min(w, h) ratio so text never outgrows the shorter axis, which is what
+    actually runs out of room first on these panels.
+    """
+    try:
+        w, h = size
+        if w <= 0 or h <= 0:
+            return 1.0
+        s = min(w / float(FONT_REF_W), h / float(FONT_REF_H))
+        return max(FONT_SCALE_MIN, min(FONT_SCALE_MAX, s))
+    except Exception:
+        return 1.0
+
+
+def _make_fonts(screen_size=None):
     """Build the fonts dict. Falls back to default font if SysFont fails.
 
-    Sizes are tuned for the Tier 2a 720x450 native framebuffer (HVS upscales
-    to 1440x900 on Pi 1 / VideoCore IV). A 'tiny' font at 8 px renders
-    pleasantly at 16 px effective on the HDMI output.
+    Base sizes are measured against a 720x450 framebuffer and scaled to the
+    surface actually in use (see _font_scale). Pass screen_size explicitly in
+    tests; otherwise the live display surface is queried.
     """
     # Ensure font subsystem is up; callers (incl. recovery-overlay tests) may
     # only have initialized pygame.display, leaving pygame.font uninitialized.
@@ -4681,7 +4720,16 @@ def _make_fonts():
             pygame.font.init()
     except Exception:
         pass
+    if screen_size is None:
+        try:
+            _surf = pygame.display.get_surface()
+            screen_size = _surf.get_size() if _surf is not None else None
+        except Exception:
+            screen_size = None
+    _scale = _font_scale(screen_size or (FONT_REF_W, FONT_REF_H))
+
     def mk(size):
+        size = max(6, int(round(size * _scale)))
         try:
             f = pygame.font.SysFont('monospace', size)
             if f is None:
@@ -9019,7 +9067,7 @@ done
 # text itself. scripts/sync_installers.py stamps it from the repo VERSION file
 # and --check fails the build if the two drift.
 sudo tee "$INSTALL_DIR/VERSION" > /dev/null << 'HCVERSIONTXT'
-1.0.0
+1.0.1
 HCVERSIONTXT
 sudo chown root:root "$INSTALL_DIR/VERSION"
 sudo chmod 0644 "$INSTALL_DIR/VERSION"
