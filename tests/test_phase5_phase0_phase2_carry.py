@@ -31,9 +31,22 @@ def test_installer_carries_sdl_driver():
             # downgrades it.
             assert "SDL_VIDEODRIVER=fbcon" in text, f"{installer} lost fbcon export"
         elif drv == "kmsdrm":
-            assert "SDL_VIDEODRIVER=kmsdrm" in text
-            assert "gpu_mem=128" in text
-            assert "dtoverlay=vc4-fkms-v3d" in text
+            # The original expectation here (gpu_mem=128 + dtoverlay=vc4-fkms-v3d)
+            # was written before any hardware existed. The first real diagnostics
+            # report contradicts it: a Pi 1B runs kmsdrm at 32bpp with gpu_mem=16
+            # and a 1.2 ms median frame time, on real KMS under kernel 6.12 /
+            # trixie. fkms is a different, deprecated stack — forcing it there is
+            # at best a no-op and at worst breaks a working display — and raising
+            # gpu_mem would surrender ~48 MB of a 486 MB box for no measured gain.
+            # See docs/sdl-backend.md for the report this is derived from.
+            #
+            # What actually matters is that the driver ladder can still reach
+            # kmsdrm: fbcon is tried first and is unavailable on this SDL build,
+            # so the ladder is the thing that makes the kiosk work at all.
+            assert "kmsdrm" in text, f"{installer} lost the kmsdrm rung"
+            assert "gpu_mem=128" not in text, (
+                f"{installer} sets gpu_mem=128; measured hardware runs kmsdrm "
+                f"fine at gpu_mem=16 and needs the RAM more")
         elif drv == "xinit":
             assert "xinit" in text and "matchbox-window-manager" in text
 

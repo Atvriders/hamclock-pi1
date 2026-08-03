@@ -410,18 +410,46 @@ def test_server_block_is_scrubbed_of_secret_shaped_keys(monkeypatch):
     assert got == {'cache': {'muf_age': 42}, 'nested': [{'ok': 1}]}
 
 
-def test_server_block_is_null_when_the_server_is_down(monkeypatch):
+def test_server_block_explains_itself_when_the_server_is_down(monkeypatch):
+    """A missing block must say WHY.
+
+    The first report from real hardware came back with "server": null and the
+    reason lived only in the Pi's journal — on a box the maintainer cannot
+    reach. A report that cannot explain its own gaps costs a round trip
+    through the operator, which is what telemetry exists to avoid.
+    """
     def boom(*a, **kw):
         raise OSError('connection refused')
     monkeypatch.setattr(hp, '_urlopen', boom)
-    assert hp._fetch_server_diagnostics() is None
+    got = hp._fetch_server_diagnostics()
+    assert isinstance(got, dict) and 'error' in got, got
+    assert 'connection refused' in got['error'].lower()
 
 
-def test_server_block_is_null_when_the_body_is_absurd(monkeypatch):
+def test_server_block_distinguishes_a_missing_endpoint_from_a_dead_server():
+    """404 means the local server predates /api/diagnostics; ECONNREFUSED
+    means it is not running. The two have different fixes, so the report must
+    not blur them."""
+    import urllib.error
+
+    class _E(urllib.error.HTTPError):
+        def __init__(self):
+            urllib.error.HTTPError.__init__(
+                self, 'http://localhost:8080/api/diagnostics', 404,
+                'Not Found', {}, None)
+
+    import unittest.mock as _m
+    with _m.patch.object(hp, '_urlopen', side_effect=_E()):
+        got = hp._fetch_server_diagnostics()
+    assert got == {'error': 'http 404'}, got
+
+
+def test_server_block_explains_an_absurd_body(monkeypatch):
     huge = b'{"x": "' + b'a' * (hp.SERVER_DIAG_MAX_BYTES + 10) + b'"}'
     monkeypatch.setattr(hp, '_urlopen', lambda req, timeout=None:
                         _FakeResp(huge))
-    assert hp._fetch_server_diagnostics() is None
+    got = hp._fetch_server_diagnostics()
+    assert isinstance(got, dict) and 'oversize' in got.get('error', ''), got
 
 
 def test_server_block_uses_the_live_server_url(monkeypatch, screen, fonts,

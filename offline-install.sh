@@ -6286,12 +6286,30 @@ def _scrub_secrets(obj, depth=0):
     return str(obj)[:512]
 
 
+def _diag_error(reason):
+    """A self-describing stand-in for a diagnostics block we could not get.
+
+    Returning a bare None taught us nothing: the first report from real
+    hardware came back with "server": null, and the reason was only in the
+    Pi's journal — on a box the maintainer cannot reach. A report that cannot
+    explain its own gaps costs a round trip through the operator, which is the
+    thing telemetry exists to avoid. Short, no secrets, no host paths.
+    """
+    return {'error': str(reason)[:200]}
+
+
 def _fetch_server_diagnostics(base_url=None, timeout=SERVER_DIAG_TIMEOUT_S):
-    """GET the local server's /api/diagnostics. None on ANY failure.
+    """GET the local server's /api/diagnostics.
+
+    On failure returns {'error': ...} rather than None, so the report itself
+    says why the block is missing.
 
     Short timeout on purpose: this runs on the render thread, once, in
     response to a keypress. The server is on loopback, so the realistic
-    failure is 'not running' (instant ECONNREFUSED), not a slow reply."""
+    failure is 'not running' (instant ECONNREFUSED), not a slow reply — and
+    measured, the endpoint answers in 1-18 ms on x86, so even a 50x slower
+    ARMv6 has ample headroom.
+    """
     base = (base_url or 'http://localhost:8080').rstrip('/')
     try:
         req = _Request(base + SERVER_DIAG_PATH)
@@ -6299,24 +6317,30 @@ def _fetch_server_diagnostics(base_url=None, timeout=SERVER_DIAG_TIMEOUT_S):
         req.add_header('User-Agent', TELEMETRY_UA)
         resp = _urlopen(req, timeout=timeout)
     except Exception as e:
+        # HTTP 404 here means the local server predates /api/diagnostics —
+        # worth distinguishing from "not running", because the fix differs.
+        code = getattr(e, 'code', None)
+        reason = ('http %s' % code) if code else '%s: %s' % (type(e).__name__, e)
         print('[report] server diagnostics unavailable: %s' % e,
               file=sys.stderr)
-        return None
+        return _diag_error(reason)
     try:
         raw = resp.read(SERVER_DIAG_MAX_BYTES + 1)
-    except Exception:
-        return None
+    except Exception as e:
+        return _diag_error('read: %s' % type(e).__name__)
     finally:
         try:
             resp.close()
         except Exception:
             pass
-    if not raw or len(raw) > SERVER_DIAG_MAX_BYTES:
-        return None
+    if not raw:
+        return _diag_error('empty response')
+    if len(raw) > SERVER_DIAG_MAX_BYTES:
+        return _diag_error('oversize: %d bytes' % len(raw))
     try:
         body = json.loads(raw.decode('utf-8', 'replace'))
-    except Exception:
-        return None
+    except Exception as e:
+        return _diag_error('parse: %s' % type(e).__name__)
     if not isinstance(body, (dict, list)):
         return None
     return _scrub_secrets(body)
