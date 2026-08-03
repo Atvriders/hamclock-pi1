@@ -4456,6 +4456,42 @@ SCREEN_H = 450
 # and rasterizes to PNG for /api/muf-map — decoded lazily only when selected,
 # so idle RAM/FPS on the Pi 1B are unchanged.
 PROP_TABS = ['drap', 'aurora', 'enlil', 'muf']
+
+#: How long each propagation tab stays up before the panel advances itself.
+#: This is a wall display: nobody is standing at it clicking through tabs, so a
+#: tab that is never selected is a map the operator never sees. Cycling makes
+#: all four reachable without input. Five minutes is long enough to actually
+#: read a map and short enough to see every one within a coffee break.
+#: Set to 0 to disable and leave the panel wherever it was last put.
+TAB_CYCLE_S = 300.0
+
+
+def _next_cycle_tab(current, tabs, key_map, data):
+    """The tab to show next, skipping ones with no image to show.
+
+    A feed that is down (or has not loaded yet) would otherwise hold the panel
+    blank for a full interval, which on a five-minute cycle is a quarter of the
+    rotation spent showing nothing. Skipping it costs nothing when everything
+    is healthy and degrades gracefully when it is not.
+
+    Falls back to plain next-in-order when NOTHING has an image — during the
+    first seconds after boot that is the normal state, and refusing to advance
+    would pin the panel to whatever tab happened to be first.
+    """
+    if not tabs:
+        return current
+    n = len(tabs)
+    try:
+        i = tabs.index(current)
+    except ValueError:
+        i = 0
+    images = getattr(data, 'images', None)
+    if isinstance(images, dict):
+        for step in range(1, n + 1):
+            cand = tabs[(i + step) % n]
+            if images.get(key_map.get(cand)):
+                return cand
+    return tabs[(i + 1) % n]
 PROP_TAB_IMAGE_KEY = {
     'drap': 'real-drap',
     'aurora': 'drap',
@@ -7333,6 +7369,9 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
         print('data start error:', e, file=sys.stderr)
 
     active_tab = 'drap'
+    # Absolute deadline rather than a countdown, so a long frame or a paused
+    # process cannot make the panel drift slower than the configured interval.
+    next_tab_at = time.time() + TAB_CYCLE_S
     image_cache = {}
     image_cache_ts = {}
     tab_regions = {}
@@ -7473,6 +7512,11 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                             if r.collidepoint(pos):
                                 active_tab = name
                                 dirty_state['full_flip_pending'] = True
+                                # Someone is standing at the screen and chose
+                                # this map. Give them the full interval to
+                                # read it rather than yanking it away partway
+                                # through whatever the cycle had left.
+                                next_tab_at = time.time() + TAB_CYCLE_S
                                 break
 
             if _report_poll(report):
@@ -7511,6 +7555,19 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 clock.tick(10)
                 consecutive_errors = 0
                 continue
+
+            # Advance the propagation panel on its own. Must happen BEFORE
+            # will_full_flip is computed below, because a tab change is one of
+            # the things that predicate tests for — deciding after it would
+            # paint the new tab into a partial-update frame and leave the old
+            # tab's pixels behind until something else forced a flip.
+            if TAB_CYCLE_S > 0 and time.time() >= next_tab_at:
+                _cycled = _next_cycle_tab(active_tab, PROP_TABS,
+                                          tab_image_key, data)
+                if _cycled != active_tab:
+                    active_tab = _cycled
+                    dirty_state['full_flip_pending'] = True
+                next_tab_at = time.time() + TAB_CYCLE_S
 
             sw, sh = screen.get_size()
             # Tier-0 perf: only memset the whole 720x450 framebuffer when this
@@ -9091,7 +9148,7 @@ done
 # text itself. scripts/sync_installers.py stamps it from the repo VERSION file
 # and --check fails the build if the two drift.
 sudo tee "$INSTALL_DIR/VERSION" > /dev/null << 'HCVERSIONTXT'
-1.0.1
+1.0.2
 HCVERSIONTXT
 sudo chown root:root "$INSTALL_DIR/VERSION"
 sudo chmod 0644 "$INSTALL_DIR/VERSION"
