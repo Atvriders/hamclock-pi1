@@ -4455,7 +4455,11 @@ SCREEN_H = 450
 # data.images[key]. 'muf' surfaces the KC2G MUF map the server already fetches
 # and rasterizes to PNG for /api/muf-map — decoded lazily only when selected,
 # so idle RAM/FPS on the Pi 1B are unchanged.
-PROP_TABS = ['drap', 'aurora', 'enlil', 'muf']
+#: The MUF map is NOT here: it now occupies the centre panel full time, so a
+#: tab showing the same map would spend a quarter of the cycle duplicating what
+#: is already on screen. PROP_TAB_IMAGE_KEY keeps its 'muf' entry so anything
+#: that still resolves that name (older settings, tests) maps correctly.
+PROP_TABS = ['drap', 'aurora', 'enlil']
 
 #: How long each propagation tab stays up before the panel advances itself.
 #: This is a wall display: nobody is standing at it clicking through tabs, so a
@@ -5302,7 +5306,47 @@ def _draw_value_and_bar(screen, rect, text, value, vmax, color, fonts, theme):
                  value, vmax, color, theme)
 
 
-def draw_muf_text(screen, rect, solar, fonts, theme):
+def draw_muf_text(screen, rect, solar, fonts, theme, surf=None,
+                  image_key=None, fetched_at=None):
+    """MUF map across the top of the panel, the numbers beneath it.
+
+    The map used to live in a tab of the propagation panel, where it got about
+    7% of the screen while this panel spent 35% on five numbers — the one
+    genuinely spatial display in the layout was the smallest thing on it. The
+    map now takes the width of this panel and the stats keep the space below,
+    which is roughly 1.6x the map area the tab could give it.
+
+    The panel is portrait (356x541 at 800x600) and the map is landscape
+    (~1.69:1), so the map is fitted to WIDTH and whatever it does not use is
+    left to the stats rather than stretching it — a distorted contour map is
+    worse than a smaller honest one.
+
+    surf=None keeps the old text-only behaviour, which is what every caller
+    that has no image (and the theme tests) still gets.
+    """
+    map_h = 0
+    if surf is not None:
+        try:
+            iw, ih = surf.get_size()
+            if iw > 0 and ih > 0:
+                avail_w = rect.w
+                # Never upscale past the raster's own width: the PNG is
+                # rendered at output_width=360 and blowing it up past that
+                # just makes the contours mushy.
+                draw_w = min(avail_w, iw)
+                draw_h = max(1, int(ih * (draw_w / float(iw))))
+                # Leave at least enough room for the five rows underneath.
+                if draw_h <= rect.h * 0.55:
+                    map_rect = pygame.Rect(rect.x + (rect.w - draw_w) // 2,
+                                           rect.y, draw_w, draw_h)
+                    draw_image(screen, map_rect, surf, fonts, theme,
+                               image_key=image_key, fetched_at=fetched_at)
+                    map_h = draw_h + max(4, rect.h // 40)
+        except Exception:
+            map_h = 0
+    if map_h:
+        rect = pygame.Rect(rect.x, rect.y + map_h, rect.w, rect.h - map_h)
+
     rows = [
         ('FOF2',   '{} MHz'.format(_safe(solar, 'fof2'))),
         ('GEOMAG', _safe(solar, 'geomagField')),
@@ -5337,10 +5381,17 @@ def draw_muf_text(screen, rect, solar, fonts, theme):
                   val_x, y + (glyph_h - val_h) // 2, val_w)
         y += pitch
     if foot_h:
-        # Was '(Map available in web UI)', which stopped being true once the
-        # native client grew a MUF tab — it sent operators to a browser this
-        # hardware cannot usefully run. Point at the tab that now has the map.
-        _blit_fit(screen, foot_f, 'Map: PROPAGATION > MUF', theme['label'],
+        # This line has been wrong twice. It began as '(Map available in web
+        # UI)' — sending operators to a browser this hardware cannot usefully
+        # run — then became 'Map: PROPAGATION > MUF', which went stale the
+        # moment the map moved into this panel and that tab was retired.
+        # Directions to the map are pointless when the map is directly above,
+        # so it now credits the source instead, which cannot go stale while
+        # the source is still what fetch_muf() asks for.
+        _blit_fit(screen, foot_f,
+                  'MUF(3000)km  ·  prop.kc2g.com' if surf is not None
+                  else 'MUF(3000)km  ·  prop.kc2g.com  (map loading)',
+                  theme['label'],
                   lab_x, rect.bottom - foot_h, rect.right - lab_x)
 
 
@@ -5842,7 +5893,10 @@ def _compute_dirty_rects(state, panel_rects, active_tab,
                 dirty.append(r)
     if image_refresh != state.get('prev_image_refresh'):
         state['prev_image_refresh'] = image_refresh
-        for k in ('sdo', 'propagation'):
+        # muf_text joined this group when the map moved into it: it is now
+        # image-fed as well as data-fed, and without this the map would only
+        # refresh when the SOLAR numbers happened to change.
+        for k in ('sdo', 'propagation', 'muf_text'):
             r = panel_rects.get(k)
             if r is not None and r not in dirty:
                 dirty.append(r)
@@ -7728,9 +7782,21 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
             mid_rect = layout["muf"]
             if _panel_due('muf_text'):
                 _t0 = _mono()
-                mid_inner = draw_panel(screen, mid_rect, 'MUF STATUS', fonts, theme)
+                mid_inner = draw_panel(screen, mid_rect, 'MUF MAP', fonts, theme)
+                muf_surf = None
                 try:
-                    draw_muf_text(screen, mid_inner, data.solar or {}, fonts, theme)
+                    muf_surf = _get_cached_image(data, 'muf-map',
+                                                 image_cache, image_cache_ts)
+                except Exception:
+                    muf_surf = None
+                try:
+                    draw_muf_text(
+                        screen, mid_inner, data.solar or {}, fonts, theme,
+                        surf=muf_surf, image_key='muf-map',
+                        fetched_at=(data.image_fetched_at.get('muf-map', 0.0)
+                                    if isinstance(
+                                        getattr(data, 'image_fetched_at', None),
+                                        dict) else 0.0))
                 except Exception:
                     pass
                 _record_panel_ms('muf_text', _t0)
@@ -9148,7 +9214,7 @@ done
 # text itself. scripts/sync_installers.py stamps it from the repo VERSION file
 # and --check fails the build if the two drift.
 sudo tee "$INSTALL_DIR/VERSION" > /dev/null << 'HCVERSIONTXT'
-1.0.2
+1.0.3
 HCVERSIONTXT
 sudo chown root:root "$INSTALL_DIR/VERSION"
 sudo chmod 0644 "$INSTALL_DIR/VERSION"

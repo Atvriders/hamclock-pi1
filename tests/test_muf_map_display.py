@@ -24,14 +24,27 @@ import pytest
 import hamclock_pygame as hp
 
 
-def test_prop_tabs_include_muf_wired_to_muf_map():
-    # The map is only reachable if 'muf' is a selectable propagation tab AND
-    # it resolves to the 'muf-map' image key the data layer fetches.
-    assert 'muf' in hp.PROP_TABS, (
-        "propagation panel must offer a 'muf' tab so the KC2G MUF map is "
-        "reachable on the native client")
-    assert hp.PROP_TAB_IMAGE_KEY.get('muf') == 'muf-map', (
-        "the 'muf' tab must resolve to the 'muf-map' image endpoint key")
+def test_muf_map_is_rendered_in_the_centre_panel():
+    """The map must reach the screen. It originally did not render at all;
+    then it lived in a propagation tab; it now occupies the centre panel.
+    The mechanism has changed twice — the requirement has not.
+    """
+    import inspect
+    src = inspect.getsource(hp)
+    i = src.index("mid_inner = draw_panel")
+    window = src[i:i + 900]
+    assert "'muf-map'" in window, (
+        "the centre panel must resolve the 'muf-map' image the data layer "
+        "fetches, or the map is downloaded every cycle and thrown away")
+    assert "_get_cached_image" in window, (
+        "the centre panel must decode the map, not just name it")
+    # draw_muf_text must be able to accept and blit that surface.
+    sig = inspect.signature(hp.draw_muf_text)
+    assert 'surf' in sig.parameters, "draw_muf_text takes no image"
+
+
+def test_muf_key_still_resolves_for_anything_holding_the_old_name():
+    assert hp.PROP_TAB_IMAGE_KEY.get('muf') == 'muf-map'
 
 
 def test_muf_map_key_matches_data_layer_endpoint():

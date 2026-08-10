@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import hamclock_pygame as hp
 
 KM = hp.PROP_TAB_IMAGE_KEY
-ALL_UP = {'real-drap': b'x', 'drap': b'x', 'enlil': b'x', 'muf-map': b'x'}
+ALL_UP = {'real-drap': b'x', 'drap': b'x', 'enlil': b'x'}
 
 
 class _Data:
@@ -44,13 +44,19 @@ def test_interval_is_five_minutes():
 
 def test_cycles_through_every_tab_in_order():
     seq = _walk(_Data(ALL_UP), len(hp.PROP_TABS))
-    assert seq[1:] == ['aurora', 'enlil', 'muf', 'drap'], seq
+    assert seq[1:] == ['aurora', 'enlil', 'drap'], seq
     # every tab reachable — the whole point
     assert set(seq) == set(hp.PROP_TABS)
 
 
 def test_wraps_around():
-    assert hp._next_cycle_tab('muf', hp.PROP_TABS, KM, _Data(ALL_UP)) == 'drap'
+    assert hp._next_cycle_tab('enlil', hp.PROP_TABS, KM, _Data(ALL_UP)) == 'drap'
+
+
+def test_muf_is_not_a_tab():
+    """The map lives in the centre panel full time now. A tab showing the same
+    map would spend a third of the rotation duplicating what is already up."""
+    assert 'muf' not in hp.PROP_TABS
 
 
 def test_skips_a_feed_with_no_image():
@@ -59,21 +65,21 @@ def test_skips_a_feed_with_no_image():
     del down['enlil']
     seq = _walk(_Data(down), 6)
     assert 'enlil' not in seq[1:], seq
-    assert set(seq[1:]) == {'drap', 'aurora', 'muf'}
+    assert set(seq[1:]) == {'drap', 'aurora'}
 
 
 def test_lands_on_the_only_live_feed():
-    only_muf = _Data({'muf-map': b'x'})
-    assert hp._next_cycle_tab('drap', hp.PROP_TABS, KM, only_muf) == 'muf'
+    only_enlil = _Data({'enlil': b'x'})
+    assert hp._next_cycle_tab('drap', hp.PROP_TABS, KM, only_enlil) == 'enlil'
     # and stays there rather than bouncing through dead tabs
-    assert hp._next_cycle_tab('muf', hp.PROP_TABS, KM, only_muf) == 'muf'
+    assert hp._next_cycle_tab('enlil', hp.PROP_TABS, KM, only_enlil) == 'enlil'
 
 
 def test_still_advances_when_nothing_has_loaded_yet():
     """During the first seconds after boot no image exists. Refusing to advance
     would pin the panel to whichever tab happened to be first."""
-    seq = _walk(_Data({}), 4)
-    assert seq[1:] == ['aurora', 'enlil', 'muf', 'drap'], seq
+    seq = _walk(_Data({}), 3)
+    assert seq[1:] == ['aurora', 'enlil', 'drap'], seq
 
 
 def test_tolerates_a_data_object_without_images():
