@@ -436,3 +436,31 @@ def test_send_json_accepts_prebaked_bytes(monkeypatch):
     h.end_headers = lambda: None
     server.Handler.send_json(h, b'{"x":1}')
     assert body_seen['b'] == b'{"x":1}'
+
+
+# ---- the bootstrap deadlock (found on real hardware, 2026-08-16) ----------
+
+def test_timeout_escalates_while_no_render_has_ever_succeeded(monkeypatch):
+    """The EWMA is only written on success, so a box whose true render time
+    sits above the floor used to deadlock: time out at 45 s, record nothing,
+    keep the 45 s budget, time out again, forever. A Pi 1B is that box —
+    slimmed cairosvg is ~0.57 s on x86, which scaled for ARMv6 and doubled by
+    cpulimit's 50% duty straddles 45 s.
+    """
+    monkeypatch.setattr(server, '_muf_render_ewma', None, raising=False)
+    seen = []
+    for n in (0, 1, 2, 3, 4):
+        monkeypatch.setattr(server, '_MUF_RASTERIZE_TIMEOUT', n, raising=False)
+        seen.append(server._muf_timeout())
+    assert seen[0] == server.PHASE2_TIMEOUT_S, "first attempt must use the floor"
+    assert seen[1] > seen[0], "a timeout must widen the budget, not repeat it"
+    assert seen == sorted(seen), f"budget must be monotonic: {seen}"
+    assert max(seen) <= server.PHASE2_TIMEOUT_MAX_S, "must respect the ceiling"
+    assert seen[-1] == server.PHASE2_TIMEOUT_MAX_S, "must reach the ceiling"
+
+
+def test_one_success_retires_the_escalation(monkeypatch):
+    """A fast box must not keep paying for an early stumble."""
+    monkeypatch.setattr(server, '_MUF_RASTERIZE_TIMEOUT', 3, raising=False)
+    monkeypatch.setattr(server, '_muf_render_ewma', 3.0, raising=False)
+    assert server._muf_timeout() == server.PHASE2_TIMEOUT_S

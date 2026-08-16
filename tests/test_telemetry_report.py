@@ -619,7 +619,7 @@ def test_confirm_is_the_only_thing_that_sends(screen, fonts, no_server,
                                               settings_path, monkeypatch):
     sent = []
     monkeypatch.setattr(hp, '_send_telemetry_async',
-                        lambda payload, holder, url=None: sent.append(payload))
+                        lambda payload, holder, url=None, **kw: sent.append(payload))
     st = hp._new_report_state()
     # Confirming from idle is a no-op: there is no armed payload to send.
     assert hp._report_confirm(st) is False
@@ -948,7 +948,7 @@ def test_confirming_after_the_dialog_sends_exactly_once(monkeypatch,
                                                         settings_path):
     sent = []
     monkeypatch.setattr(hp, '_send_telemetry_async',
-                        lambda payload, holder, url=None: sent.append(payload))
+                        lambda payload, holder, url=None, **kw: sent.append(payload))
     st = _drive(monkeypatch,
                 [[pygame.event.Event(pygame.KEYDOWN, key=pygame.K_t)],
                  [],

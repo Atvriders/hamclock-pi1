@@ -2435,7 +2435,13 @@ TELEMETRY_UA = 'hamclock-pi1-report/1 (+https://hamclock-reborn.org)'
 # under payload['server']. Path only — the host comes from the live
 # HamClockData instance so a non-default --server URL is honoured.
 SERVER_DIAG_PATH = '/api/diagnostics'
-SERVER_DIAG_TIMEOUT_S = 2.0
+# Measured 1-18 ms on x86, from which I concluded a 2 s budget had "ample
+# ARMv6 headroom". The first field report that could answer the question said
+# otherwise: 'TimeoutError: timed out'. A 700 MHz single core already running a
+# 10 FPS loop, and possibly a cpulimited cairosvg, does not serve a request in
+# the time an idle x86 does. The fetch now happens on the SENDER thread rather
+# than the render thread, so a generous budget costs the display nothing.
+SERVER_DIAG_TIMEOUT_S = 20.0
 SERVER_DIAG_MAX_BYTES = 64 * 1024
 
 # A 720x450 antialiased frame is ~73 KB of PNG -> ~98 KB of base64. The cap is
@@ -2995,7 +3001,8 @@ def _get_or_create_device_id(settings, path=None):
 
 
 def _collect_telemetry(screen, data, fonts=None, settings=None,
-                       settings_path=None, screenshot=True):
+                       settings_path=None, screenshot=True,
+                       defer_server=False):
     """Build the diagnostics payload. Collects only; sends nothing.
 
     `fonts` is accepted for call-site symmetry with the draw helpers and is
@@ -3026,7 +3033,12 @@ def _collect_telemetry(screen, data, fonts=None, settings=None,
             'panel_ms': dict((k, round(v, 1)) for k, v in _panel_ms.items()),
             'boot_to_first_paint_s': _first_paint_s,
         },
-        'server': _fetch_server_diagnostics(base),
+        # defer_server: leave this for the sender thread. Collecting it here
+        # blocks the 10 FPS render loop while the confirm dialog is being
+        # built, which is how a 2 s budget turned into a visible stall and
+        # then a timeout on real hardware. The dialog lists categories, not
+        # values, so nothing on screen depends on having it yet.
+        'server': (None if defer_server else _fetch_server_diagnostics(base)),
         'screenshot_png_b64': (_screenshot_b64(screen) if screenshot
                                else None),
     }
@@ -3077,7 +3089,7 @@ def _post_telemetry(payload, url=None, timeout=None):
     return (True, 'report sent — thank you')
 
 
-def _send_telemetry_async(payload, holder, url=None):
+def _send_telemetry_async(payload, holder, url=None, diag_base=None):
     """Run one _post_telemetry on a short-lived daemon thread.
 
     The render loop must not block for up to 15 s at 10 FPS. The thread only
@@ -3085,6 +3097,9 @@ def _send_telemetry_async(payload, holder, url=None):
     single key without a lock."""
     def _worker():
         try:
+            # Off the render thread, so this may take as long as it needs.
+            if diag_base is not None and payload.get('server') is None:
+                payload['server'] = _fetch_server_diagnostics(diag_base)
             ok, msg = _post_telemetry(payload, url=url)
         except Exception as e:          # belt and braces; must never escape
             ok, msg = (False, 'send failed: %s' % e)
@@ -3348,13 +3363,21 @@ def _report_open(state, screen, data, fonts, settings, callsign='',
         return False
     try:
         payload = _collect_telemetry(screen, data, fonts, settings=settings,
-                                     settings_path=settings_path)
+                                     settings_path=settings_path,
+                                     defer_server=True)
         lines = _report_confirm_lines(payload, callsign)
     except Exception as e:
         print('[report] could not build the report: %s' % e, file=sys.stderr)
         _report_notice(state, 'report failed: %s' % e, 'poor')
         return False
     state['payload'] = payload
+    # Carried for the sender thread: _report_confirm has no `data` in scope,
+    # and the server diagnostics are deliberately fetched there rather than
+    # here so the confirm dialog does not stall the render loop.
+    try:
+        state['diag_base'] = getattr(data, 'server_url', None)
+    except Exception:
+        state['diag_base'] = None
     state['lines'] = lines
     state['regions'] = {}
     state['shown'] = False
@@ -3399,7 +3422,8 @@ def _report_confirm(state, url=None):
     state['shown'] = False
     state['stage'] = 'sending'
     _report_notice(state, 'sending report…', 'accent')
-    _send_telemetry_async(payload, holder, url=url)
+    _send_telemetry_async(payload, holder, url=url,
+                          diag_base=state.get('diag_base'))
     return True
 
 

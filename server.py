@@ -811,12 +811,32 @@ def _record_muf_render(seconds):
 
 
 def _muf_timeout():
-    """Adaptive rasterize budget, floored at PHASE2_TIMEOUT_S."""
+    """Adaptive rasterize budget, floored at PHASE2_TIMEOUT_S.
+
+    Escalates while no render has EVER succeeded. The EWMA is only written on
+    success, so a box whose true render time sits above the floor used to
+    deadlock: time out at 45 s, record nothing, keep the 45 s budget, time out
+    again, forever. The budget could only widen after a success it could never
+    achieve.
+
+    A Pi 1B is exactly that box. Slimmed cairosvg measures 0.57 s on x86;
+    scaled 30-50x for ARMv6 and doubled again by cpulimit's 50% duty cycle
+    that lands around 34-57 s — straddling the 45 s floor. So consecutive
+    timeouts are treated as evidence the floor is wrong for this hardware and
+    the budget steps toward the ceiling. Fast boxes never pay it: one success
+    switches to the EWMA path and the escalation is forgotten.
+    """
     ewma = _muf_render_ewma
-    if not ewma:
-        return PHASE2_TIMEOUT_S
-    return int(min(PHASE2_TIMEOUT_MAX_S,
-                   max(PHASE2_TIMEOUT_S, MUF_TIMEOUT_FACTOR * ewma)))
+    if ewma:
+        return int(min(PHASE2_TIMEOUT_MAX_S,
+                       max(PHASE2_TIMEOUT_S, MUF_TIMEOUT_FACTOR * ewma)))
+    if _MUF_RASTERIZE_TIMEOUT > 0:
+        steps = 3.0
+        step = min(float(_MUF_RASTERIZE_TIMEOUT), steps)
+        widened = PHASE2_TIMEOUT_S + (
+            (PHASE2_TIMEOUT_MAX_S - PHASE2_TIMEOUT_S) * (step / steps))
+        return int(min(PHASE2_TIMEOUT_MAX_S, widened))
+    return PHASE2_TIMEOUT_S
 
 
 def _rasterize_once(payload, timeout_s):

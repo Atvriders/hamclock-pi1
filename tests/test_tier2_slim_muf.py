@@ -405,7 +405,12 @@ def test_timeout_ceiling_is_below_the_dx_cadence():
 
 
 def test_timeout_is_the_floor_before_anything_has_been_measured():
+    """First attempt only. _MUF_RASTERIZE_TIMEOUT is module-level global state
+    that other tests mutate, and after a timeout the budget deliberately
+    escalates (see test_timeout_escalates_while_no_render_has_ever_succeeded),
+    so pin the counter rather than inheriting it."""
     server._muf_render_ewma = None
+    server._MUF_RASTERIZE_TIMEOUT = 0
     assert server._muf_timeout() == server.PHASE2_TIMEOUT_S
 
 
