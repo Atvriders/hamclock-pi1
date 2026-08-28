@@ -229,7 +229,11 @@ def test_refresh_images_with_keys_fetches_only_those(clock, monkeypatch):
 
     results = d.refresh_images(['muf-map', 'drap'])
 
-    assert seen == ['/api/muf-map', '/api/drap']
+    # Reference the endpoint map rather than literals: muf-map carries
+    # ?fmt=png (so the server cannot answer with undecodable SVG), and a
+    # hardcoded path here would go stale the next time a query param moves.
+    EP = HamClockData._IMAGE_ENDPOINTS
+    assert seen == [EP['muf-map'], EP['drap']]
     assert set(results) == {'muf-map', 'drap'}
     assert set(d.image_next_due) == {'muf-map', 'drap'}
 

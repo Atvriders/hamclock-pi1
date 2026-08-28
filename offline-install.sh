@@ -3261,7 +3261,14 @@ class HamClockData:
     }
     _IMAGE_ENDPOINTS = {
         'solar-image': '/api/solar-image',
-        'muf-map': '/api/muf-map',
+        # ?fmt=png matters: without it the server falls back to serving the
+        # raw KC2G SVG while the rasterize is still running, and pygame cannot
+        # decode SVG. _fetch_binary treats any HTTP 200 as success, so those
+        # undecodable bytes were cached as a satisfied fetch and the key was
+        # not retried until the next 900 s cycle — 15 minutes of a blank MUF
+        # panel. With ?fmt=png the server answers PNG-or-503, and a 503 is a
+        # real failure that the retry backoff picks up within seconds.
+        'muf-map': '/api/muf-map?fmt=png',
         'enlil': '/api/enlil',
         'drap': '/api/drap',
         'real-drap': '/api/real-drap',
@@ -3358,6 +3365,32 @@ class HamClockData:
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
             self.errors[path] = '{}: {}'.format(type(e).__name__, e)
             return None
+
+    def mark_image_undecodable(self, key, retry_in=None):
+        """Report that key's cached bytes could not be decoded.
+
+        A 200 carrying a payload this client cannot render is a failed fetch in
+        every way that matters, but _fetch_binary cannot see that — only the
+        decoder can. Without this the key stays "satisfied" until the slow
+        cycle comes round again. Schedules a retry on the normal backoff.
+        """
+        try:
+            if key not in self._IMAGE_ENDPOINTS:
+                return
+            with self._lock:
+                streak = self.image_fail_streak.get(key, 0) + 1
+                self.image_fail_streak[key] = streak
+                if retry_in is None:
+                    idx = min(streak, len(self.IMAGE_RETRY_BACKOFF)) - 1
+                    retry_in = self.IMAGE_RETRY_BACKOFF[max(0, idx)]
+                self.image_next_due[key] = time.time() + retry_in
+                # Drop the bad payload so a stale-but-good surface is not
+                # rebuilt from it, and so "have we got bytes" stays honest.
+                imgs = dict(self.images)
+                imgs.pop(key, None)
+                self.images = imgs
+        except Exception:
+            pass
 
     def refresh_data(self):
         """Fetch the 4 JSON endpoints synchronously."""
@@ -5722,6 +5755,17 @@ def _get_cached_image(data, key, image_cache, image_cache_ts):
             image_cache_ts[key] = ts
             _decode_failed_ts.pop(key, None)
         else:
+            # First time we have seen THIS payload fail. Tell the data layer,
+            # so the key is refetched on the retry backoff instead of sitting
+            # satisfied until the next slow cycle: the decoder is the only
+            # part of the system that can tell a useless 200 from a good one.
+            if _decode_failed_ts.get(key) != ts:
+                try:
+                    data.mark_image_undecodable(key)
+                except AttributeError:
+                    pass        # older data layer; nothing to report to
+                except Exception:
+                    pass
             _decode_failed_ts[key] = ts
     return image_cache.get(key)
 
@@ -9258,7 +9302,7 @@ done
 # text itself. scripts/sync_installers.py stamps it from the repo VERSION file
 # and --check fails the build if the two drift.
 sudo tee "$INSTALL_DIR/VERSION" > /dev/null << 'HCVERSIONTXT'
-1.0.4
+1.0.5
 HCVERSIONTXT
 sudo chown root:root "$INSTALL_DIR/VERSION"
 sudo chmod 0644 "$INSTALL_DIR/VERSION"

@@ -2196,6 +2196,17 @@ def _get_cached_image(data, key, image_cache, image_cache_ts):
             image_cache_ts[key] = ts
             _decode_failed_ts.pop(key, None)
         else:
+            # First time we have seen THIS payload fail. Tell the data layer,
+            # so the key is refetched on the retry backoff instead of sitting
+            # satisfied until the next slow cycle: the decoder is the only
+            # part of the system that can tell a useless 200 from a good one.
+            if _decode_failed_ts.get(key) != ts:
+                try:
+                    data.mark_image_undecodable(key)
+                except AttributeError:
+                    pass        # older data layer; nothing to report to
+                except Exception:
+                    pass
             _decode_failed_ts[key] = ts
     return image_cache.get(key)
 
