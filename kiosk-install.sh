@@ -64,6 +64,22 @@ if [ "$KIOSK_MODE" = "pygame" ]; then
     # 10 FPS render loop keeps its frame budget while MUF refreshes.
     sudo apt install -y python3-pygame python3-cairosvg cpulimit
 
+    # librsvg2-bin gets its OWN line, deliberately: apt fails the whole
+    # transaction if any one package is unavailable, and this is an
+    # optimisation rather than a requirement — losing it must not take
+    # python3-pygame down with it. Hence `|| true`.
+    #
+    # It provides rsvg-convert, which server.py prefers over cairosvg for the
+    # MUF map. cairosvg parses the document in Python and spends ~61% of its
+    # time in an O(n^2) re-walk triggered once per <use> element (257 of them
+    # in this map); librsvg is C and does not. Measured on the real KC2G SVG:
+    # 1.204 s -> 0.181 s, a 6.7x speedup, visually identical output.
+    #
+    # This is not a nicety. Field diagnostics from a Pi 1B showed cairosvg
+    # NEVER completing: 0 successes, 3 timeouts, still failing at an 88 s
+    # budget, so the MUF panel could only ever read "(map loading)".
+    sudo apt install -y librsvg2-bin || true
+
     # Tier 1c: free RAM + boot time on a 512 MB Pi by masking kiosk-irrelevant daemons.
     # All four are non-essential for a wired-Ethernet HDMI kiosk.
     sudo systemctl mask bluetooth hciuart ModemManager avahi-daemon triggerhappy 2>/dev/null || true
@@ -85,8 +101,15 @@ if [ "$KIOSK_MODE" = "pygame" ]; then
         add_cfg "display_auto_detect=0"    # no extra display probe
         add_cfg "disable_overscan=1"       # full HDMI canvas
         add_cfg "hdmi_blanking=0"          # never DPMS the display
-        add_cfg "framebuffer_width=720"    # Tier 2a: half-res framebuffer, HVS upscales free
-        add_cfg "framebuffer_height=450"   # Tier 2a: pygame renders at 720x450; HDMI scanout stays 1440x900
+        # framebuffer_width/height are NOT set any more. Under KMS they are
+        # silently ignored — they only ever worked with the firmware scaler
+        # that KMS removed — which is how a Pi asking for 720x450 ended up at
+        # 800x600 on a 1440x900 panel, upscaled by a fractional 1.8x. The
+        # client now asks the connector for its real mode instead.
+        #
+        # Leaving them would be worse than useless: on a legacy or fkms stack
+        # they DO take effect, pinning exactly the half-resolution framebuffer
+        # whose blur this change exists to remove.
     fi
 
     # Tier 1c: quieter boot, no fsck at boot, no cursor on the TTY before kiosk paints.

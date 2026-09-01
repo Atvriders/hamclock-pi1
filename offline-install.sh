@@ -1051,15 +1051,64 @@ def _muf_timeout():
     return PHASE2_TIMEOUT_S
 
 
-def _rasterize_once(payload, timeout_s):
-    """One cpulimit+cairosvg subprocess round trip. None on any failure."""
+#: Rasterizer engines, fastest first. Both read SVG on stdin and write PNG to
+#: stdout, so they are interchangeable.
+#:
+#: cairosvg parses the whole document in Python, and profiling put 61% of its
+#: time in an O(n^2) cssselect2 re-walk triggered once per <use> element — of
+#: which this map has 257. librsvg is C and has no equivalent. Measured on the
+#: real KC2G SVG: cairosvg 1.204 s, rsvg-convert 0.181 s, a 6.7x speedup, with
+#: visually identical output (same contours, station dots, colorbar, labels).
+#:
+#: This matters because the field diagnostics showed cairosvg NEVER completing
+#: on a Pi 1B: rasterize_ok 0, rasterize_timeout 3, still failing at an 88 s
+#: budget. docs/muf-source.md's own rule says >30 s means change source or
+#: engine. 6.7x puts the same work near 13 s, inside the 45 s floor.
+#:
+#: cairosvg stays as the second rung, NOT as dead weight: a Pi upgraded in
+#: place has server.py refreshed without necessarily having librsvg2-bin
+#: installed, and falling back is better than a blank panel.
+MUF_ENGINES = (
+    ('rsvg', ['cpulimit', '-l', '50', '-q', '--',
+              'rsvg-convert', '-w', '360', '-f', 'png']),
+    ('cairosvg', ['cpulimit', '-l', '50', '-q', '--',
+                  'python3', '-c',
+                  'import sys, cairosvg; cairosvg.svg2png('
+                  'bytestring=sys.stdin.buffer.read(), '
+                  'output_width=360, write_to=sys.stdout.buffer)']),
+)
+
+_PNG_MAGIC = b'\x89PNG\r\n\x1a\x0a'
+
+#: Which engine last produced a PNG, for /api/diagnostics.
+_MUF_ENGINE_USED = None
+
+#: Times an engine was skipped because its binary is not installed. Kept apart
+#: from _MUF_RASTERIZE_FAIL on purpose — see _is_engine_absent.
+_MUF_ENGINE_ABSENT = 0
+
+
+def _is_engine_absent(exc):
+    """True when the engine binary simply is not installed.
+
+    ONLY exit 127: cpulimit ran but could not find the program after `--`.
+
+    A FileNotFoundError is deliberately NOT this. That means argv[0] — cpulimit
+    itself — is missing, so no engine on the ladder can run and nothing will
+    ever render. That is a genuine fault and must keep incrementing
+    rasterize_fail, or the one environment problem that breaks every engine
+    would be the one the diagnostics stayed silent about.
+    """
+    return (isinstance(exc, subprocess.CalledProcessError)
+            and exc.returncode == 127)
+
+
+def _rasterize_once(payload, timeout_s, argv=None):
+    """One cpulimit+rasterizer subprocess round trip. None on any failure."""
     global _MUF_RASTERIZE_OK, _MUF_RASTERIZE_TIMEOUT, _MUF_RASTERIZE_FAIL
-    global _MUF_LAST_TIMEOUT_BUDGET_S
-    argv = ['cpulimit', '-l', '50', '-q', '--',
-            'python3', '-c',
-            'import sys, cairosvg; cairosvg.svg2png('
-            'bytestring=sys.stdin.buffer.read(), '
-            'output_width=360, write_to=sys.stdout.buffer)']
+    global _MUF_LAST_TIMEOUT_BUDGET_S, _MUF_ENGINE_ABSENT
+    if argv is None:
+        argv = list(MUF_ENGINES[-1][1])
     p = None
     try:
         p = subprocess.Popen(
@@ -1082,6 +1131,10 @@ def _rasterize_once(payload, timeout_s):
             raise subprocess.CalledProcessError(p.returncode, argv, output=out)
         # A zero exit with an empty stdout is still a failed render as far as
         # every caller is concerned (`if out:`), so count it as one.
+        # cpulimit can swallow a failing child's exit status, so a zero return
+        # code is not enough — check the bytes are actually a PNG.
+        if out and not out.startswith(_PNG_MAGIC):
+            raise subprocess.CalledProcessError(0, argv, output=out)
         if out:
             _MUF_RASTERIZE_OK += 1
         else:
@@ -1090,11 +1143,22 @@ def _rasterize_once(payload, timeout_s):
     # FileNotFoundError (cpulimit not installed) is an OSError subclass.
     except (subprocess.SubprocessError, OSError) as e:
         # The log line below says "rasterize failed" for a 45 s timeout and
-        # for a missing cpulimit alike. Splitting the two counters is what
-        # tells the maintainer which one the Pi is actually hitting.
+        # for a missing cpulimit alike. Splitting the counters is what tells
+        # the maintainer which one the Pi is actually hitting.
         if isinstance(e, subprocess.TimeoutExpired):
             _MUF_RASTERIZE_TIMEOUT += 1
             _MUF_LAST_TIMEOUT_BUDGET_S = timeout_s
+        elif _is_engine_absent(e):
+            # An engine that is not installed did not FAIL to render — it was
+            # never asked. Counting it would make rasterize_fail climb on every
+            # refresh for every Pi that has not yet installed librsvg2-bin
+            # (i.e. every existing install), while cairosvg quietly succeeds
+            # right after. Diagnostics that cry wolf are worse than none.
+            _MUF_ENGINE_ABSENT += 1
+            print('[muf] engine unavailable (%s); trying the next one'
+                  % (argv[argv.index('--') + 1] if '--' in argv else argv[0]),
+                  file=sys.stderr)
+            return None
         else:
             _MUF_RASTERIZE_FAIL += 1
         print('[muf] rasterize failed: %s' % e, file=sys.stderr)
@@ -1104,6 +1168,33 @@ def _rasterize_once(payload, timeout_s):
         # every normal path (communicate() has already reaped by then).
         if p is not None and p.poll() is None:
             _kill_process_group(p)
+
+
+def _rasterize_ladder(payload, timeout_s):
+    """Try each engine in MUF_ENGINES until one yields a PNG.
+
+    Returns (png_or_None, seconds_of_the_attempt_that_settled_it,
+    any_attempt_timed_out). An engine
+    that is not installed is skipped without counting as a failure — see
+    _is_engine_absent — so a Pi that has never installed librsvg2-bin simply
+    lands on cairosvg rather than reporting a fault every refresh.
+    """
+    global _MUF_ENGINE_USED
+    elapsed = 0.0
+    before = _MUF_RASTERIZE_TIMEOUT
+    for name, argv in MUF_ENGINES:
+        started = time.monotonic()
+        out = _rasterize_once(payload, timeout_s, argv=list(argv))
+        elapsed = time.monotonic() - started
+        if out:
+            _MUF_ENGINE_USED = name
+            return out, elapsed, False
+        print('[muf] engine %s produced nothing in %.1fs' % (name, elapsed),
+              file=sys.stderr)
+    # Read the counter rather than the clock: `elapsed` is only the LAST
+    # attempt, so a ladder whose first engine timed out and whose second
+    # failed instantly would otherwise look fast enough to retry.
+    return None, elapsed, (_MUF_RASTERIZE_TIMEOUT > before)
 
 
 def _rasterize_muf(svg_bytes):
@@ -1153,9 +1244,7 @@ def _rasterize_muf(svg_bytes):
     else:
         _MUF_SLIM_DECLINED += 1
 
-    started = time.monotonic()
-    out = _rasterize_once(payload, timeout_s)
-    elapsed = time.monotonic() - started
+    out, elapsed, timed_out = _rasterize_ladder(payload, timeout_s)
 
     if out:
         _record_muf_render(elapsed)
@@ -1170,14 +1259,15 @@ def _rasterize_muf(svg_bytes):
     # after a timeout: two full budgets back to back (up to 220 s) would
     # starve the 120 s fetch_dx cadence, which is exactly what
     # PHASE2_TIMEOUT_MAX_S exists to prevent.
-    if slimmed and elapsed < timeout_s * 0.5:
+    if slimmed and not timed_out and elapsed < timeout_s * 0.5:
         print('[muf] slimmed SVG did not render in %.1fs; retrying unslimmed'
               % elapsed, file=sys.stderr)
         _MUF_UNSLIMMED_RETRIES += 1
-        started = time.monotonic()
-        out = _rasterize_once(svg_bytes, timeout_s)
+        # The retry walks the SAME ladder. Pinning it to one engine would mean
+        # the fallback path silently used a different rasterizer from the one
+        # that just failed, which is not a like-for-like retry.
+        out, retry_elapsed, _ = _rasterize_ladder(svg_bytes, timeout_s)
         if out:
-            retry_elapsed = time.monotonic() - started
             _record_muf_render(retry_elapsed)
             _MUF_LAST_RENDER_S = round(retry_elapsed, 3)
             _MUF_LAST_PNG_BYTES = len(out)
@@ -2042,6 +2132,12 @@ def _diagnostics_snapshot():
             'rasterize_fail': _MUF_RASTERIZE_FAIL,
             'slim_ok': _MUF_SLIM_OK,
             'slim_declined': _MUF_SLIM_DECLINED,
+            # Which rasterizer actually produced the PNG. The field report that
+            # exposed cairosvg never completing could not say which engine ran,
+            # because there was only one; with a ladder the next report must.
+            'engine_used': _MUF_ENGINE_USED,
+            'engine_absent': _MUF_ENGINE_ABSENT,
+            'engines': [n for n, _ in MUF_ENGINES],
             'unslimmed_retries': _MUF_UNSLIMMED_RETRIES,
             'svg_bytes': _MUF_LAST_SVG_BYTES,
             'slim_bytes': _MUF_LAST_SLIM_BYTES,
@@ -4498,6 +4594,44 @@ _CADENCE_S_NO_IMAGE = {
     'sdo': 15.0,
     'propagation': 15.0,
 }
+
+def _build_panel_phase():
+    """One-time offset per panel so panels sharing a cadence do not all come
+    due on the same frame.
+
+    Every 60 s panel was initialised to the same due time and then rescheduled
+    to now+60, so all ten redrew together, forever. Their measured cost on a
+    Pi 1B sums to ~203 ms and the reported p90 was 176 ms — i.e. the p90 frame
+    WAS the pile-up. It was survivable at 800x600 and became a visible stutter
+    once the client started rendering at the panel's native 1440x900.
+
+    Spreading them across the cadence window means at most one lands per frame,
+    so the worst frame costs one panel (~58 ms) instead of ten.
+    """
+    by_cadence = {}
+    for name, c in _CADENCE_S.items():
+        by_cadence.setdefault(c, []).append(name)
+    phase = {}
+    for c, names in by_cadence.items():
+        names = sorted(names)
+        for i, name in enumerate(names):
+            phase[name] = (float(c) * i) / max(1, len(names))
+    return phase
+
+
+_PANEL_PHASE = _build_panel_phase()
+
+
+def _next_due(name, now_ts, phased):
+    """Next due time for `name`. The phase is applied ONCE — after that each
+    panel simply advances by its cadence, so the spread persists instead of
+    re-synchronising the way `now + cadence` alone did."""
+    c = _CADENCE_S[name]
+    if name in phased:
+        return now_ts + c
+    phased.add(name)
+    return now_ts + c + _PANEL_PHASE.get(name, 0.0)
+
 
 SCREEN_W = 720    # Tier 2a: native render at 720x450; BCM2835 HVS upscales to 1440x900 in firmware
 SCREEN_H = 450
@@ -7641,6 +7775,8 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
     # bump its entry by _CADENCE_S[name]. A tab change or pending full flip
     # forces all panels to redraw regardless of due time.
     _panel_due_at = {name: 0.0 for name in _CADENCE_S}
+    # Panels that have already taken their one-time phase offset.
+    _phased = set()
 
     clock = pygame.time.Clock()
     running = True
@@ -7854,7 +7990,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 draw_header(screen, header, callsign, fonts, theme, data=data)
                 _record_panel_ms('header', _t0)
                 redrawn_this_frame.add('header')
-                _panel_due_at['header'] = now_ts + _CADENCE_S['header']
+                _panel_due_at['header'] = _next_due('header', now_ts, _phased)
 
             status = layout["status"]
             if _panel_due('status'):
@@ -7876,7 +8012,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 if _sr is not None:
                     status_regions = _sr
                 redrawn_this_frame.add('status')
-                _panel_due_at['status'] = now_ts + _CADENCE_S['status']
+                _panel_due_at['status'] = _next_due('status', now_ts, _phased)
 
             panel_gap = 4
 
@@ -7905,7 +8041,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('solar', _t0)
                 redrawn_this_frame.add('solar')
-                _panel_due_at['solar'] = now_ts + _CADENCE_S['solar']
+                _panel_due_at['solar'] = _next_due('solar', now_ts, _phased)
             if _panel_due('bands'):
                 _t0 = _mono()
                 try:
@@ -7914,7 +8050,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('bands', _t0)
                 redrawn_this_frame.add('bands')
-                _panel_due_at['bands'] = now_ts + _CADENCE_S['bands']
+                _panel_due_at['bands'] = _next_due('bands', now_ts, _phased)
             if _panel_due('sdo'):
                 # Tier 2.5: hoisted out of the try. The cadence line below
                 # reads it, and a NameError there would land in the render
@@ -7944,7 +8080,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('geomag', _t0)
                 redrawn_this_frame.add('geomag')
-                _panel_due_at['geomag'] = now_ts + _CADENCE_S['geomag']
+                _panel_due_at['geomag'] = _next_due('geomag', now_ts, _phased)
             if _panel_due('xray'):
                 _t0 = _mono()
                 try:
@@ -7954,7 +8090,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('xray', _t0)
                 redrawn_this_frame.add('xray')
-                _panel_due_at['xray'] = now_ts + _CADENCE_S['xray']
+                _panel_due_at['xray'] = _next_due('xray', now_ts, _phased)
             if _panel_due('open_bands'):
                 _t0 = _mono()
                 try:
@@ -7964,7 +8100,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('open_bands', _t0)
                 redrawn_this_frame.add('open_bands')
-                _panel_due_at['open_bands'] = now_ts + _CADENCE_S['open_bands']
+                _panel_due_at['open_bands'] = _next_due('open_bands', now_ts, _phased)
 
             # ---- MIDDLE COLUMN ----
             mid_rect = layout["muf"]
@@ -7989,7 +8125,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('muf_text', _t0)
                 redrawn_this_frame.add('muf_text')
-                _panel_due_at['muf_text'] = now_ts + _CADENCE_S['muf_text']
+                _panel_due_at['muf_text'] = _next_due('muf_text', now_ts, _phased)
 
             # ---- RIGHT COLUMN ----
             dx_r = layout["dx_spots"]
@@ -8002,7 +8138,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('dx_spots', _t0)
                 redrawn_this_frame.add('dx_spots')
-                _panel_due_at['dx_spots'] = now_ts + _CADENCE_S['dx_spots']
+                _panel_due_at['dx_spots'] = _next_due('dx_spots', now_ts, _phased)
 
             ba_r = layout["band_activity"]
             if _panel_due('band_activity'):
@@ -8014,7 +8150,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('band_activity', _t0)
                 redrawn_this_frame.add('band_activity')
-                _panel_due_at['band_activity'] = now_ts + _CADENCE_S['band_activity']
+                _panel_due_at['band_activity'] = _next_due('band_activity', now_ts, _phased)
 
             prop_r = layout["propagation"]
             if _panel_due('propagation'):
@@ -9402,7 +9538,7 @@ done
 # text itself. scripts/sync_installers.py stamps it from the repo VERSION file
 # and --check fails the build if the two drift.
 sudo tee "$INSTALL_DIR/VERSION" > /dev/null << 'HCVERSIONTXT'
-1.0.6
+1.0.7
 HCVERSIONTXT
 sudo chown root:root "$INSTALL_DIR/VERSION"
 sudo chmod 0644 "$INSTALL_DIR/VERSION"
@@ -9566,6 +9702,22 @@ if [ "$KIOSK_MODE" = "pygame" ]; then
     # the subprocess to 50% of one core so the render loop keeps its budget.
     sudo apt install -y python3-pygame python3-cairosvg cpulimit
 
+    # librsvg2-bin gets its OWN line, deliberately: apt fails the whole
+    # transaction if any one package is unavailable, and this is an
+    # optimisation rather than a requirement — losing it must not take
+    # python3-pygame down with it. Hence `|| true`.
+    #
+    # It provides rsvg-convert, which server.py prefers over cairosvg for the
+    # MUF map. cairosvg parses the document in Python and spends ~61% of its
+    # time in an O(n^2) re-walk triggered once per <use> element (257 of them
+    # in this map); librsvg is C and does not. Measured on the real KC2G SVG:
+    # 1.204 s -> 0.181 s, a 6.7x speedup, visually identical output.
+    #
+    # This is not a nicety. Field diagnostics from a Pi 1B showed cairosvg
+    # NEVER completing: 0 successes, 3 timeouts, still failing at an 88 s
+    # budget, so the MUF panel could only ever read "(map loading)".
+    sudo apt install -y librsvg2-bin || true
+
     # Tier 1c: free RAM + boot time on a 512 MB Pi by masking kiosk-irrelevant daemons.
     # All four are non-essential for a wired-Ethernet HDMI kiosk.
     sudo systemctl mask bluetooth hciuart ModemManager avahi-daemon triggerhappy 2>/dev/null || true
@@ -9587,8 +9739,15 @@ if [ "$KIOSK_MODE" = "pygame" ]; then
         add_cfg "display_auto_detect=0"    # no extra display probe
         add_cfg "disable_overscan=1"       # full HDMI canvas
         add_cfg "hdmi_blanking=0"          # never DPMS the display
-        add_cfg "framebuffer_width=720"    # Tier 2a: half-res framebuffer, HVS upscales free
-        add_cfg "framebuffer_height=450"   # Tier 2a: pygame renders at 720x450; HDMI scanout stays 1440x900
+        # framebuffer_width/height are NOT set any more. Under KMS they are
+        # silently ignored — they only ever worked with the firmware scaler
+        # that KMS removed — which is how a Pi asking for 720x450 ended up at
+        # 800x600 on a 1440x900 panel, upscaled by a fractional 1.8x. The
+        # client now asks the connector for its real mode instead.
+        #
+        # Leaving them would be worse than useless: on a legacy or fkms stack
+        # they DO take effect, pinning exactly the half-resolution framebuffer
+        # whose blur this change exists to remove.
     fi
 
     # Tier 1c: quieter boot, no fsck at boot, no cursor on the TTY before kiosk paints.

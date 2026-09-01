@@ -940,6 +940,44 @@ _CADENCE_S_NO_IMAGE = {
     'propagation': 15.0,
 }
 
+def _build_panel_phase():
+    """One-time offset per panel so panels sharing a cadence do not all come
+    due on the same frame.
+
+    Every 60 s panel was initialised to the same due time and then rescheduled
+    to now+60, so all ten redrew together, forever. Their measured cost on a
+    Pi 1B sums to ~203 ms and the reported p90 was 176 ms — i.e. the p90 frame
+    WAS the pile-up. It was survivable at 800x600 and became a visible stutter
+    once the client started rendering at the panel's native 1440x900.
+
+    Spreading them across the cadence window means at most one lands per frame,
+    so the worst frame costs one panel (~58 ms) instead of ten.
+    """
+    by_cadence = {}
+    for name, c in _CADENCE_S.items():
+        by_cadence.setdefault(c, []).append(name)
+    phase = {}
+    for c, names in by_cadence.items():
+        names = sorted(names)
+        for i, name in enumerate(names):
+            phase[name] = (float(c) * i) / max(1, len(names))
+    return phase
+
+
+_PANEL_PHASE = _build_panel_phase()
+
+
+def _next_due(name, now_ts, phased):
+    """Next due time for `name`. The phase is applied ONCE — after that each
+    panel simply advances by its cadence, so the spread persists instead of
+    re-synchronising the way `now + cadence` alone did."""
+    c = _CADENCE_S[name]
+    if name in phased:
+        return now_ts + c
+    phased.add(name)
+    return now_ts + c + _PANEL_PHASE.get(name, 0.0)
+
+
 SCREEN_W = 720    # Tier 2a: native render at 720x450; BCM2835 HVS upscales to 1440x900 in firmware
 SCREEN_H = 450
 
@@ -4082,6 +4120,8 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
     # bump its entry by _CADENCE_S[name]. A tab change or pending full flip
     # forces all panels to redraw regardless of due time.
     _panel_due_at = {name: 0.0 for name in _CADENCE_S}
+    # Panels that have already taken their one-time phase offset.
+    _phased = set()
 
     clock = pygame.time.Clock()
     running = True
@@ -4295,7 +4335,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 draw_header(screen, header, callsign, fonts, theme, data=data)
                 _record_panel_ms('header', _t0)
                 redrawn_this_frame.add('header')
-                _panel_due_at['header'] = now_ts + _CADENCE_S['header']
+                _panel_due_at['header'] = _next_due('header', now_ts, _phased)
 
             status = layout["status"]
             if _panel_due('status'):
@@ -4317,7 +4357,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 if _sr is not None:
                     status_regions = _sr
                 redrawn_this_frame.add('status')
-                _panel_due_at['status'] = now_ts + _CADENCE_S['status']
+                _panel_due_at['status'] = _next_due('status', now_ts, _phased)
 
             panel_gap = 4
 
@@ -4346,7 +4386,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('solar', _t0)
                 redrawn_this_frame.add('solar')
-                _panel_due_at['solar'] = now_ts + _CADENCE_S['solar']
+                _panel_due_at['solar'] = _next_due('solar', now_ts, _phased)
             if _panel_due('bands'):
                 _t0 = _mono()
                 try:
@@ -4355,7 +4395,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('bands', _t0)
                 redrawn_this_frame.add('bands')
-                _panel_due_at['bands'] = now_ts + _CADENCE_S['bands']
+                _panel_due_at['bands'] = _next_due('bands', now_ts, _phased)
             if _panel_due('sdo'):
                 # Tier 2.5: hoisted out of the try. The cadence line below
                 # reads it, and a NameError there would land in the render
@@ -4385,7 +4425,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('geomag', _t0)
                 redrawn_this_frame.add('geomag')
-                _panel_due_at['geomag'] = now_ts + _CADENCE_S['geomag']
+                _panel_due_at['geomag'] = _next_due('geomag', now_ts, _phased)
             if _panel_due('xray'):
                 _t0 = _mono()
                 try:
@@ -4395,7 +4435,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('xray', _t0)
                 redrawn_this_frame.add('xray')
-                _panel_due_at['xray'] = now_ts + _CADENCE_S['xray']
+                _panel_due_at['xray'] = _next_due('xray', now_ts, _phased)
             if _panel_due('open_bands'):
                 _t0 = _mono()
                 try:
@@ -4405,7 +4445,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('open_bands', _t0)
                 redrawn_this_frame.add('open_bands')
-                _panel_due_at['open_bands'] = now_ts + _CADENCE_S['open_bands']
+                _panel_due_at['open_bands'] = _next_due('open_bands', now_ts, _phased)
 
             # ---- MIDDLE COLUMN ----
             mid_rect = layout["muf"]
@@ -4430,7 +4470,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('muf_text', _t0)
                 redrawn_this_frame.add('muf_text')
-                _panel_due_at['muf_text'] = now_ts + _CADENCE_S['muf_text']
+                _panel_due_at['muf_text'] = _next_due('muf_text', now_ts, _phased)
 
             # ---- RIGHT COLUMN ----
             dx_r = layout["dx_spots"]
@@ -4443,7 +4483,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('dx_spots', _t0)
                 redrawn_this_frame.add('dx_spots')
-                _panel_due_at['dx_spots'] = now_ts + _CADENCE_S['dx_spots']
+                _panel_due_at['dx_spots'] = _next_due('dx_spots', now_ts, _phased)
 
             ba_r = layout["band_activity"]
             if _panel_due('band_activity'):
@@ -4455,7 +4495,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('band_activity', _t0)
                 redrawn_this_frame.add('band_activity')
-                _panel_due_at['band_activity'] = now_ts + _CADENCE_S['band_activity']
+                _panel_due_at['band_activity'] = _next_due('band_activity', now_ts, _phased)
 
             prop_r = layout["propagation"]
             if _panel_due('propagation'):

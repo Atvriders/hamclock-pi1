@@ -24,13 +24,26 @@ def test_fonts_resized_for_720x450():
         pygame.quit()
 
 
-def test_installer_sets_framebuffer_720x450():
-    body = (REPO / "kiosk-install.sh").read_text()
-    assert 'framebuffer_width=720' in body
-    assert 'framebuffer_height=450' in body
-    obody = (REPO / "offline-install.sh").read_text()
-    assert 'framebuffer_width=720' in obody
-    assert 'framebuffer_height=450' in obody
+def test_installer_no_longer_pins_the_framebuffer():
+    """Was test_installer_sets_framebuffer_720x450, and the hardware overruled it.
+
+    Tier 2a set framebuffer_width/height=720x450 expecting the firmware scaler
+    to upscale for free. Field telemetry showed the Pi running KMSDRM at
+    800x600 on a 1440x900 panel: under KMS those keys are silently ignored —
+    they only ever worked with the scaler KMS removed — so the client's request
+    was snapped to the nearest real DRM mode and then stretched by a fractional
+    1.8x. That upscale is what made the display unreadable.
+
+    They are not merely inert, either: on a legacy or fkms stack they DO apply,
+    which would pin exactly the half-resolution framebuffer this change exists
+    to stop rendering into. The client now asks the connector for its real mode.
+    """
+    for name in ("kiosk-install.sh", "offline-install.sh"):
+        body = (REPO / name).read_text()
+        live = [l for l in body.splitlines()
+                if re.search(r'add_cfg\s+"framebuffer_(width|height)=', l)
+                and not l.strip().startswith('#')]
+        assert not live, f"{name} still pins the framebuffer: {live}"
 
 
 def test_muf_rasterize_width_is_360():

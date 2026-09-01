@@ -839,15 +839,64 @@ def _muf_timeout():
     return PHASE2_TIMEOUT_S
 
 
-def _rasterize_once(payload, timeout_s):
-    """One cpulimit+cairosvg subprocess round trip. None on any failure."""
+#: Rasterizer engines, fastest first. Both read SVG on stdin and write PNG to
+#: stdout, so they are interchangeable.
+#:
+#: cairosvg parses the whole document in Python, and profiling put 61% of its
+#: time in an O(n^2) cssselect2 re-walk triggered once per <use> element — of
+#: which this map has 257. librsvg is C and has no equivalent. Measured on the
+#: real KC2G SVG: cairosvg 1.204 s, rsvg-convert 0.181 s, a 6.7x speedup, with
+#: visually identical output (same contours, station dots, colorbar, labels).
+#:
+#: This matters because the field diagnostics showed cairosvg NEVER completing
+#: on a Pi 1B: rasterize_ok 0, rasterize_timeout 3, still failing at an 88 s
+#: budget. docs/muf-source.md's own rule says >30 s means change source or
+#: engine. 6.7x puts the same work near 13 s, inside the 45 s floor.
+#:
+#: cairosvg stays as the second rung, NOT as dead weight: a Pi upgraded in
+#: place has server.py refreshed without necessarily having librsvg2-bin
+#: installed, and falling back is better than a blank panel.
+MUF_ENGINES = (
+    ('rsvg', ['cpulimit', '-l', '50', '-q', '--',
+              'rsvg-convert', '-w', '360', '-f', 'png']),
+    ('cairosvg', ['cpulimit', '-l', '50', '-q', '--',
+                  'python3', '-c',
+                  'import sys, cairosvg; cairosvg.svg2png('
+                  'bytestring=sys.stdin.buffer.read(), '
+                  'output_width=360, write_to=sys.stdout.buffer)']),
+)
+
+_PNG_MAGIC = b'\x89PNG\r\n\x1a\x0a'
+
+#: Which engine last produced a PNG, for /api/diagnostics.
+_MUF_ENGINE_USED = None
+
+#: Times an engine was skipped because its binary is not installed. Kept apart
+#: from _MUF_RASTERIZE_FAIL on purpose — see _is_engine_absent.
+_MUF_ENGINE_ABSENT = 0
+
+
+def _is_engine_absent(exc):
+    """True when the engine binary simply is not installed.
+
+    ONLY exit 127: cpulimit ran but could not find the program after `--`.
+
+    A FileNotFoundError is deliberately NOT this. That means argv[0] — cpulimit
+    itself — is missing, so no engine on the ladder can run and nothing will
+    ever render. That is a genuine fault and must keep incrementing
+    rasterize_fail, or the one environment problem that breaks every engine
+    would be the one the diagnostics stayed silent about.
+    """
+    return (isinstance(exc, subprocess.CalledProcessError)
+            and exc.returncode == 127)
+
+
+def _rasterize_once(payload, timeout_s, argv=None):
+    """One cpulimit+rasterizer subprocess round trip. None on any failure."""
     global _MUF_RASTERIZE_OK, _MUF_RASTERIZE_TIMEOUT, _MUF_RASTERIZE_FAIL
-    global _MUF_LAST_TIMEOUT_BUDGET_S
-    argv = ['cpulimit', '-l', '50', '-q', '--',
-            'python3', '-c',
-            'import sys, cairosvg; cairosvg.svg2png('
-            'bytestring=sys.stdin.buffer.read(), '
-            'output_width=360, write_to=sys.stdout.buffer)']
+    global _MUF_LAST_TIMEOUT_BUDGET_S, _MUF_ENGINE_ABSENT
+    if argv is None:
+        argv = list(MUF_ENGINES[-1][1])
     p = None
     try:
         p = subprocess.Popen(
@@ -870,6 +919,10 @@ def _rasterize_once(payload, timeout_s):
             raise subprocess.CalledProcessError(p.returncode, argv, output=out)
         # A zero exit with an empty stdout is still a failed render as far as
         # every caller is concerned (`if out:`), so count it as one.
+        # cpulimit can swallow a failing child's exit status, so a zero return
+        # code is not enough — check the bytes are actually a PNG.
+        if out and not out.startswith(_PNG_MAGIC):
+            raise subprocess.CalledProcessError(0, argv, output=out)
         if out:
             _MUF_RASTERIZE_OK += 1
         else:
@@ -878,11 +931,22 @@ def _rasterize_once(payload, timeout_s):
     # FileNotFoundError (cpulimit not installed) is an OSError subclass.
     except (subprocess.SubprocessError, OSError) as e:
         # The log line below says "rasterize failed" for a 45 s timeout and
-        # for a missing cpulimit alike. Splitting the two counters is what
-        # tells the maintainer which one the Pi is actually hitting.
+        # for a missing cpulimit alike. Splitting the counters is what tells
+        # the maintainer which one the Pi is actually hitting.
         if isinstance(e, subprocess.TimeoutExpired):
             _MUF_RASTERIZE_TIMEOUT += 1
             _MUF_LAST_TIMEOUT_BUDGET_S = timeout_s
+        elif _is_engine_absent(e):
+            # An engine that is not installed did not FAIL to render — it was
+            # never asked. Counting it would make rasterize_fail climb on every
+            # refresh for every Pi that has not yet installed librsvg2-bin
+            # (i.e. every existing install), while cairosvg quietly succeeds
+            # right after. Diagnostics that cry wolf are worse than none.
+            _MUF_ENGINE_ABSENT += 1
+            print('[muf] engine unavailable (%s); trying the next one'
+                  % (argv[argv.index('--') + 1] if '--' in argv else argv[0]),
+                  file=sys.stderr)
+            return None
         else:
             _MUF_RASTERIZE_FAIL += 1
         print('[muf] rasterize failed: %s' % e, file=sys.stderr)
@@ -892,6 +956,33 @@ def _rasterize_once(payload, timeout_s):
         # every normal path (communicate() has already reaped by then).
         if p is not None and p.poll() is None:
             _kill_process_group(p)
+
+
+def _rasterize_ladder(payload, timeout_s):
+    """Try each engine in MUF_ENGINES until one yields a PNG.
+
+    Returns (png_or_None, seconds_of_the_attempt_that_settled_it,
+    any_attempt_timed_out). An engine
+    that is not installed is skipped without counting as a failure — see
+    _is_engine_absent — so a Pi that has never installed librsvg2-bin simply
+    lands on cairosvg rather than reporting a fault every refresh.
+    """
+    global _MUF_ENGINE_USED
+    elapsed = 0.0
+    before = _MUF_RASTERIZE_TIMEOUT
+    for name, argv in MUF_ENGINES:
+        started = time.monotonic()
+        out = _rasterize_once(payload, timeout_s, argv=list(argv))
+        elapsed = time.monotonic() - started
+        if out:
+            _MUF_ENGINE_USED = name
+            return out, elapsed, False
+        print('[muf] engine %s produced nothing in %.1fs' % (name, elapsed),
+              file=sys.stderr)
+    # Read the counter rather than the clock: `elapsed` is only the LAST
+    # attempt, so a ladder whose first engine timed out and whose second
+    # failed instantly would otherwise look fast enough to retry.
+    return None, elapsed, (_MUF_RASTERIZE_TIMEOUT > before)
 
 
 def _rasterize_muf(svg_bytes):
@@ -941,9 +1032,7 @@ def _rasterize_muf(svg_bytes):
     else:
         _MUF_SLIM_DECLINED += 1
 
-    started = time.monotonic()
-    out = _rasterize_once(payload, timeout_s)
-    elapsed = time.monotonic() - started
+    out, elapsed, timed_out = _rasterize_ladder(payload, timeout_s)
 
     if out:
         _record_muf_render(elapsed)
@@ -958,14 +1047,15 @@ def _rasterize_muf(svg_bytes):
     # after a timeout: two full budgets back to back (up to 220 s) would
     # starve the 120 s fetch_dx cadence, which is exactly what
     # PHASE2_TIMEOUT_MAX_S exists to prevent.
-    if slimmed and elapsed < timeout_s * 0.5:
+    if slimmed and not timed_out and elapsed < timeout_s * 0.5:
         print('[muf] slimmed SVG did not render in %.1fs; retrying unslimmed'
               % elapsed, file=sys.stderr)
         _MUF_UNSLIMMED_RETRIES += 1
-        started = time.monotonic()
-        out = _rasterize_once(svg_bytes, timeout_s)
+        # The retry walks the SAME ladder. Pinning it to one engine would mean
+        # the fallback path silently used a different rasterizer from the one
+        # that just failed, which is not a like-for-like retry.
+        out, retry_elapsed, _ = _rasterize_ladder(svg_bytes, timeout_s)
         if out:
-            retry_elapsed = time.monotonic() - started
             _record_muf_render(retry_elapsed)
             _MUF_LAST_RENDER_S = round(retry_elapsed, 3)
             _MUF_LAST_PNG_BYTES = len(out)
@@ -1830,6 +1920,12 @@ def _diagnostics_snapshot():
             'rasterize_fail': _MUF_RASTERIZE_FAIL,
             'slim_ok': _MUF_SLIM_OK,
             'slim_declined': _MUF_SLIM_DECLINED,
+            # Which rasterizer actually produced the PNG. The field report that
+            # exposed cairosvg never completing could not say which engine ran,
+            # because there was only one; with a ladder the next report must.
+            'engine_used': _MUF_ENGINE_USED,
+            'engine_absent': _MUF_ENGINE_ABSENT,
+            'engines': [n for n, _ in MUF_ENGINES],
             'unslimmed_retries': _MUF_UNSLIMMED_RETRIES,
             'svg_bytes': _MUF_LAST_SVG_BYTES,
             'slim_bytes': _MUF_LAST_SLIM_BYTES,

@@ -325,33 +325,52 @@ def test_rasterize_falls_back_to_the_original_when_slimming_declines(
 def test_rasterize_output_width_is_360_in_the_argv(monkeypatch):
     """Pinned against the argv the code builds, not a file substring: the
     _rasterize_muf docstring also says 'output_width=360', so a bare grep
-    reads green even when the one-liner has drifted."""
+    reads green even when the one-liner has drifted.
+
+    Now covers the whole engine ladder — every engine must render at the panel
+    width, or falling back would silently change the map's size.
+    """
     seen = _fake_popen(monkeypatch)
     server._rasterize_muf(b'<svg xmlns="http://www.w3.org/2000/svg"/>')
-    one_liner = seen[0].argv[7]
-    assert "output_width=360" in one_liner
-    assert "cairosvg.svg2png" in one_liner
+    assert seen, "no engine was invoked"
+    # The ladder short-circuits on success, so only the FIRST engine runs here.
+    first = ' '.join(seen[0].argv)
+    assert '360' in first, f"first engine does not render at 360px: {first}"
+    assert 'rsvg-convert' in first, f"fastest engine should lead: {first}"
+    # Every engine must still target the same width, or a fallback would
+    # silently change the map's size.
+    for name, argv in server.MUF_ENGINES:
+        assert '360' in ' '.join(argv), f"{name} does not render at 360px"
+    cairo = dict(server.MUF_ENGINES)['cairosvg']
+    assert 'output_width=360' in ' '.join(cairo)
+    assert 'cairosvg.svg2png' in ' '.join(cairo)
 
 
 def test_rasterize_retries_unslimmed_when_the_slimmed_payload_fails_fast(
         monkeypatch, real_svg):
     """Safety net: a cairosvg complaint about our surgery must not be able to
     turn a working map into a permanently blank panel."""
-    class _FailFirst(_FakePopen):
+    # Every engine must fail on the SLIMMED payload before the unslimmed retry
+    # is reached — the retry exists to rule out our surgery, so it only makes
+    # sense once no engine could render what we produced.
+    n_engines = len(server.MUF_ENGINES)
+
+    class _FailFirstPayload(_FakePopen):
         def __init__(self, argv, **kw):
             super().__init__(argv, **kw)
-            if _FailFirst.n == 0:
+            if _FailFirstPayload.n < n_engines:
                 self.returncode = 1
                 self.out = b""
-            _FailFirst.n += 1
-    _FailFirst.n = 0
+            _FailFirstPayload.n += 1
+    _FailFirstPayload.n = 0
 
-    seen = _fake_popen(monkeypatch, _FailFirst)
+    seen = _fake_popen(monkeypatch, _FailFirstPayload)
     out = server._rasterize_muf(real_svg)
     assert out == b"\x89PNG\r\n\x1a\nBODY"
-    assert len(seen) == 2
-    assert seen[0].calls[0]["input"] != real_svg   # slimmed
-    assert seen[1].calls[0]["input"] == real_svg   # untouched
+    assert len(seen) == n_engines + 1, [c.argv for c in seen]
+    for c in seen[:n_engines]:
+        assert c.calls[0]["input"] != real_svg     # slimmed
+    assert seen[n_engines].calls[0]["input"] == real_svg   # untouched
 
 
 def test_rasterize_does_not_retry_when_the_slimmed_attempt_burned_the_budget(
@@ -371,10 +390,14 @@ def test_rasterize_does_not_retry_when_the_slimmed_attempt_burned_the_budget(
 
     seen = _fake_popen(monkeypatch, _Timeout)
     monkeypatch.setattr(server, "_kill_process_group", lambda p: None)
+    # One tick per engine attempt, plus the reads around them.
     monkeypatch.setattr(server.time, "monotonic",
-                        _stepping_clock([0.0, 60.0, 60.0]))
+                        _stepping_clock([0.0, 60.0] * (len(server.MUF_ENGINES) + 2)))
     assert server._rasterize_muf(real_svg) is None
-    assert len(seen) == 1
+    # Every engine is tried on the slimmed payload — and then it STOPS. The
+    # unslimmed retry must not run after a timeout: two full budgets back to
+    # back would starve the 120 s fetch_dx cadence.
+    assert len(seen) == len(server.MUF_ENGINES), [c.argv for c in seen]
 
 
 def _stepping_clock(values):

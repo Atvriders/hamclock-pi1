@@ -423,7 +423,10 @@ def test_a_timeout_is_counted_apart_from_a_failure(monkeypatch):
     monkeypatch.setattr(server, '_kill_process_group', lambda p: None)
     assert server._rasterize_muf(FAKE_SVG) is None
     d = _body()['muf']
-    assert d['rasterize_timeout'] == 1
+    # Counted per ENGINE ATTEMPT, not per refresh: with a ladder, a box that
+    # is simply too slow times out on each engine in turn, and each of those
+    # really did exceed its budget.
+    assert d['rasterize_timeout'] == len(server.MUF_ENGINES)
     assert d['rasterize_fail'] == 0
     assert d['rasterize_ok'] == 0
     # The budget that actually fired, so a raised PHASE2_TIMEOUT_S in the
@@ -442,8 +445,14 @@ def test_a_missing_cpulimit_counts_as_a_failure_not_a_timeout(monkeypatch):
     monkeypatch.setattr(server.subprocess, 'Popen', missing)
     assert server._rasterize_muf(FAKE_SVG) is None
     d = _body()['muf']
-    assert d['rasterize_fail'] == 1
+    # A missing cpulimit is argv[0] — the throttle itself — so NO engine on the
+    # ladder can run. Each attempt is a genuine failure, and this is
+    # deliberately NOT treated as "engine absent": that category exists for a
+    # rasterizer that simply is not installed, where falling back works. The
+    # one fault that breaks every engine must not be the one that stays quiet.
+    assert d['rasterize_fail'] == len(server.MUF_ENGINES)
     assert d['rasterize_timeout'] == 0
+    assert d['engine_absent'] == 0
 
 
 def test_an_empty_stdout_counts_as_a_failure(monkeypatch):

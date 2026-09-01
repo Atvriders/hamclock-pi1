@@ -88,16 +88,19 @@ def test_rasterize_muf_happy_path(monkeypatch):
     out = server._rasterize_muf(FAKE_SVG)
     assert out == FAKE_PNG
     p = _FakePopen.last
-    # argv must start with the cpulimit guard
+    # argv must start with the cpulimit guard, whichever engine ran
     assert p.argv[:5] == ['cpulimit', '-l', '50', '-q', '--']
-    # then python3 -c "<cairosvg one-liner>"
-    assert p.argv[5] == 'python3'
-    assert p.argv[6] == '-c'
-    one_liner = p.argv[7]
-    assert 'cairosvg.svg2png' in one_liner
-    assert 'output_width=360' in one_liner
-    assert 'sys.stdin.buffer.read()' in one_liner
-    assert 'sys.stdout.buffer' in one_liner
+    # The ladder leads with rsvg-convert and stops at the first success, so
+    # that is what a happy path invokes now.
+    assert p.argv[5] == 'rsvg-convert'
+    assert '360' in p.argv
+
+    # cairosvg remains the fallback rung and must keep its one-liner intact.
+    cairo = ' '.join(dict(server.MUF_ENGINES)['cairosvg'])
+    assert 'cairosvg.svg2png' in cairo
+    assert 'output_width=360' in cairo
+    assert 'sys.stdin.buffer.read()' in cairo
+    assert 'sys.stdout.buffer' in cairo
     # stdin contains the SVG bytes, fed through communicate()
     assert p.communicate_calls[0]['input'] == FAKE_SVG
     # timeout matches the published constant
@@ -121,7 +124,10 @@ def test_rasterize_muf_returns_none_on_timeout(monkeypatch, capsys):
     assert '[muf]' in err and 'rasterize failed' in err
     # Tier 1.6: the timeout path must tear down the whole process group, not
     # just cpulimit, or the SIGSTOPped cairosvg grandchild leaks ~48 MB.
-    assert killed == [_FakePopen.last]
+    # One process per engine on the ladder, and every one must be killed —
+    # the whole point of this test is that no group is left alive.
+    assert len(killed) == len(server.MUF_ENGINES), killed
+    assert _FakePopen.last in killed
     # ...and it must still be reaped afterwards.
     assert len(_FakePopen.last.communicate_calls) == 2
 
@@ -153,7 +159,10 @@ def test_rasterize_muf_kills_the_group_on_an_unexpected_error(monkeypatch):
     killed = []
     monkeypatch.setattr(server, '_kill_process_group', lambda p: killed.append(p))
     assert server._rasterize_muf(FAKE_SVG) is None
-    assert killed == [_FakePopen.last]
+    # One process per engine on the ladder, and every one must be killed —
+    # the whole point of this test is that no group is left alive.
+    assert len(killed) == len(server.MUF_ENGINES), killed
+    assert _FakePopen.last in killed
 
 
 def test_kill_process_group_sigconts_then_sigkills(monkeypatch):
