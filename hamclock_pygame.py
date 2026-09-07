@@ -1008,9 +1008,9 @@ PROP_TABS = ['drap', 'aurora', 'enlil']
 #: This is a wall display: nobody is standing at it clicking through tabs, so a
 #: tab that is never selected is a map the operator never sees. Cycling makes
 #: all four reachable without input. Five minutes is long enough to actually
-#: read a map and short enough to see every one within a coffee break.
+#: read a map, short enough that every one comes round within a few minutes.
 #: Set to 0 to disable and leave the panel wherever it was last put.
-TAB_CYCLE_S = 300.0
+TAB_CYCLE_S = 60.0
 
 
 def _next_cycle_tab(current, tabs, key_map, data):
@@ -1873,13 +1873,21 @@ def draw_muf_text(screen, rect, solar, fonts, theme, surf=None,
             iw, ih = surf.get_size()
             if iw > 0 and ih > 0:
                 avail_w = rect.w
-                # Never upscale past the raster's own width: the PNG is
-                # rendered at output_width=360 and blowing it up past that
-                # just makes the contours mushy.
+                # Never upscale past the raster's own width — blowing a PNG up
+                # past its own resolution just makes the contours mushy. The
+                # server now renders at 720 rather than 360 precisely so this
+                # clamp stops being the thing that keeps the map small.
                 draw_w = min(avail_w, iw)
                 draw_h = max(1, int(ih * (draw_w / float(iw))))
-                # Leave at least enough room for the five rows underneath.
-                if draw_h <= rect.h * 0.55:
+                # Reserve what the five rows BENEATH actually need, rather than
+                # a flat fraction of the panel. A fixed 55% cap gave the map no
+                # more room as the panel grew, which on a 774 px-tall centre
+                # panel meant leaving hundreds of pixels unused to protect five
+                # rows that need a couple of hundred.
+                _lab_h = fonts['panel'].get_height()
+                _val_h = fonts['title'].get_height()
+                _rows_need = 5 * (max(_lab_h, _val_h) + 6) + _lab_h
+                if draw_h <= max(0, rect.h - _rows_need):
                     map_rect = pygame.Rect(rect.x + (rect.w - draw_w) // 2,
                                            rect.y, draw_w, draw_h)
                     draw_image(screen, map_rect, surf, fonts, theme,
@@ -1910,7 +1918,13 @@ def draw_muf_text(screen, rect, solar, fonts, theme, surf=None,
     n = len(rows)
     top = rect.y + min(20, max(0, (rect.h - foot_h - glyph_h) // 4))
     avail = rect.bottom - foot_h - top - glyph_h
-    pitch = max(glyph_h + 1, min(44, avail // max(1, n - 1)))
+    # The 44 px ceiling was an absolute from the 720x450 era. At native
+    # resolution there is room for ~100 px per row, so a flat 44 bunched the
+    # five readings against the map and left the bottom half of the panel
+    # empty. Scale it with the glyph like every other piece of chrome, while
+    # still refusing to scatter the rows across the whole panel.
+    _max_pitch = max(44, glyph_h * 2)
+    pitch = max(glyph_h + 1, min(_max_pitch, avail // max(1, n - 1)))
     lab_x = rect.x + int(rect.w * 0.06)
     val_x = rect.x + int(rect.w * 0.45)
     lab_w = val_x - lab_x - 2

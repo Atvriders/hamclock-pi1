@@ -46,18 +46,31 @@ def test_installer_no_longer_pins_the_framebuffer():
         assert not live, f"{name} still pins the framebuffer: {live}"
 
 
-def test_muf_rasterize_width_is_360():
-    """MUF panel at 720x450 layout is ~360 px wide; rasterize narrower.
+def test_muf_rasterize_width_matches_the_centre_panel():
+    """Was test_muf_rasterize_width_is_360, sized for the small propagation TAB.
 
-    Targets the cairosvg one-liner, not a bare 'output_width=360' substring:
-    _rasterize_muf's docstring also contains that phrase, so the old grep read
-    green even when the argv it describes had drifted. The argv itself is
-    additionally pinned in tests/test_tier2_slim_muf.py by driving
-    _rasterize_muf against a stubbed Popen.
+    The map now occupies the centre panel, whose inner width is 636 px at a
+    native 1440x900. A 360 px raster filled 57% of that and the client refuses
+    to upscale a PNG past its own width, so the map was small because the
+    SOURCE was small. Affordable to raise because rsvg is parse-dominated:
+    360 -> 0.172 s, 720 -> 0.226 s for four times the pixels.
+
+    Asserted against the constant so the width can move again without a
+    scavenger hunt through the tests.
     """
-    body = (REPO / "server.py").read_text()
-    assert 'output_width=360, write_to=sys.stdout.buffer)' in body, \
-        'Tier 2a: server.py _rasterize_muf must use output_width=360'
+    import server
+    w = server.MUF_RASTER_WIDTH
+    assert w >= 636, f"raster {w}px is narrower than the centre panel it fills"
+
+    # Assert the RESOLVED argv, not source text: the width is interpolated
+    # from the constant, so the literal never appears in the file and a
+    # substring grep would read green while the argv had drifted.
+    engines = dict(server.MUF_ENGINES)
+    assert ('output_width=%d' % w) in ' '.join(engines['cairosvg'])
+    assert str(w) in engines['rsvg']
+
+    # The embedded copy must define the same constant, so the single-file
+    # installer cannot ship a different width from the repo.
     obody = (REPO / "offline-install.sh").read_text()
-    assert 'output_width=360' in obody, \
-        'Tier 2a: offline-install.sh embedded _rasterize_muf must use output_width=360'
+    assert ('MUF_RASTER_WIDTH = %d' % w) in obody, \
+        'offline-install.sh embedded server must carry the same raster width'

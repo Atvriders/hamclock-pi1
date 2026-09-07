@@ -856,14 +856,30 @@ def _muf_timeout():
 #: cairosvg stays as the second rung, NOT as dead weight: a Pi upgraded in
 #: place has server.py refreshed without necessarily having librsvg2-bin
 #: installed, and falling back is better than a blank panel.
+#: Raster width for the MUF map.
+#:
+#: Was 360, sized for the small propagation TAB the map used to live in. It now
+#: occupies the centre panel, whose inner width is 636 px at a native 1440x900 —
+#: so a 360 px raster filled 57% of the space available and the client refused
+#: to upscale it (blowing a raster past its own width just makes the contours
+#: mushy). The map was small because the SOURCE was small.
+#:
+#: 720 covers that panel with headroom and downscales cleanly for narrower
+#: ones. Affordable because rsvg is parse-dominated, not fill-dominated:
+#: measured 360 -> 0.172 s, 480 -> 0.190 s, 600 -> 0.202 s, 720 -> 0.226 s.
+#: Four times the pixels for 31% more time, which against the Pi's observed
+#: 10.5 s render is ~14 s — still comfortably inside the 45 s floor.
+MUF_RASTER_WIDTH = 720
+
 MUF_ENGINES = (
     ('rsvg', ['cpulimit', '-l', '50', '-q', '--',
-              'rsvg-convert', '-w', '360', '-f', 'png']),
+              'rsvg-convert', '-w', str(MUF_RASTER_WIDTH), '-f', 'png']),
     ('cairosvg', ['cpulimit', '-l', '50', '-q', '--',
                   'python3', '-c',
                   'import sys, cairosvg; cairosvg.svg2png('
                   'bytestring=sys.stdin.buffer.read(), '
-                  'output_width=360, write_to=sys.stdout.buffer)']),
+                  'output_width=%d, write_to=sys.stdout.buffer)'
+                  % MUF_RASTER_WIDTH]),
 )
 
 _PNG_MAGIC = b'\x89PNG\r\n\x1a\x0a'

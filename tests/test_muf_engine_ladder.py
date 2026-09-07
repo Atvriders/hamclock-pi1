@@ -43,8 +43,12 @@ def test_every_engine_is_cpu_limited():
 
 
 def test_every_engine_renders_at_the_panel_width():
+    """Read the constant, not a literal: the width moved from 360 to 720 when
+    the map left the small propagation tab for the centre panel, and a
+    hardcoded number here would have to be chased every time it moves again."""
+    w = str(server.MUF_RASTER_WIDTH)
     for name, argv in server.MUF_ENGINES:
-        assert '360' in ' '.join(argv), f"{name} does not render at 360px: {argv}"
+        assert w in ' '.join(argv), f"{name} does not render at {w}px: {argv}"
 
 
 def test_engine_used_is_reported():

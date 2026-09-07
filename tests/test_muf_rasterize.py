@@ -93,12 +93,12 @@ def test_rasterize_muf_happy_path(monkeypatch):
     # The ladder leads with rsvg-convert and stops at the first success, so
     # that is what a happy path invokes now.
     assert p.argv[5] == 'rsvg-convert'
-    assert '360' in p.argv
+    assert str(server.MUF_RASTER_WIDTH) in p.argv
 
     # cairosvg remains the fallback rung and must keep its one-liner intact.
     cairo = ' '.join(dict(server.MUF_ENGINES)['cairosvg'])
     assert 'cairosvg.svg2png' in cairo
-    assert 'output_width=360' in cairo
+    assert ('output_width=%d' % server.MUF_RASTER_WIDTH) in cairo
     assert 'sys.stdin.buffer.read()' in cairo
     assert 'sys.stdout.buffer' in cairo
     # stdin contains the SVG bytes, fed through communicate()

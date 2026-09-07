@@ -1068,14 +1068,30 @@ def _muf_timeout():
 #: cairosvg stays as the second rung, NOT as dead weight: a Pi upgraded in
 #: place has server.py refreshed without necessarily having librsvg2-bin
 #: installed, and falling back is better than a blank panel.
+#: Raster width for the MUF map.
+#:
+#: Was 360, sized for the small propagation TAB the map used to live in. It now
+#: occupies the centre panel, whose inner width is 636 px at a native 1440x900 —
+#: so a 360 px raster filled 57% of the space available and the client refused
+#: to upscale it (blowing a raster past its own width just makes the contours
+#: mushy). The map was small because the SOURCE was small.
+#:
+#: 720 covers that panel with headroom and downscales cleanly for narrower
+#: ones. Affordable because rsvg is parse-dominated, not fill-dominated:
+#: measured 360 -> 0.172 s, 480 -> 0.190 s, 600 -> 0.202 s, 720 -> 0.226 s.
+#: Four times the pixels for 31% more time, which against the Pi's observed
+#: 10.5 s render is ~14 s — still comfortably inside the 45 s floor.
+MUF_RASTER_WIDTH = 720
+
 MUF_ENGINES = (
     ('rsvg', ['cpulimit', '-l', '50', '-q', '--',
-              'rsvg-convert', '-w', '360', '-f', 'png']),
+              'rsvg-convert', '-w', str(MUF_RASTER_WIDTH), '-f', 'png']),
     ('cairosvg', ['cpulimit', '-l', '50', '-q', '--',
                   'python3', '-c',
                   'import sys, cairosvg; cairosvg.svg2png('
                   'bytestring=sys.stdin.buffer.read(), '
-                  'output_width=360, write_to=sys.stdout.buffer)']),
+                  'output_width=%d, write_to=sys.stdout.buffer)'
+                  % MUF_RASTER_WIDTH]),
 )
 
 _PNG_MAGIC = b'\x89PNG\r\n\x1a\x0a'
@@ -4663,9 +4679,9 @@ PROP_TABS = ['drap', 'aurora', 'enlil']
 #: This is a wall display: nobody is standing at it clicking through tabs, so a
 #: tab that is never selected is a map the operator never sees. Cycling makes
 #: all four reachable without input. Five minutes is long enough to actually
-#: read a map and short enough to see every one within a coffee break.
+#: read a map, short enough that every one comes round within a few minutes.
 #: Set to 0 to disable and leave the panel wherever it was last put.
-TAB_CYCLE_S = 300.0
+TAB_CYCLE_S = 60.0
 
 
 def _next_cycle_tab(current, tabs, key_map, data):
@@ -5528,13 +5544,21 @@ def draw_muf_text(screen, rect, solar, fonts, theme, surf=None,
             iw, ih = surf.get_size()
             if iw > 0 and ih > 0:
                 avail_w = rect.w
-                # Never upscale past the raster's own width: the PNG is
-                # rendered at output_width=360 and blowing it up past that
-                # just makes the contours mushy.
+                # Never upscale past the raster's own width — blowing a PNG up
+                # past its own resolution just makes the contours mushy. The
+                # server now renders at 720 rather than 360 precisely so this
+                # clamp stops being the thing that keeps the map small.
                 draw_w = min(avail_w, iw)
                 draw_h = max(1, int(ih * (draw_w / float(iw))))
-                # Leave at least enough room for the five rows underneath.
-                if draw_h <= rect.h * 0.55:
+                # Reserve what the five rows BENEATH actually need, rather than
+                # a flat fraction of the panel. A fixed 55% cap gave the map no
+                # more room as the panel grew, which on a 774 px-tall centre
+                # panel meant leaving hundreds of pixels unused to protect five
+                # rows that need a couple of hundred.
+                _lab_h = fonts['panel'].get_height()
+                _val_h = fonts['title'].get_height()
+                _rows_need = 5 * (max(_lab_h, _val_h) + 6) + _lab_h
+                if draw_h <= max(0, rect.h - _rows_need):
                     map_rect = pygame.Rect(rect.x + (rect.w - draw_w) // 2,
                                            rect.y, draw_w, draw_h)
                     draw_image(screen, map_rect, surf, fonts, theme,
@@ -5565,7 +5589,13 @@ def draw_muf_text(screen, rect, solar, fonts, theme, surf=None,
     n = len(rows)
     top = rect.y + min(20, max(0, (rect.h - foot_h - glyph_h) // 4))
     avail = rect.bottom - foot_h - top - glyph_h
-    pitch = max(glyph_h + 1, min(44, avail // max(1, n - 1)))
+    # The 44 px ceiling was an absolute from the 720x450 era. At native
+    # resolution there is room for ~100 px per row, so a flat 44 bunched the
+    # five readings against the map and left the bottom half of the panel
+    # empty. Scale it with the glyph like every other piece of chrome, while
+    # still refusing to scatter the rows across the whole panel.
+    _max_pitch = max(44, glyph_h * 2)
+    pitch = max(glyph_h + 1, min(_max_pitch, avail // max(1, n - 1)))
     lab_x = rect.x + int(rect.w * 0.06)
     val_x = rect.x + int(rect.w * 0.45)
     lab_w = val_x - lab_x - 2
@@ -9597,7 +9627,7 @@ done
 # text itself. scripts/sync_installers.py stamps it from the repo VERSION file
 # and --check fails the build if the two drift.
 sudo tee "$INSTALL_DIR/VERSION" > /dev/null << 'HCVERSIONTXT'
-1.0.8
+1.0.9
 HCVERSIONTXT
 sudo chown root:root "$INSTALL_DIR/VERSION"
 sudo chmod 0644 "$INSTALL_DIR/VERSION"

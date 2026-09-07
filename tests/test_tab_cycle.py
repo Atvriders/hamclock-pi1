@@ -38,8 +38,10 @@ def _walk(data, steps, start='drap'):
     return out
 
 
-def test_interval_is_five_minutes():
-    assert hp.TAB_CYCLE_S == 300.0
+def test_cycle_interval_is_one_minute():
+    """Was five. A wall display shows three propagation maps; a minute apiece
+    means every one comes round within the time an operator spends looking."""
+    assert hp.TAB_CYCLE_S == 60.0
 
 
 def test_cycles_through_every_tab_in_order():

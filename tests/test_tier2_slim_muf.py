@@ -322,7 +322,7 @@ def test_rasterize_falls_back_to_the_original_when_slimming_declines(
     assert seen[0].calls[0]["input"] == unslimmable
 
 
-def test_rasterize_output_width_is_360_in_the_argv(monkeypatch):
+def test_rasterize_output_width_matches_the_constant(monkeypatch):
     """Pinned against the argv the code builds, not a file substring: the
     _rasterize_muf docstring also says 'output_width=360', so a bare grep
     reads green even when the one-liner has drifted.
@@ -335,14 +335,15 @@ def test_rasterize_output_width_is_360_in_the_argv(monkeypatch):
     assert seen, "no engine was invoked"
     # The ladder short-circuits on success, so only the FIRST engine runs here.
     first = ' '.join(seen[0].argv)
-    assert '360' in first, f"first engine does not render at 360px: {first}"
+    w = str(server.MUF_RASTER_WIDTH)
+    assert w in first, f"first engine does not render at {w}px: {first}"
     assert 'rsvg-convert' in first, f"fastest engine should lead: {first}"
     # Every engine must still target the same width, or a fallback would
     # silently change the map's size.
     for name, argv in server.MUF_ENGINES:
-        assert '360' in ' '.join(argv), f"{name} does not render at 360px"
+        assert w in ' '.join(argv), f"{name} does not render at {w}px"
     cairo = dict(server.MUF_ENGINES)['cairosvg']
-    assert 'output_width=360' in ' '.join(cairo)
+    assert ('output_width=%d' % server.MUF_RASTER_WIDTH) in ' '.join(cairo)
     assert 'cairosvg.svg2png' in ' '.join(cairo)
 
 
