@@ -56,10 +56,22 @@ def test_installer_carries_muf_timeout():
         text = (REPO / installer).read_text()
         # Installer either inlines PHASE2_TIMEOUT_S=<n> or sed-patches
         # server.py to that value.
-        assert (
-            f"PHASE2_TIMEOUT_S={timeout}" in text
-            or f"PHASE2_TIMEOUT_S = {timeout}" in text
-        ), f"{installer} missing PHASE2_TIMEOUT_S={timeout}"
+        inlined = (f"PHASE2_TIMEOUT_S={timeout}" in text
+                   or f"PHASE2_TIMEOUT_S = {timeout}" in text)
+        # kiosk-install.sh carries the value a third way, which the original
+        # rule did not anticipate: it COPIES server.py verbatim rather than
+        # embedding or sed-patching it. The requirement is that the INSTALLED
+        # server ends up with the recorded timeout, and copying the file that
+        # defines it satisfies that exactly as well as inlining a literal.
+        copies_server = 'cp "$SCRIPT_DIR/$_hc_file"' in text or \
+                        'cp "$SCRIPT_DIR/server.py"' in text
+        if copies_server and not inlined:
+            src = (REPO / "server.py").read_text()
+            assert f"PHASE2_TIMEOUT_S = {timeout}" in src, (
+                f"{installer} copies server.py, but server.py does not define "
+                f"PHASE2_TIMEOUT_S = {timeout}")
+        else:
+            assert inlined, f"{installer} missing PHASE2_TIMEOUT_S={timeout}"
 
 def test_phase5_blocked_until_phase0_and_phase2_records_exist():
     assert (DOCS / "sdl-backend.md").exists(), "Phase 0 record missing — Phase 5 cannot ship"

@@ -74,17 +74,23 @@ def test_all_sixty_second_panels_together_would_have_blown_the_budget():
     assert sum(MEASURED_MS.get(n, 0.0) for n in sixty) > FRAME_BUDGET_MS
 
 
-def test_phase_is_applied_once_then_the_cadence_persists():
-    phased = set()
+def test_each_panel_stays_on_its_own_grid():
+    """Superseded the apply-the-phase-once scheme, which a full flip undid.
+
+    Every due time must land on epoch + phase + k*cadence, so no amount of
+    rescheduling can collapse the panels back together.
+    """
+    epoch = 1000.0
     c = hp._CADENCE_S['solar']
-    first = hp._next_due('solar', 1000.0, phased)
-    second = hp._next_due('solar', first, phased)
-    assert first == 1000.0 + c + hp._PANEL_PHASE['solar'], "phase not applied"
-    assert second == first + c, (
-        "phase re-applied — that lengthens the period instead of offsetting it")
+    ph = hp._PANEL_PHASE['solar']
+    for now in (epoch, epoch + 0.4, epoch + 37.3, epoch + 61.0, epoch + 604.9):
+        due = hp._next_due('solar', now, epoch)
+        offset = (due - epoch - ph) % c
+        assert abs(offset) < 1e-6 or abs(offset - c) < 1e-6, (
+            f"due {due} is off solar's grid (offset {offset})")
+        assert due > now
 
 
 def test_next_due_never_returns_the_past():
-    phased = set()
     for name in hp._CADENCE_S:
-        assert hp._next_due(name, 1000.0, phased) > 1000.0
+        assert hp._next_due(name, 1000.0, 1000.0) > 1000.0

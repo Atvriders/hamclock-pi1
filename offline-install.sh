@@ -3665,6 +3665,7 @@ import collections
 import gc
 import io
 import json
+import math
 import os
 import sys
 import threading
@@ -4622,15 +4623,25 @@ def _build_panel_phase():
 _PANEL_PHASE = _build_panel_phase()
 
 
-def _next_due(name, now_ts, phased):
-    """Next due time for `name`. The phase is applied ONCE — after that each
-    panel simply advances by its cadence, so the spread persists instead of
-    re-synchronising the way `now + cadence` alone did."""
+def _next_due(name, now_ts, epoch):
+    """Next due time for `name`, on that panel's own fixed grid.
+
+    The first attempt at this applied the phase ONCE and then advanced by the
+    cadence, which looked equivalent and was not: a full flip redraws every
+    panel and reschedules them all to now+cadence, so the offsets were thrown
+    away and the panels re-synchronised. The propagation tab cycles every five
+    minutes and forces exactly such a flip, so in the field the pile-up came
+    straight back — measured p90 187 ms, no better than before the stagger.
+
+    Anchoring each panel to `epoch + phase + k * cadence` cannot be undone that
+    way: whatever happens, the next due time lands back on that panel's own
+    grid, so the spread is a property of the schedule rather than of the
+    history that led to it.
+    """
     c = _CADENCE_S[name]
-    if name in phased:
-        return now_ts + c
-    phased.add(name)
-    return now_ts + c + _PANEL_PHASE.get(name, 0.0)
+    ph = _PANEL_PHASE.get(name, 0.0)
+    k = math.floor((now_ts - epoch - ph) / c) + 1
+    return epoch + ph + k * c
 
 
 SCREEN_W = 720    # Tier 2a: native render at 720x450; BCM2835 HVS upscales to 1440x900 in firmware
@@ -5676,6 +5687,15 @@ def draw_band_activity(screen, rect, dxspots, fonts, theme):
 
 
 def draw_tabs(screen, rect, tabs, active, fonts, theme):
+    """Tabs fill `rect` — its HEIGHT is honoured rather than assumed.
+
+    The bar used to be a hardcoded 20 px. Once fonts began scaling with the
+    framebuffer, the 26 px panel face at 1440x900 was drawn into a 20 px box
+    and clipped to nothing: measured 0 label pixels at native resolution
+    against 113 at 800x600, so the operator saw three blank buttons with no
+    way to tell which map was showing. Same failure as the hardcoded header
+    height, in the one piece of chrome that fix did not cover.
+    """
     """Draw a tab bar across rect.y (height 20). Returns {name: Rect}."""
     regions = {}
     if not tabs or rect.w <= 0 or rect.h <= 0:
@@ -6640,15 +6660,34 @@ def _fetch_server_diagnostics(base_url=None, timeout=SERVER_DIAG_TIMEOUT_S):
     return _scrub_secrets(body)
 
 
+#: Longest edge we will send. The screenshot is a diagnostic, not an archive:
+#: it has to show layout, legibility and which panels are blank, and it does
+#: that just as well at half size.
+SCREENSHOT_MAX_EDGE = 800
+
+
 def _screenshot_b64(surface, cap=None):
-    """Base64 PNG of `surface`, or None.
+    """Base64 PNG of `surface`, downscaled to SCREENSHOT_MAX_EDGE, or None.
 
     Encoded string is capped: over the limit we drop the screenshot entirely
-    and send null. A truncated image is not a smaller screenshot."""
+    and send null. A truncated image is not a smaller screenshot.
+
+    It is downscaled first because the cap started biting. A 1440x900 frame
+    came to 209 KB of PNG (279 KB base64) while the MUF panel was still empty;
+    once the map actually rendered, the added contour detail pushed it past the
+    350 KB cap and the report arrived with no screenshot at all — losing the
+    picture at exactly the moment the display finally worked.
+    """
     if surface is None:
         return None
     limit = SCREENSHOT_MAX_B64 if cap is None else cap
     try:
+        w, h = surface.get_size()
+        longest = max(w, h)
+        if longest > SCREENSHOT_MAX_EDGE:
+            scale = SCREENSHOT_MAX_EDGE / float(longest)
+            surface = _smoothscale_safe(
+                surface, (max(1, int(w * scale)), max(1, int(h * scale))))
         buf = io.BytesIO()
         pygame.image.save(surface, buf, 'shot.png')
         raw = buf.getvalue()
@@ -7775,8 +7814,10 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
     # bump its entry by _CADENCE_S[name]. A tab change or pending full flip
     # forces all panels to redraw regardless of due time.
     _panel_due_at = {name: 0.0 for name in _CADENCE_S}
-    # Panels that have already taken their one-time phase offset.
-    _phased = set()
+    # Fixed anchor for every panel's cadence grid. Never reassigned: the grid
+    # must survive full flips, which is precisely what the previous scheme did
+    # not do.
+    _sched_epoch = time.time()
 
     clock = pygame.time.Clock()
     running = True
@@ -7944,7 +7985,23 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                                           tab_image_key, data)
                 if _cycled != active_tab:
                     active_tab = _cycled
-                    dirty_state['full_flip_pending'] = True
+                    # Repaint ONLY the propagation panel. A tab change alters
+                    # nothing else, and the full flip this used to request
+                    # redrew all twelve panels in one frame — measured at
+                    # 314 ms against a 100 ms budget. That was tolerable when
+                    # a human clicked a tab; it is not when the panel cycles
+                    # itself every five minutes.
+                    #
+                    # prev_active_tab is advanced here so the will_full_flip
+                    # predicate does not see a tab change and force the flip
+                    # anyway. draw_panel repaints the whole panel rect, so the
+                    # outgoing tab's pixels are covered rather than left behind.
+                    #
+                    # A MANUAL click deliberately still takes the full-flip
+                    # path: it is rare, and someone standing at the screen is
+                    # better served by a guaranteed-clean repaint.
+                    dirty_state['prev_active_tab'] = active_tab
+                    _panel_due_at['propagation'] = 0.0
                 next_tab_at = time.time() + TAB_CYCLE_S
 
             sw, sh = screen.get_size()
@@ -7990,7 +8047,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 draw_header(screen, header, callsign, fonts, theme, data=data)
                 _record_panel_ms('header', _t0)
                 redrawn_this_frame.add('header')
-                _panel_due_at['header'] = _next_due('header', now_ts, _phased)
+                _panel_due_at['header'] = _next_due('header', now_ts, _sched_epoch)
 
             status = layout["status"]
             if _panel_due('status'):
@@ -8012,7 +8069,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 if _sr is not None:
                     status_regions = _sr
                 redrawn_this_frame.add('status')
-                _panel_due_at['status'] = _next_due('status', now_ts, _phased)
+                _panel_due_at['status'] = _next_due('status', now_ts, _sched_epoch)
 
             panel_gap = 4
 
@@ -8041,7 +8098,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('solar', _t0)
                 redrawn_this_frame.add('solar')
-                _panel_due_at['solar'] = _next_due('solar', now_ts, _phased)
+                _panel_due_at['solar'] = _next_due('solar', now_ts, _sched_epoch)
             if _panel_due('bands'):
                 _t0 = _mono()
                 try:
@@ -8050,7 +8107,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('bands', _t0)
                 redrawn_this_frame.add('bands')
-                _panel_due_at['bands'] = _next_due('bands', now_ts, _phased)
+                _panel_due_at['bands'] = _next_due('bands', now_ts, _sched_epoch)
             if _panel_due('sdo'):
                 # Tier 2.5: hoisted out of the try. The cadence line below
                 # reads it, and a NameError there would land in the render
@@ -8080,7 +8137,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('geomag', _t0)
                 redrawn_this_frame.add('geomag')
-                _panel_due_at['geomag'] = _next_due('geomag', now_ts, _phased)
+                _panel_due_at['geomag'] = _next_due('geomag', now_ts, _sched_epoch)
             if _panel_due('xray'):
                 _t0 = _mono()
                 try:
@@ -8090,7 +8147,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('xray', _t0)
                 redrawn_this_frame.add('xray')
-                _panel_due_at['xray'] = _next_due('xray', now_ts, _phased)
+                _panel_due_at['xray'] = _next_due('xray', now_ts, _sched_epoch)
             if _panel_due('open_bands'):
                 _t0 = _mono()
                 try:
@@ -8100,7 +8157,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('open_bands', _t0)
                 redrawn_this_frame.add('open_bands')
-                _panel_due_at['open_bands'] = _next_due('open_bands', now_ts, _phased)
+                _panel_due_at['open_bands'] = _next_due('open_bands', now_ts, _sched_epoch)
 
             # ---- MIDDLE COLUMN ----
             mid_rect = layout["muf"]
@@ -8125,7 +8182,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('muf_text', _t0)
                 redrawn_this_frame.add('muf_text')
-                _panel_due_at['muf_text'] = _next_due('muf_text', now_ts, _phased)
+                _panel_due_at['muf_text'] = _next_due('muf_text', now_ts, _sched_epoch)
 
             # ---- RIGHT COLUMN ----
             dx_r = layout["dx_spots"]
@@ -8138,7 +8195,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('dx_spots', _t0)
                 redrawn_this_frame.add('dx_spots')
-                _panel_due_at['dx_spots'] = _next_due('dx_spots', now_ts, _phased)
+                _panel_due_at['dx_spots'] = _next_due('dx_spots', now_ts, _sched_epoch)
 
             ba_r = layout["band_activity"]
             if _panel_due('band_activity'):
@@ -8150,17 +8207,19 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('band_activity', _t0)
                 redrawn_this_frame.add('band_activity')
-                _panel_due_at['band_activity'] = _next_due('band_activity', now_ts, _phased)
+                _panel_due_at['band_activity'] = _next_due('band_activity', now_ts, _sched_epoch)
 
             prop_r = layout["propagation"]
             if _panel_due('propagation'):
                 _t0 = _mono()
                 prop_inner = draw_panel(screen, prop_r, 'PROPAGATION', fonts, theme)
-                tab_bar = pygame.Rect(prop_inner.x, prop_inner.y, prop_inner.w, 20)
+                _tab_h = max(20, fonts['panel'].get_height() + 6)
+                tab_bar = pygame.Rect(prop_inner.x, prop_inner.y,
+                                      prop_inner.w, _tab_h)
                 tab_regions = draw_tabs(screen, tab_bar, PROP_TABS,
                                         active_tab, fonts, theme)
-                img_rect = pygame.Rect(prop_inner.x, prop_inner.y + 24,
-                                       prop_inner.w, prop_inner.h - 24)
+                img_rect = pygame.Rect(prop_inner.x, prop_inner.y + _tab_h + 4,
+                                       prop_inner.w, prop_inner.h - _tab_h - 4)
                 # Tier 2.5: hoisted out of the try — see the sdo panel above.
                 surf = None
                 try:
@@ -9538,7 +9597,7 @@ done
 # text itself. scripts/sync_installers.py stamps it from the repo VERSION file
 # and --check fails the build if the two drift.
 sudo tee "$INSTALL_DIR/VERSION" > /dev/null << 'HCVERSIONTXT'
-1.0.7
+1.0.8
 HCVERSIONTXT
 sudo chown root:root "$INSTALL_DIR/VERSION"
 sudo chmod 0644 "$INSTALL_DIR/VERSION"

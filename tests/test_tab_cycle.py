@@ -130,9 +130,19 @@ def test_cycling_can_be_disabled():
     assert 'TAB_CYCLE_S > 0' in src, "no guard for a disabled cycle"
 
 
-def test_advance_forces_a_repaint():
+def test_advance_repaints_only_the_propagation_panel():
+    """It used to request a full flip, which redrew all twelve panels in one
+    frame — measured at 314 ms against a 100 ms budget. Acceptable when a human
+    clicked a tab; not when the panel cycles itself every five minutes. A tab
+    change alters nothing outside this panel.
+    """
     src = _loop_src()
     advance = src.index('>= next_tab_at')
-    window = src[advance:advance + 500]
-    assert "full_flip_pending" in window, (
-        "a tab change must force a repaint or the panel keeps the old pixels")
+    window = src[advance:advance + 1400]
+    assert "_panel_due_at['propagation'] = 0.0" in window, (
+        "the cycle must mark the propagation panel due")
+    assert "dirty_state['prev_active_tab'] = active_tab" in window, (
+        "prev_active_tab must advance too, or will_full_flip sees a tab change "
+        "and forces the full repaint anyway")
+    assert "full_flip_pending" not in window, (
+        "the auto-cycle must not request a full flip")
