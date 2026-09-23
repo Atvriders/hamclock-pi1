@@ -31,7 +31,12 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 OFFLINE = REPO / "offline-install.sh"
-MIRROR = Path("/home/kasm-user/hamclock-reborn/public/downloads/pi1-install.sh")
+# The site repo is expected as a sibling checkout; HAMCLOCK_REBORN_MIRROR
+# overrides it. Derived rather than written out so no host path is
+# committed to a public repo.
+MIRROR = Path(os.environ.get(
+    "HAMCLOCK_REBORN_MIRROR",
+    REPO.parent / "hamclock-reborn" / "public" / "downloads" / "pi1-install.sh"))
 SYNC = REPO / "scripts" / "sync_installers.py"
 
 

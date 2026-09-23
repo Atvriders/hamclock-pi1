@@ -1376,21 +1376,58 @@ def fetch_hamqsl():
             el = sd.find(tag)
             return el.text.strip() if el is not None and el.text else default
 
+        # A default is the "no reading" sentinel, and the only honest one is
+        # '' -- the value rows already read it as absence: _safe() renders
+        # '--' in the pygame client and an em dash in the tkinter one, and
+        # index.html's `if(d.fof2)` drops the row. pygame's GEOMAG panel now
+        # draws '' as "Kp --" too. index.html's does not yet: renderGeomag
+        # coerces a missing Kp to 0 on its own (`parseInt(...)||0`), so there
+        # '' paints the same green "Kp 0" that '0' did -- no worse, but not
+        # fixed from this side. A default that is
+        # itself a value the feed can publish is indistinguishable from a
+        # measurement by the time it reaches a panel.
+        #
+        # hamqsl is serving <fof2></fof2> right now (22 Sep 2026 1900 GMT
+        # sample, next to <muffactor></muffactor> and <muf>NoRpt</muf>), so
+        # '0' was painting "FOF2  0 MHz" in the largest type on the centre
+        # panel as though zero had been measured. The same collision applies
+        # to every default changed here: <kindex> is literally " 0" in that
+        # same sample, SSN is 0 on a spotless day, A-index 0 on a quiet one,
+        # aurora is a small integer starting at 0, Bz crosses 0 every few
+        # hours, and 'quiet'/'S0-S0' come from the feed's own vocabulary
+        # (it sent <geomagfield>INACTIVE</geomagfield> and
+        # <signalnoise>S0-S1</signalnoise>).
+        #
+        # solarWind too, though 0 cannot collide with a reading (the wind runs
+        # 250-800 km/s and never stops): "Wind 0" still reads as a measurement,
+        # and an alarming one. Every consumer takes '' — pygame '--', tkinter
+        # an em dash, index.html a blank cell.
+        #
+        # Deliberately left on a numeric default: sfi, because the 10.7 cm
+        # flux floor is ~64 so 0 is not a reading, and index.html bails out
+        # of the entire solar panel on `if(!d.sfi)return;` — which '' would
+        # trip and the truthy string '0' does not. The 'N/A'
+        # defaults stay too -- 'N/A' is outside those fields' value formats,
+        # so it cannot be mistaken for one.
         solar = {
             'sfi': gt('solarflux', '0'),
-            'ssn': gt('sunspots', '0'),
-            'aIndex': gt('aindex', '0'),
-            'kIndex': gt('kindex', '0'),
+            'ssn': gt('sunspots'),
+            'aIndex': gt('aindex'),
+            'kIndex': gt('kindex'),
             'xray': gt('xray', 'N/A'),
             'heliumLine': gt('heliumline', 'N/A'),
+            # hamqsl misspells this tag as <electonflux> (no 'r'), so
+            # 'electronflux' never matched and the field has always fallen
+            # through to 'N/A'. Read the spelling the feed ships, keeping the
+            # correct one as the fallback for if it is ever fixed.
+            'electronFlux': gt('electonflux') or gt('electronflux', 'N/A'),
             'protonFlux': gt('protonflux', 'N/A'),
-            'electronFlux': gt('electronflux', 'N/A'),
-            'aurora': gt('aurora', '0'),
-            'solarWind': gt('solarwind', '0'),
-            'magneticField': gt('magneticfield', '0'),
-            'geomagField': gt('geomagfield', 'quiet'),
-            'signalNoise': gt('signalnoise', 'S0-S0'),
-            'fof2': gt('fof2', '0'),
+            'aurora': gt('aurora'),
+            'solarWind': gt('solarwind'),
+            'magneticField': gt('magneticfield'),
+            'geomagField': gt('geomagfield'),
+            'signalNoise': gt('signalnoise'),
+            'fof2': gt('fof2'),
             'mpiVer': gt('mpiVer', ''),
             'updated': gt('updated', ''),
         }
@@ -3155,10 +3192,14 @@ function renderGeomag(solar){
 if(!solar)return;
 var el=document.getElementById('geomagBody');
 if(!el)return;
-var kp=parseInt(solar.kIndex)||0;
+// A missing Kp is '--' in the muted colour, not a green 0: 0 is a real
+// reading (a quiet sky) and the server now sends '' when it has none.
+var kpn=parseInt(solar.kIndex,10);
+var has=isFinite(kpn);
+var kp=has?kpn:'--';
 var geo=solar.geomagField||'unknown';
-var color=kp<=3?'#22c55e':kp<=5?'#eab308':kp<=7?'#ff8c00':'#ef4444';
-var pct=Math.min(100,kp/9*100);
+var color=!has?'var(--muted)':kp<=3?'#22c55e':kp<=5?'#eab308':kp<=7?'#ff8c00':'#ef4444';
+var pct=has?Math.min(100,kpn/9*100):0;
 el.innerHTML='<div style="display:flex;align-items:center;gap:8px">'+
 '<span style="font-size:clamp(24px,2.5vh,24px);font-weight:bold;color:'+color+'">Kp '+kp+'</span>'+
 '<div style="flex:1;height:clamp(6px,1vh,10px);background:var(--bg)">'+
@@ -3702,6 +3743,27 @@ import tempfile
 # hamclock_data uses. urllib.request is already resident (hamclock_data imports
 # it at module scope), so this costs no extra RAM on the Pi.
 from urllib.request import Request as _Request, urlopen as _urlopen
+
+
+def _log(msg):
+    """One line to stderr, flushed, for things an operator has to be able to
+    find afterwards.
+
+    Newlines are folded out because the only variable part of these lines is
+    an exception string, and a report failure that spreads over three journal
+    entries is a report failure that greps as one line and two orphans.
+
+    The kiosk runs under systemd, so stderr is the journal. A report used to
+    leave no trace there at all — the only evidence a send had happened was a
+    status-bar line that aged out after 10 s, which is no help to anyone
+    reading `journalctl -u hamclock-lite` an hour later. Flushed because the
+    interesting lines are the ones written just before something wedges."""
+    try:
+        print(str(msg).replace('\n', ' ').replace('\r', ' '),
+              file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
 
 # ---- Settings layer (Phase 4) ----
 SETTINGS_PATH = "/etc/hamclock-lite/settings.json"
@@ -4856,7 +4918,7 @@ def _formatted_strings(data):
         'OK' if data.bands else '--',
         dx_len,
     )
-    kp = _safe(data.solar or {}, 'kIndex', 0) if data.solar is not None else 0
+    kp = _safe(data.solar or {}, 'kIndex') if data.solar is not None else '--'
     _strfmt_cache["kp"] = 'Kp {}'.format(kp)
     _strfmt_cache["key"] = key
     return _strfmt_cache
@@ -4878,11 +4940,17 @@ def _solar_view(solar, data_refresh_ts):
         'aIndex':      _safe(s, 'aIndex'),
         'xray':        _safe(s, 'xray'),
         'solarWind':   _safe(s, 'solarWind'),
-        'bz':          _safe(s, 'bz'),
+        # The server has only ever sent Bz as 'magneticField' (index.html
+        # reads it there). This read 'bz', so the Pi's Bz row showed '--'
+        # on every frame it has ever drawn. 'bz' is kept as a fallback.
+        'bz':          _safe(s, 'magneticField', _safe(s, 'bz')),
         'geomagField': _safe(s, 'geomagField'),
         'signalNoise': _safe(s, 'signalNoise'),
         'fof2':        _safe(s, 'fof2'),
-        'kIndex_raw':  _safe(s, 'kIndex', 0),
+        # '--', not 0: the server now sends '' for a missing Kp (1.0.10), and
+        # a default of 0 painted "Kp 0" in GEOMAG — a quiet-sky reading — beside
+        # SOLAR's honest '--'. draw_geomag's float() maps it to an empty bar.
+        'kIndex_raw':  _safe(s, 'kIndex'),
         'xray_raw':    _safe(s, 'xray', 'A0.0'),
     }
     _solar_snapshot["ts"] = data_refresh_ts
@@ -5045,6 +5113,53 @@ def _safe(d, key, default='--'):
         return v
     except Exception:
         return default
+
+
+# Rendered in this font stack and measured (ink = alpha > 128): the em dash is
+# a bar 5x1 px at the 720x450 label size up to 18x3 at the 1440x900 title
+# size, sitting inside the digits' height (rows 19-21 of a '5' spanning 6-27
+# at that title size, where '_' lands on 32-34). The box drawn for a codepoint
+# the font lacks is 4x7 up to 15x26. pygame's fallback face, used when
+# SysFont('monospace') finds nothing, draws it as a bar too (8x1 to 23x2). So
+# it is a dash at every size we use, not a .notdef box, and '--' is not needed.
+FOF2_ABSENT = u'\u2014'
+
+
+def _fmt_fof2(value):
+    """A foF2 reading, or FOF2_ABSENT when there is no reading.
+
+    hamqsl is serving `<fof2></fof2>` right now — an empty tag, meaning the
+    ionosonde network gave it nothing — and a server older than 1.0.10 renders
+    that empty tag as the string '0'. Passed straight through, the MUF headline read
+    "FOF2 0 MHz", which an operator reads as a measurement rather than as a
+    gap, and a critical one: 0 MHz would mean no F2 layer at all. Zero is not
+    a foF2 value, so it is treated as the absence it actually is.
+
+    BOTH '' and '0' count as absent, because the client has to be right
+    against a server that has not been restarted yet as well as one that has.
+    '--' is accepted too so the field shows one marker whichever way the
+    reading went missing. So is anything that does not parse as a number: the
+    same hamqsl document spells a missing reading in words (`<muf>NoRpt</muf>`,
+    `<kindexnt>No Report</kindexnt>`), and with the unit after it the row would
+    read "FOF2 NoRpt MHz". A number is returned exactly as given.
+
+    "Parses as a number" means a finite one above zero. Python's float() also
+    accepts 'NAN', 'inf' and 'Infinity' -- which is what PHP prints for a
+    failed float, and hamqsl is PHP -- so a bare float() test let "FOF2 NAN
+    MHz" through (rendered, 1440x900). A negative plasma frequency is no more
+    a reading than zero is, and -1 is the usual missing-value sentinel."""
+    if value is None:
+        return FOF2_ABSENT
+    text = str(value).strip()
+    if text in ('', '--', FOF2_ABSENT):
+        return FOF2_ABSENT
+    try:
+        mhz = float(text)
+    except (TypeError, ValueError):
+        return FOF2_ABSENT
+    if not math.isfinite(mhz) or mhz <= 0.0:
+        return FOF2_ABSENT
+    return value
 
 
 def _blit_text(screen, font, text, color, x, y):
@@ -5263,7 +5378,7 @@ def draw_solar(screen, rect, solar, fonts, theme, data_refresh_ts=None):
             ('A', v['aIndex']), ('Xray', v['xray']),
             ('Wind', v['solarWind']), ('Bz', v['bz']),
             ('Geo', v['geomagField']), ('S/N', v['signalNoise']),
-            ('foF2', v['fof2']),
+            ('foF2', _fmt_fof2(v['fof2'])),
         ]
     else:
         rows = [
@@ -5273,10 +5388,10 @@ def draw_solar(screen, rect, solar, fonts, theme, data_refresh_ts=None):
             ('A', _safe(solar, 'aIndex')),
             ('Xray', _safe(solar, 'xray')),
             ('Wind', _safe(solar, 'solarWind')),
-            ('Bz', _safe(solar, 'bz')),
+            ('Bz', _safe(solar, 'magneticField', _safe(solar, 'bz'))),
             ('Geo', _safe(solar, 'geomagField')),
             ('S/N', _safe(solar, 'signalNoise')),
-            ('foF2', _safe(solar, 'fof2')),
+            ('foF2', _fmt_fof2(_safe(solar, 'fof2'))),
         ]
     # Tier 1.1: ten label/value rows at the old fixed pitch 16 needed 160 px;
     # the SOLAR content rect at 720x450 is 128x53. Derive the pitch from the
@@ -5569,8 +5684,11 @@ def draw_muf_text(screen, rect, solar, fonts, theme, surf=None,
     if map_h:
         rect = pygame.Rect(rect.x, rect.y + map_h, rect.w, rect.h - map_h)
 
+    fof2 = _fmt_fof2(_safe(solar, 'fof2'))
     rows = [
-        ('FOF2',   '{} MHz'.format(_safe(solar, 'fof2'))),
+        # No unit on the dash: "— MHz" still reads as a reading, which
+        # is the thing this row is here to stop.
+        ('FOF2',   fof2 if fof2 == FOF2_ABSENT else '{} MHz'.format(fof2)),
         ('GEOMAG', _safe(solar, 'geomagField')),
         ('KP',     _safe(solar, 'kIndex')),
         ('SFI',    _safe(solar, 'sfi')),
@@ -5717,16 +5835,24 @@ def draw_band_activity(screen, rect, dxspots, fonts, theme):
 
 
 def draw_tabs(screen, rect, tabs, active, fonts, theme):
-    """Tabs fill `rect` — its HEIGHT is honoured rather than assumed.
+    """Draw a tab bar filling `rect`. Returns {name: Rect}.
 
-    The bar used to be a hardcoded 20 px. Once fonts began scaling with the
-    framebuffer, the 26 px panel face at 1440x900 was drawn into a 20 px box
-    and clipped to nothing: measured 0 label pixels at native resolution
-    against 113 at 800x600, so the operator saw three blank buttons with no
-    way to tell which map was showing. Same failure as the hardcoded header
-    height, in the one piece of chrome that fix did not cover.
+    The bar is as tall as the rect the caller hands over. It used to be
+    `min(20, rect.h)` — a constant left over from the 720x450-only era — so
+    once fonts began scaling with the framebuffer the bar stayed 20 px while
+    the panel face grew to 26 px at 1440x900, and the `th >= fh` guard below
+    then skipped the label entirely. Label pixels measured here, before and
+    after (colour within 60 of the label/accent face):
+
+        720x450   panel font 13  bar 20  ->  176  ->  176
+        800x600   panel font 14  bar 20  ->  208  ->  208
+        1440x900  panel font 26  bar 32  ->    0  ->  810
+
+    Zero, at the one resolution the Pi actually runs: the Sep 20 screenshot
+    off the hardware shows three empty boxes with no way to tell which map is
+    up. The two smaller modes keep their pixel count because their bar was
+    already the full 20 px; centring only moves their label down one row.
     """
-    """Draw a tab bar across rect.y (height 20). Returns {name: Rect}."""
     regions = {}
     if not tabs or rect.w <= 0 or rect.h <= 0:
         return regions
@@ -5738,9 +5864,9 @@ def draw_tabs(screen, rect, tabs, active, fonts, theme):
         return regions
     f = fonts['panel']
     fh = f.get_height()
-    th = min(20, rect.h)
+    th = rect.h
     pad = min(8, max(1, tw // 6))
-    ty = rect.y + min(2, max(0, th - fh))
+    ty = rect.y + max(0, (th - fh) // 2)
     for i, name in enumerate(tabs):
         tab_rect = pygame.Rect(rect.x + i * tw, rect.y, max(1, tw - 2), th)
         color = theme['border'] if name == active else theme['card']
@@ -5761,14 +5887,23 @@ def draw_geomag(screen, rect, solar, fonts, theme, data_refresh_ts=None):
         v = _solar_view(solar, data_refresh_ts)
         kp = v['kIndex_raw']
     else:
-        kp = _safe(solar, 'kIndex', 0)
+        kp = _safe(solar, 'kIndex')
     try:
         kp_val = float(kp)
+        if not math.isfinite(kp_val):
+            # float() takes 'NAN'/'inf'. NaN fails every '<' below, so it drew
+            # a FULL bar in 'poor' -- a storm verdict from a failed number.
+            raise ValueError(kp)
+        color = (theme['good'] if kp_val < 4
+                 else theme['fair'] if kp_val < 6
+                 else theme['poor'])
     except Exception:
+        # No reading, so an empty bar. draw_bar paints no fill at 0, so this
+        # colour is never on screen today (nor was 'good' before it); it is
+        # the label colour so that a bar which one day gets a minimum sliver
+        # still cannot turn no data into a verdict on the sky.
         kp_val = 0.0
-    color = (theme['good'] if kp_val < 4
-             else theme['fair'] if kp_val < 6
-             else theme['poor'])
+        color = theme['label']
     _draw_value_and_bar(screen, rect, 'Kp {}'.format(kp), kp_val, 9.0,
                         color, fonts, theme)
 
@@ -6184,6 +6319,29 @@ TELEMETRY_SCHEMA = 1
 # the screen.
 TELEMETRY_TIMEOUT_S = 15.0
 TELEMETRY_UA = 'hamclock-pi1-report/1 (+https://hamclock-reborn.org)'
+
+# How long the render loop waits before it takes the button back.
+#
+# A send that spends each timeout once costs SERVER_DIAG_TIMEOUT_S (20) +
+# TELEMETRY_TIMEOUT_S (15) = 35 s. That is not a ceiling: urllib applies the
+# timeout to each blocking socket operation, and create_connection spends it
+# once per address the name resolves to — measured, timeout=2 against four
+# unanswering addresses gave up after 8.0 s, and the telemetry host resolves
+# to 2 A + 2 AAAA. What has no deadline at all is getaddrinfo(): a socket
+# timeout starts after the name resolves, so a stuck resolver — a DNS server
+# that accepts the query and never answers is the ordinary way this happens
+# on a rural link — pins the worker thread indefinitely.
+# The worker is the ONLY thing that ends the 'sending' stage, so until now
+# that wedged the report button until the next restart, silently: _report_open
+# refuses while stage != 'idle' and the notice had already aged out, so the
+# screen looked completely normal and every later press did nothing.
+#
+# 75 s is a little over double the spend-each-timeout-once case, so a slow
+# send is not cut short unless it is also retrying addresses, and it is still
+# well inside the time an operator will wait before deciding the button is
+# broken. A send the watchdog gives up on can therefore still arrive; the
+# worker journals that late outcome itself (see _send_telemetry_async).
+REPORT_SEND_WATCHDOG_S = 75.0
 
 # The local server's diagnostics endpoint, embedded verbatim (after scrubbing)
 # under payload['server']. Path only — the host comes from the live
@@ -6879,6 +7037,14 @@ def _send_telemetry_async(payload, holder, url=None, diag_base=None):
         holder['ok'] = ok
         holder['msg'] = msg
         holder['done'] = True
+        if holder.get('released'):
+            # The loop has stopped listening: _report_poll's watchdog already
+            # journalled this send as released and told the operator to try
+            # again. Nothing on screen can change now, but the journal must
+            # not be left saying a report that DID arrive never went — that
+            # is exactly the question it is read to answer.
+            _log('[report] released send finished late: %s'
+                 % ('sent' if ok else 'NOT sent: %s' % msg))
 
     t = threading.Thread(target=_worker, name='hamclock-report', daemon=True)
     t.start()
@@ -6903,6 +7069,9 @@ def _new_report_state():
         'notice': '',
         'notice_color': 'accent',
         'notice_until': 0.0,
+        # When the current send was handed to the worker, so _report_poll can
+        # tell a slow send from a wedged one. 0.0 whenever stage != 'sending'.
+        'sending_since': 0.0,
     }
 
 
@@ -7118,7 +7287,14 @@ def _report_notice(state, text, color='accent', now=None):
 
 
 def _report_notice_text(state, now):
-    """The status-bar message, or None once it has aged out."""
+    """The status-bar message, or None once it has aged out.
+
+    Exception: while a send is actually in flight the message stays up for as
+    long as that takes. The 10 s TTL used to expire it mid-send, so the bar
+    went back to looking idle while the button was still refusing presses —
+    the display said nothing was happening at the one moment something was."""
+    if state.get('stage') == 'sending' and state.get('notice'):
+        return state['notice']
     if state.get('notice') and now < state.get('notice_until', 0.0):
         return state['notice']
     return None
@@ -7187,6 +7363,20 @@ def _report_confirm(state, url=None):
     holder = {'done': False, 'ok': False, 'msg': ''}
     state['result'] = holder
     payload = state['payload']
+    # Sized here, while the loop still holds the only reference it will ever
+    # have: the worker mutates payload['server'] in place, so asking after the
+    # thread starts would be a race. That block is therefore NOT in this
+    # count, which is why the log line says so.
+    #
+    # This is a second serialization of ~100 KB on the render thread. Measured
+    # at 0.40 ms on x86 for a 100 KB payload; at the ~30x this file's MUF
+    # decode shows between x86 and the ARMv6, ~12 ms against a 100 ms frame —
+    # affordable because it happens once, on the single frame the operator
+    # pressed Y, and never again.
+    try:
+        sent_bytes = len(json.dumps(payload).encode('utf-8'))
+    except Exception:
+        sent_bytes = -1
     # Drop the loop's reference now: the worker holds the only one, so the
     # ~130 KB payload is freed the moment the POST finishes.
     state['payload'] = None
@@ -7194,26 +7384,68 @@ def _report_confirm(state, url=None):
     state['regions'] = {}
     state['shown'] = False
     state['stage'] = 'sending'
+    state['sending_since'] = time.time()
     _report_notice(state, 'sending report…', 'accent')
+    _log('[report] send started: %d B payload, server diagnostics not yet '
+         'attached' % sent_bytes)
     _send_telemetry_async(payload, holder, url=url,
                           diag_base=state.get('diag_base'))
     return True
 
 
-def _report_poll(state):
-    """Pick up the worker's result. True when the status bar must redraw."""
+def _report_poll(state, now=None):
+    """Pick up the worker's result. True when the status bar must redraw.
+
+    Also the watchdog. The worker setting holder['done'] is the only thing
+    that ends a send, and it can fail to happen: its timeouts are socket
+    timeouts, and getaddrinfo() runs before any of them, so a resolver that
+    answers nothing pins the thread indefinitely. That left the button dead
+    until restart with nothing on screen to say so. After
+    REPORT_SEND_WATCHDOG_S we stop waiting and hand the button back."""
     if state.get('stage') != 'sending':
         return False
+    now = time.time() if now is None else now
     holder = state.get('result')
     if not holder or not holder.get('done'):
+        started = state.get('sending_since') or 0.0
+        if started and now < started:
+            # The Pi 1 has no RTC and NTP steps its clock. Measured from a
+            # start time that is now in the future, a backwards step would add
+            # its whole size to the watchdog — the dead button again, for as
+            # long as the step. Count from here instead. A forward step can
+            # only fire the watchdog early, which costs at most a resend.
+            state['sending_since'] = started = now
+        if started and now - started >= REPORT_SEND_WATCHDOG_S:
+            # The thread may well still be alive inside getaddrinfo(), and we
+            # leave it there deliberately: Python cannot kill a thread, and
+            # joining it is precisely the wait we are refusing to do. It is a
+            # daemon, it holds one payload and a holder only it still reads,
+            # and it never retries — so the entire cost of handing the button
+            # back is one stranded thread and its ~130 KB until the process
+            # exits. Marked so that, if it does finish, it journals the
+            # outcome nobody is polling for.
+            if holder is not None:
+                holder['released'] = True
+            state['result'] = None
+            state['stage'] = 'idle'
+            state['sending_since'] = 0.0
+            _log('[report] watchdog released a wedged send after %.0f s'
+                 % (now - started))
+            _report_notice(state, 'report timed out — press T to try again',
+                           'poor', now=now)
+            return True
         return False
     state['result'] = None
     state['stage'] = 'idle'
+    state['sending_since'] = 0.0
     if holder.get('ok'):
-        _report_notice(state, holder.get('msg') or 'report sent', 'good')
+        _report_notice(state, holder.get('msg') or 'report sent', 'good',
+                       now=now)
+        _log('[report] sent')
     else:
-        _report_notice(state, 'report NOT sent: %s'
-                       % (holder.get('msg') or 'unknown error'), 'poor')
+        reason = holder.get('msg') or 'unknown error'
+        _report_notice(state, 'report NOT sent: %s' % reason, 'poor', now=now)
+        _log('[report] NOT sent: %s' % reason)
     return True
 
 
@@ -7831,6 +8063,9 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
     # stat and a ~150-byte read every 300 frames, and nothing at all in
     # between.
     update = _new_update_state()
+    # Set when a key the update box does not take has posted its hint, so the
+    # overlay branch paints the status bar once. See that branch for why.
+    update_hint_due = False
     tab_image_key = PROP_TAB_IMAGE_KEY
     dirty_state = {
         'prev_active_tab': None,
@@ -7903,6 +8138,30 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                         elif event.key in (pygame.K_n, pygame.K_ESCAPE,
                                            pygame.K_q):
                             _update_cancel(update)
+                        elif event.key == pygame.K_t:
+                            # T is the report key everywhere else on this
+                            # display, and this arm sits AHEAD of the one that
+                            # owns it, so an operator who wanted to report the
+                            # update notice they were looking at got nothing
+                            # at all. Answer the update with "not now" and
+                            # open the report box: the two presses they would
+                            # have had to make by hand, in that order.
+                            _update_cancel(update)
+                            _report_open(report, screen, data, fonts,
+                                         settings, callsign)
+                        else:
+                            # Anything else used to fall off the end of this
+                            # arm and vanish. Say which keys the box takes.
+                            # Posted on the UPDATE channel, which every way of
+                            # closing the box overwrites with its own outcome,
+                            # so the hint can never outlive the box and mask
+                            # the answer to what the operator chose. That is
+                            # also why posting it is not enough on its own —
+                            # see update_hint_due in the overlay branch.
+                            _set_notice(update,
+                                        'update: Y installs, N dismisses, '
+                                        'T reports', 'label', 10.0)
+                            update_hint_due = True
                     elif event.type == pygame.MOUSEBUTTONDOWN:
                         pos = event.pos
                         go_r = update['regions'].get('install')
@@ -7992,13 +8251,39 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 continue
 
             if update['stage'] == 'confirm':
-                # Identical treatment to the report box above.
+                # Identical treatment to the report box above, with one
+                # exception: the hint a stray key posts. The dashboard is
+                # frozen while the box is up and the box's outcome overwrites
+                # the hint when it closes, so a hint left to the normal status
+                # cadence is never painted at all. Rendered through this loop
+                # at 720x450: U, then S, then N — the bar showed the data ages
+                # for every frame the box was up and "update postponed" after,
+                # and the hint was in state the whole time and on no pixel.
+                # So paint the bar here, once per hint, UNDER the box: at
+                # 720x450 a full box reaches y=432 and the bar starts at 430.
+                _dirty = []
+                if update_hint_due:
+                    update_hint_due = False
+                    try:
+                        _sbar = _get_layout(screen.get_size())['status']
+                        _sr = draw_status_bar(
+                            screen, _sbar, data, fonts, theme,
+                            notice=_update_notice_text(update, time.time()),
+                            notice_color=update['notice_color'],
+                            update_label=update['button'])
+                        if _sr is not None:
+                            status_regions = _sr
+                        _dirty.append(_sbar)
+                    except Exception as e:
+                        _log('[update] could not paint the key hint: %s' % e)
                 orect = _report_overlay_rect(screen.get_size(),
                                              update['lines'], fonts)
                 update['regions'] = draw_update_overlay(
                     screen, orect, update['lines'], fonts, theme)
                 if orect is not None:
-                    pygame.display.update(orect)
+                    _dirty.append(orect)
+                if _dirty:
+                    pygame.display.update(_dirty)
                 update['shown'] = True
                 dirty_state['full_flip_pending'] = True
                 clock.tick(10)
@@ -9627,7 +9912,7 @@ done
 # text itself. scripts/sync_installers.py stamps it from the repo VERSION file
 # and --check fails the build if the two drift.
 sudo tee "$INSTALL_DIR/VERSION" > /dev/null << 'HCVERSIONTXT'
-1.0.9
+1.0.10
 HCVERSIONTXT
 sudo chown root:root "$INSTALL_DIR/VERSION"
 sudo chmod 0644 "$INSTALL_DIR/VERSION"

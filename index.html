@@ -712,10 +712,14 @@ function renderGeomag(solar){
 if(!solar)return;
 var el=document.getElementById('geomagBody');
 if(!el)return;
-var kp=parseInt(solar.kIndex)||0;
+// A missing Kp is '--' in the muted colour, not a green 0: 0 is a real
+// reading (a quiet sky) and the server now sends '' when it has none.
+var kpn=parseInt(solar.kIndex,10);
+var has=isFinite(kpn);
+var kp=has?kpn:'--';
 var geo=solar.geomagField||'unknown';
-var color=kp<=3?'#22c55e':kp<=5?'#eab308':kp<=7?'#ff8c00':'#ef4444';
-var pct=Math.min(100,kp/9*100);
+var color=!has?'var(--muted)':kp<=3?'#22c55e':kp<=5?'#eab308':kp<=7?'#ff8c00':'#ef4444';
+var pct=has?Math.min(100,kpn/9*100):0;
 el.innerHTML='<div style="display:flex;align-items:center;gap:8px">'+
 '<span style="font-size:clamp(24px,2.5vh,24px);font-weight:bold;color:'+color+'">Kp '+kp+'</span>'+
 '<div style="flex:1;height:clamp(6px,1vh,10px);background:var(--bg)">'+

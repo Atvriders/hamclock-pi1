@@ -1164,21 +1164,58 @@ def fetch_hamqsl():
             el = sd.find(tag)
             return el.text.strip() if el is not None and el.text else default
 
+        # A default is the "no reading" sentinel, and the only honest one is
+        # '' -- the value rows already read it as absence: _safe() renders
+        # '--' in the pygame client and an em dash in the tkinter one, and
+        # index.html's `if(d.fof2)` drops the row. pygame's GEOMAG panel now
+        # draws '' as "Kp --" too. index.html's does not yet: renderGeomag
+        # coerces a missing Kp to 0 on its own (`parseInt(...)||0`), so there
+        # '' paints the same green "Kp 0" that '0' did -- no worse, but not
+        # fixed from this side. A default that is
+        # itself a value the feed can publish is indistinguishable from a
+        # measurement by the time it reaches a panel.
+        #
+        # hamqsl is serving <fof2></fof2> right now (22 Sep 2026 1900 GMT
+        # sample, next to <muffactor></muffactor> and <muf>NoRpt</muf>), so
+        # '0' was painting "FOF2  0 MHz" in the largest type on the centre
+        # panel as though zero had been measured. The same collision applies
+        # to every default changed here: <kindex> is literally " 0" in that
+        # same sample, SSN is 0 on a spotless day, A-index 0 on a quiet one,
+        # aurora is a small integer starting at 0, Bz crosses 0 every few
+        # hours, and 'quiet'/'S0-S0' come from the feed's own vocabulary
+        # (it sent <geomagfield>INACTIVE</geomagfield> and
+        # <signalnoise>S0-S1</signalnoise>).
+        #
+        # solarWind too, though 0 cannot collide with a reading (the wind runs
+        # 250-800 km/s and never stops): "Wind 0" still reads as a measurement,
+        # and an alarming one. Every consumer takes '' — pygame '--', tkinter
+        # an em dash, index.html a blank cell.
+        #
+        # Deliberately left on a numeric default: sfi, because the 10.7 cm
+        # flux floor is ~64 so 0 is not a reading, and index.html bails out
+        # of the entire solar panel on `if(!d.sfi)return;` — which '' would
+        # trip and the truthy string '0' does not. The 'N/A'
+        # defaults stay too -- 'N/A' is outside those fields' value formats,
+        # so it cannot be mistaken for one.
         solar = {
             'sfi': gt('solarflux', '0'),
-            'ssn': gt('sunspots', '0'),
-            'aIndex': gt('aindex', '0'),
-            'kIndex': gt('kindex', '0'),
+            'ssn': gt('sunspots'),
+            'aIndex': gt('aindex'),
+            'kIndex': gt('kindex'),
             'xray': gt('xray', 'N/A'),
             'heliumLine': gt('heliumline', 'N/A'),
+            # hamqsl misspells this tag as <electonflux> (no 'r'), so
+            # 'electronflux' never matched and the field has always fallen
+            # through to 'N/A'. Read the spelling the feed ships, keeping the
+            # correct one as the fallback for if it is ever fixed.
+            'electronFlux': gt('electonflux') or gt('electronflux', 'N/A'),
             'protonFlux': gt('protonflux', 'N/A'),
-            'electronFlux': gt('electronflux', 'N/A'),
-            'aurora': gt('aurora', '0'),
-            'solarWind': gt('solarwind', '0'),
-            'magneticField': gt('magneticfield', '0'),
-            'geomagField': gt('geomagfield', 'quiet'),
-            'signalNoise': gt('signalnoise', 'S0-S0'),
-            'fof2': gt('fof2', '0'),
+            'aurora': gt('aurora'),
+            'solarWind': gt('solarwind'),
+            'magneticField': gt('magneticfield'),
+            'geomagField': gt('geomagfield'),
+            'signalNoise': gt('signalnoise'),
+            'fof2': gt('fof2'),
             'mpiVer': gt('mpiVer', ''),
             'updated': gt('updated', ''),
         }
