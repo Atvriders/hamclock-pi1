@@ -72,9 +72,16 @@ def test_title_font_text_is_not_a_solid_block(display):
 
 
 def test_flat_fonts_still_render(display):
-    """The AA=False faces (everything except 'title') must be unaffected."""
+    """Every other face renders text, and none of it as a filled block.
+
+    "Rendered" is any pixel that left the card colour, not only pixels at the
+    full text colour: the Pi's FreeMonoBold at 8 px (the 720x450 label face)
+    paints 64 partially covered pixels and not one fully solid pixel, so a
+    solid-only count read real text as nothing at all. The block check keeps
+    the solid-pixel ratio, which is what a lost alpha channel inflates."""
     fonts = hp._make_fonts()
     theme = hp.THEMES['kstate']
+    card = tuple(theme['card'])[:3]
     for name in ('panel', 'body', 'label', 'small', 'tiny'):
         screen = pygame.Surface((200, 30))
         screen.fill(theme['card'])
@@ -82,8 +89,12 @@ def test_flat_fonts_still_render(display):
         hp._blit_text(screen, fonts[name], 'Kp 3', theme['bright'], 2, 2)
         box = pygame.Rect(2, 2, fonts[name].size('Kp 3')[0],
                           fonts[name].get_height())
+        painted = sum(1 for x in range(box.x, box.right)
+                      for y in range(box.y, box.bottom)
+                      if screen.get_at((x, y))[:3] != card)
+        assert painted > 0, "font %r painted nothing at all" % name
         ink = _ink_ratio(screen, box, theme['bright'])
-        assert 0.0 < ink < 0.75, (
+        assert ink < 0.75, (
             "font %r painted %.0f%% solid ink" % (name, ink * 100))
 
 

@@ -117,14 +117,19 @@ def test_payload_top_level_shape_is_the_agreed_schema(screen, fonts,
         'versions', 'perf', 'server', 'screenshot_png_b64',
     }, 'top-level payload keys drifted from the agreed schema'
     assert p['schema'] == 1
-    assert set(p['app']) == {'version', 'mode', 'install'}
+    # 1.0.11 added proc_age_s (app), clock_step_s and ntp_synced (host), and
+    # present / slow_frames / glyph (perf). Additive: the receiver stores any
+    # field inside its limits, and its public projection picks these by name.
+    assert set(p['app']) == {'version', 'mode', 'install', 'proc_age_s'}
     assert p['app']['mode'] == 'pygame'
     assert set(p['host']) == {'model', 'cpu', 'cores', 'mem_total_kb',
-                              'kernel', 'os', 'python', 'uptime_s'}
+                              'kernel', 'os', 'python', 'uptime_s',
+                              'clock_step_s', 'ntp_synced'}
     assert set(p['display']) == {'sdl_driver', 'bitsize', 'size',
                                  'fullscreen'}
     assert set(p['versions']) == {'pygame', 'sdl', 'cairosvg', 'cpulimit'}
-    assert set(p['perf']) == {'frame_ms', 'panel_ms', 'boot_to_first_paint_s'}
+    assert set(p['perf']) == {'frame_ms', 'panel_ms', 'boot_to_first_paint_s',
+                              'present', 'slow_frames', 'glyph'}
     assert set(p['perf']['frame_ms']) == {'p50', 'p90', 'p99', 'n'}
     assert re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$', p['sent_at'])
 

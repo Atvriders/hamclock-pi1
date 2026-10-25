@@ -246,11 +246,21 @@ def test_draw_band_activity_uses_theme_palette():
     rect = pygame.Rect(0, 0, 400, 200)
     spots = [{'band': '10m'}]
     hamclock_pygame.draw_band_activity(surf, rect, spots, fonts, theme)
-    # 10m is the 10th band; row_h ≈ (200-4)/10 = 19; row 10 center ~ y=180.
-    # Sample inside the bar interior (label width = 40, sample at x=80).
-    px = surf.get_at((80, 184))[:3]
-    assert tuple(px) == theme['band_palette'][9], \
-        f'got {tuple(px)}, want {theme["band_palette"][9]}'
+    # Find the bar rather than assume where it is. A fixed sample at (80, 184)
+    # encoded DejaVu's 10 px label face; in the Pi's own face rows are 18 px,
+    # the 10m bar ends at y=177, and the sample read the background.
+    want = tuple(theme['band_palette'][9])
+    hits = [(x, y) for x in range(rect.w) for y in range(rect.h)
+            if tuple(surf.get_at((x, y))[:3]) == want]
+    assert len(hits) > 20, f'no 10m bar painted in {want}'
+    # 10m is the last of ten bands, so its bar sits in the bottom half.
+    assert min(y for _, y in hits) > rect.h // 2, 'the 10m colour is on the wrong row'
+    # Only 10m has a spot, so no other band's colour may have a filled bar.
+    for i, other in enumerate(theme['band_palette'][:9]):
+        if tuple(other) != want:
+            assert not any(tuple(surf.get_at((x, y))[:3]) == tuple(other)
+                           for x in range(rect.w) for y in range(rect.h)), (
+                f'band {i} has a bar but no spots')
 
 
 def test_draw_image_signature_takes_theme():

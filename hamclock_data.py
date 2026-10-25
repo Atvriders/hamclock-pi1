@@ -75,6 +75,15 @@ class HamClockData:
         # Timestamps (Unix seconds; 0 means never)
         self.last_data_refresh = 0
         self.last_image_refresh = 0
+        # last_data_refresh is stamped after every poll, including one in
+        # which all four requests failed, so it cannot say whether the server
+        # is there. last_contact is the last poll the server actually answered
+        # (a 200 or a 304), and health_at the moment `health` last came back
+        # fresh — the instant its ages were true. The status bar needs both:
+        # with the server down, the ages in the last health dict keep growing
+        # from health_at, and "server silent" is measured from last_contact.
+        self.last_contact = 0
+        self.health_at = 0
         # Per-image refresh timestamps (epoch seconds). Maps image_key
         # ('solar-image' | 'muf-map' | 'enlil' | 'drap' | 'real-drap')
         # to the epoch-second when that key's bytes last refreshed.
@@ -184,11 +193,17 @@ class HamClockData:
         """Fetch the 4 JSON endpoints synchronously."""
         results = {}
         fetched = {}
+        answered = False
         for key, path in self._JSON_ENDPOINTS.items():
             data = self._fetch_json(path)
             results[key] = data is not None
             if data is not None:
                 fetched[key] = data
+            # _fetch_json leaves None here for a 200 and for a 304 alike:
+            # either way the server was there.
+            if self.errors.get(path, 'unset') is None:
+                answered = True
+        now = time.time()
         with self._lock:
             if 'solar' in fetched:
                 self.solar = fetched['solar'] if isinstance(fetched['solar'], dict) else {}
@@ -198,7 +213,10 @@ class HamClockData:
                 self.dxspots = fetched['dxspots'] if isinstance(fetched['dxspots'], list) else []
             if 'health' in fetched:
                 self.health = fetched['health'] if isinstance(fetched['health'], dict) else {}
-            self.last_data_refresh = time.time()
+                self.health_at = now
+            if answered:
+                self.last_contact = now
+            self.last_data_refresh = now
         return results
 
     def _next_image_delay(self, key):

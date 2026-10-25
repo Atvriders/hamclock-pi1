@@ -330,7 +330,10 @@ def test_render_loop_30_frame_alloc_budget(monkeypatch):
             def __init__(self, inner):
                 self._inner = inner
             def render(self, *a, **kw):
-                calls['render'] += 1
+                # The once-per-face measuring render (_face_top_trim) is not
+                # a glyph-cache miss; count only the strings being drawn.
+                if not (a and a[0] == getattr(hamclock_pygame, '_TRIM_PROBE', None)):
+                    calls['render'] += 1
                 return self._inner.render(*a, **kw)
             def __getattr__(self, name):
                 return getattr(self._inner, name)

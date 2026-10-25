@@ -1284,7 +1284,7 @@ def fetch_dx():
     """Fetch DX spots from HamQTH or fallback.
 
     Tier 1b perf: limit=15 (was 30) is enough for the pygame client
-    (5 rows in draw_dx_spots + band-activity histogram which only needs
+    (8 rows in draw_dx_spots at 1440x900 + band-activity histogram which needs
     counts per band). Halves the upstream CSV and the cached payload.
     """
     urls = [

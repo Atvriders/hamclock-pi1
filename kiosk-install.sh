@@ -80,6 +80,12 @@ if [ "$KIOSK_MODE" = "pygame" ]; then
     # budget, so the MUF panel could only ever read "(map loading)".
     sudo apt install -y librsvg2-bin || true
 
+    # fonts-freefont-ttf by name. The client asks for the bold monospace face,
+    # which resolves to FreeMonoBold from this package; until now it arrived
+    # only as python3-pygame's dependency, so nothing here said the display
+    # depended on it. Own line and `|| true` for the same reason as above.
+    sudo apt install -y fonts-freefont-ttf || true
+
     # Tier 1c: free RAM + boot time on a 512 MB Pi by masking kiosk-irrelevant daemons.
     # All four are non-essential for a wired-Ethernet HDMI kiosk.
     sudo systemctl mask bluetooth hciuart ModemManager avahi-daemon triggerhappy 2>/dev/null || true

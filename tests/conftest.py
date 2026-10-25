@@ -11,6 +11,15 @@ import tempfile
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("HAMCLOCK_DEBUG", "1")
 
+# Render in the face the Pi actually uses (see tests/fonts/README.md). Without
+# this a desktop resolves SysFont('monospace') to DejaVu, whose faces are
+# 14-19% taller than the Pi's, and every pixel measurement in the suite
+# describes a display that does not exist.
+os.environ.setdefault(
+    "HAMCLOCK_FONT",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "fonts", "FreeMonoBold.ttf"))
+
 # Tier 2.1: server.CACHE_DIR is read at import time and defaults to
 # /var/cache/hamclock-lite. tests/test_muf_rasterize.py calls server.fetch_muf()
 # directly, which now write-throughs the rendered PNG — point that at a temp

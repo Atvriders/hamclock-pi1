@@ -140,8 +140,11 @@ def test_advance_repaints_only_the_propagation_panel():
     """
     src = _loop_src()
     advance = src.index('>= next_tab_at')
-    window = src[advance:advance + 1400]
-    assert "_panel_due_at['propagation'] = 0.0" in window, (
+    # Nearby, not exact: the advance block carries a long comment. The
+    # behaviour itself is pinned by tests/test_render_loop_schedule.py, which
+    # drives the real loop and checks an advance repaints that panel alone.
+    window = src[advance:advance + 2000]
+    assert "_panel_due_at['propagation'] = min(" in window, (
         "the cycle must mark the propagation panel due")
     assert "dirty_state['prev_active_tab'] = active_tab" in window, (
         "prev_active_tab must advance too, or will_full_flip sees a tab change "

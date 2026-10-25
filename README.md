@@ -113,19 +113,19 @@ The dashboard is a 3-column kiosk layout designed for 1440×900 monitors but sca
 | **SDO IMAGE** | Live NASA SDO solar disk (HMI continuum), large enough to spot active regions | Every 15 minutes |
 | **GEOMAGNETIC** | Kp index gauge with color bar and storm-level label | Every 5 minutes |
 | **X-RAY FLUX** | GOES X-ray class (A/B/C/M/X) with intensity bar | Every 5 minutes |
-| **OPEN BANDS** | Quick summary of which HF bands are currently OPEN vs CLOSED | Every 5 minutes |
+| **OPEN BANDS** | Which HF bands are OPEN vs CLOSED now: the day forecast from 06:00 to 18:00 local, the night forecast otherwise (the panel title says which) | Every 5 minutes |
 
 ### Center column
 
 | Panel | Data | Updates |
 |-------|------|---------|
-| **MUF MAP** | KC2G real-time global Maximum Usable Frequency map with terminator and propagation contours | Every 15 minutes |
+| **MUF MAP** | KC2G real-time global Maximum Usable Frequency map with terminator and propagation contours, labelled with its age once it is over an hour old | Every 15 minutes |
 
 ### Right column
 
 | Panel | Data | Updates |
 |-------|------|---------|
-| **DX SPOTS** | Last 5 HF DX spots from HamQTH with frequency, band badge, DX callsign, spotter, and UTC time | Every 2 minutes |
+| **DX SPOTS** | The latest HF DX spots from HamQTH — as many as the panel holds, 8 at 1440x900 — with frequency, band badge, DX callsign, spotter, and UTC time (HHMM) | Every 2 minutes |
 | **BAND ACTIVITY** | HF-only horizontal bar chart of spot counts per band (160m–10m), auto-sized to fit all 10 HF bands | Every 2 minutes |
 | **PROPAGATION (tabbed)** | Click **DRAP** / **AURORA** / **ENLIL** to switch between three space-weather images: NOAA D-Region Absorption global map (default), Northern-Hemisphere Aurora forecast, and WSA-Enlil solar wind animation | Every 15 minutes |
 
@@ -133,8 +133,8 @@ The dashboard is a 3-column kiosk layout designed for 1440×900 monitors but sca
 
 | Element | Content |
 |---------|---------|
-| **Header** | HAMCLOCK LITE title, your callsign (click to reopen settings), UTC clock, local clock (timezone-aware), connection status dot |
-| **Status bar** | Solar / Bands / DX data ages so you can see freshness at a glance |
+| **Header** | HAMCLOCK LITE title, your callsign (click to reopen settings), UTC and local clocks in large type (timezone-aware), heartbeat dot |
+| **Status bar** | How old each feed is (Solar / Bands / DX, as the server last fetched it), red once a feed is three fetch intervals old; `server silent` if the dashboard cannot reach its own server; the spot count |
 
 ---
 

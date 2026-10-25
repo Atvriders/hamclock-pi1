@@ -983,13 +983,42 @@ def _build_panel_phase():
         names = sorted(names)
         for i, name in enumerate(names):
             phase[name] = (float(c) * i) / max(1, len(names))
+            if c > 1.0:
+                phase[name] += _SLOW_PHASE_OFFSET_S
     return phase
 
+
+# Where within each second the slow panels are drawn: clear of the header
+# (every whole second) and the status bar (every half second).
+#
+# Stagger alone was not enough, because of how SDL presents. Under KMSDRM it
+# has no framebuffer of its own, so pygame.display.update(rects) goes through
+# SDL_UpdateWindowTexture, which uploads ONE full-width band from the top of
+# the highest dirty rect to the bottom of the lowest (SDL_GetSpanEnclosingRect,
+# SDL 2.32.4). Every 60 s panel was phased on a whole second, i.e. drawn in
+# the same frame as the header at rows 0-60, so a panel near the bottom
+# uploaded nearly the whole 1440x900 screen to change a tenth of it. The Pi's
+# own p90 (header-only frames) puts that at ~0.2 ms a row, which predicts the
+# 120-230 ms frames behind its p99 of 184 ms. A quarter second apart, each
+# frame uploads only the band its own panels occupy.
+_SLOW_PHASE_OFFSET_S = 0.25
+
+# How late a slow panel may be and still be held back a frame because the
+# header or status bar is drawing (see _panel_due in the render loop). Below
+# half a second it is an ordinary collision worth one frame's wait; beyond it
+# the loop is running slow, and waiting would only starve the panel.
+_DEFER_MAX_LATE_S = 0.5
+
+# An image panel retrying every 15 s while it has no image sits half a second
+# later again, at x.75: clear of the header (x.0), the slow panels (x.25) and
+# the status bar (x.5). On x.25 its 15 s grid hit two other panels' 60 s
+# slots once a minute — sdo on dx_spots', propagation on bands'.
+_NO_IMAGE_SHIFT_S = 0.5
 
 _PANEL_PHASE = _build_panel_phase()
 
 
-def _next_due(name, now_ts, epoch):
+def _next_due(name, now_ts, epoch, cadence=None, shift=0.0):
     """Next due time for `name`, on that panel's own fixed grid.
 
     The first attempt at this applied the phase ONCE and then advanced by the
@@ -1003,11 +1032,28 @@ def _next_due(name, now_ts, epoch):
     way: whatever happens, the next due time lands back on that panel's own
     grid, so the spread is a property of the schedule rather than of the
     history that led to it.
+
+    `cadence` overrides the panel's own (the image panels redraw every 15 s
+    while they have no image). The phase is taken modulo it, so the faster
+    grid keeps the panel's position within the second — plus `shift`, which
+    the image panels use to move their 15 s retries to x.75 s: on x.25 a
+    15 s grid lands on two other panels' 60 s slots once a minute.
     """
-    c = _CADENCE_S[name]
-    ph = _PANEL_PHASE.get(name, 0.0)
+    c = _CADENCE_S[name] if cadence is None else float(cadence)
+    ph = (_PANEL_PHASE.get(name, 0.0) + shift) % c
     k = math.floor((now_ts - epoch - ph) / c) + 1
     return epoch + ph + k * c
+
+
+def _next_tab_at(now_ts, epoch, min_wait):
+    """When the propagation panel next advances its tab: the first slot on
+    that panel's own grid at least `min_wait` seconds away.
+
+    The tab cycle kept its own timer, restarted from whatever moment the last
+    advance happened to run, so it wandered onto whole seconds — the header's
+    frames — and took the propagation panel, which reaches row 858, with it.
+    On the grid, the advance lands in the frame the panel was due anyway."""
+    return _next_due('propagation', now_ts + max(0.0, min_wait) - 1e-6, epoch)
 
 
 SCREEN_W = 720    # Tier 2a: native render at 720x450; BCM2835 HVS upscales to 1440x900 in firmware
@@ -1028,9 +1074,13 @@ PROP_TABS = ['drap', 'aurora', 'enlil']
 #: How long each propagation tab stays up before the panel advances itself.
 #: This is a wall display: nobody is standing at it clicking through tabs, so a
 #: tab that is never selected is a map the operator never sees. Cycling makes
-#: all four reachable without input. Five minutes is long enough to actually
-#: read a map, short enough that every one comes round within a few minutes.
+#: all three reachable without input, a minute apiece, so every one comes round
+#: within the time an operator spends looking.
 #: Set to 0 to disable and leave the panel wherever it was last put.
+#:
+#: Keep it a multiple of 60. The advance happens on the propagation panel's own
+#: 60 s grid slot (_next_tab_at), so anything else rounds to the nearest slot:
+#: 75 behaves as 60, 90 as 120.
 TAB_CYCLE_S = 60.0
 
 
@@ -1143,43 +1193,94 @@ def _get_layout(screen_size):
 # Item 6: draw_band_activity pre-allocated counts (no per-frame dict alloc).
 _band_counts: list = [0] * len(HF_BANDS)
 
-# Item 7: cached OPEN / CLOSED label strings keyed by data.last_data_refresh.
-_open_bands_cache: dict = {"ts": None, "open": "", "closed": ""}
+# Item 7: cached OPEN / CLOSED label strings keyed by data.last_data_refresh
+# and the forecast period they were built for.
+_open_bands_cache: dict = {"ts": None, "period": None, "open": "", "closed": ""}
 
 
-def _open_bands_strings(bands, data_refresh_ts):
+def _band_period(now=None):
+    """'day' or 'night': which half of hamqsl's band forecast applies now.
+
+    By the Pi's local clock, 06:00 to 17:59 being day. hamqsl publishes both
+    columns for every band group, and they disagree exactly where it matters:
+    on the live feed of 2026-10-21 the night column had 80m-40m open and
+    12m-10m closed, the day column the reverse."""
+    try:
+        hour = time.localtime(now).tm_hour
+    except Exception:
+        return 'day'
+    return 'day' if 6 <= hour < 18 else 'night'
+
+
+def _open_bands_strings(bands, data_refresh_ts, period='day'):
     """Return the cached (open_label, closed_label) strings; refresh only
-    on a new data.last_data_refresh tick."""
-    if _open_bands_cache["ts"] == data_refresh_ts:
+    on a new data.last_data_refresh tick or a change of period.
+
+    It read the 'day' column at every hour, so after dark the panel showed
+    daytime conditions — wrong at both ends of the spectrum at once."""
+    period = period if period in ('day', 'night') else 'day'
+    if (_open_bands_cache["ts"] == data_refresh_ts
+            and _open_bands_cache.get("period") == period):
         return _open_bands_cache["open"], _open_bands_cache["closed"]
     opens, closes = [], []
     if isinstance(bands, dict):
         for key, entry in bands.items():
             if not isinstance(entry, dict):
                 continue
-            day = entry.get('day', 'N/A')
-            if day in ('Good', 'Fair'):
+            cond = entry.get(period, 'N/A')
+            if cond in ('Good', 'Fair'):
                 opens.append(key)
-            elif day == 'Poor':
+            elif cond == 'Poor':
                 closes.append(key)
     o = 'OPEN: ' + (', '.join(opens) or '--')
     c = 'CLOSED: ' + (', '.join(closes) or '--')
     _open_bands_cache["ts"] = data_refresh_ts
+    _open_bands_cache["period"] = period
     _open_bands_cache["open"] = o
     _open_bands_cache["closed"] = c
     return o, c
 
 
+def _wrap_band_list(font, text, max_w):
+    """'OPEN: 30m-20m, 17m-15m, 12m-10m' as lines no wider than max_w.
+
+    Breaks only between bands, with continuation lines indented under the
+    first band. A single band too wide for the line stays whole and is left
+    to _blit_fit's marked truncation."""
+    try:
+        if max_w <= 0 or font.size(text)[0] <= max_w:
+            return [text]
+        head, sep, rest = text.partition(': ')
+        if not sep or not rest:
+            return [text]
+        items = rest.split(', ')
+        pad = ' ' * (len(head) + len(sep))
+        lines, cur, fresh = [], head + sep, True
+        for i, item in enumerate(items):
+            tok = item + (',' if i < len(items) - 1 else '')
+            trial = cur + tok if fresh else cur + ' ' + tok
+            if fresh or font.size(trial)[0] <= max_w:
+                cur, fresh = trial, False
+            else:
+                lines.append(cur)
+                cur, fresh = pad + tok, False
+        lines.append(cur)
+        return lines
+    except Exception:
+        return [text]
+
+
 # Item 8: header / status / Kp string format cache keyed by
 # (int(time.time()), data.last_data_refresh, data.last_image_refresh, dx_len).
 _strfmt_cache: dict = {
-    "key": None, "utc": "", "local": "", "status": "", "kp": "",
+    "key": None, "utc": "", "local": "", "kp": "",
 }
 
 
 def _formatted_strings(data):
-    """Return cached strings for header (utc, local), status bar, and Kp.
-    Refreshes once per UTC second OR on a data/image refresh tick."""
+    """Return cached strings for the header (utc, local) and Kp.
+    Refreshes once per UTC second OR on a data/image refresh tick. (The
+    status bar's text is built by _status_segments.)"""
     try:
         now_sec = int(time.time())
     except Exception:
@@ -1195,17 +1296,8 @@ def _formatted_strings(data):
         local = time.strftime('%H:%M:%S')
     except Exception:
         utc = local = '--:--:--'
-    dage = int(now_sec - data.last_data_refresh) if data.last_data_refresh else -1
-    iage = int(now_sec - data.last_image_refresh) if data.last_image_refresh else -1
     _strfmt_cache["utc"] = 'UTC ' + utc
     _strfmt_cache["local"] = 'LOC ' + local
-    _strfmt_cache["status"] = 'Data:{}s  Img:{}s  Solar:{}  Bands:{}  DX:{}'.format(
-        dage if dage >= 0 else '--',
-        iage if iage >= 0 else '--',
-        'OK' if data.solar else '--',
-        'OK' if data.bands else '--',
-        dx_len,
-    )
     kp = _safe(data.solar or {}, 'kIndex') if data.solar is not None else '--'
     _strfmt_cache["kp"] = 'Kp {}'.format(kp)
     _strfmt_cache["key"] = key
@@ -1239,7 +1331,9 @@ def _solar_view(solar, data_refresh_ts):
         # a default of 0 painted "Kp 0" in GEOMAG — a quiet-sky reading — beside
         # SOLAR's honest '--'. draw_geomag's float() maps it to an empty bar.
         'kIndex_raw':  _safe(s, 'kIndex'),
-        'xray_raw':    _safe(s, 'xray', 'A0.0'),
+        # '--', not 'A0.0': a missing reading is not the quietest possible
+        # flux. draw_xray shows anything that is not a GOES class as no data.
+        'xray_raw':    _safe(s, 'xray'),
     }
     _solar_snapshot["ts"] = data_refresh_ts
     return _solar_snapshot["view"]
@@ -1338,16 +1432,42 @@ def _make_fonts(screen_size=None):
             screen_size = None
     _scale = _font_scale(screen_size or (FONT_REF_W, FONT_REF_H))
 
+    # Bold, because of what 'monospace' actually is on the Pi. pygame resolves
+    # it through an alias table that lists 'freemono' ahead of
+    # 'dejavusansmono', and Debian's python3-pygame pulls in GNU FreeFont, so
+    # the Pi draws every string in FreeMono: a thin Courier clone whose stems
+    # are 0.7-1.2 px wide. A development desktop without that package draws
+    # DejaVu instead, which is why nobody saw it — the Pi's own screenshot
+    # matches a FreeMono render pixel for pixel and misses DejaVu by up to 212
+    # levels. FreeMonoBold ships in the same package and matches FreeMono's
+    # height, ascent, descent and per-glyph advance at every size from 6 to
+    # 39 px, so it roughly doubles the ink without moving a layout boundary.
+    # (A few strings measure one pixel wider at 9, 12, 17 and 22 px, and bold
+    # overruns its line at 8 and 18 px where regular does not — see
+    # _trim_to_line. At 1440x900 none of it moves anything; at 720x450 one
+    # clipped spotter call keeps a character fewer.)
+    #
+    # HAMCLOCK_FONT pins an exact face file. The test suite points it at the
+    # Pi's FreeMonoBold so a desktop measures what the wall display shows.
+    _font_path = os.environ.get('HAMCLOCK_FONT') or None
+
     def mk(size):
         size = max(6, int(round(size * _scale)))
         try:
-            f = pygame.font.SysFont('monospace', size)
+            if _font_path:
+                try:
+                    return pygame.font.Font(_font_path, size)
+                except Exception:
+                    pass    # a bad pin falls back to the face the Pi uses
+            f = pygame.font.SysFont('monospace', size, bold=True)
             if f is None:
                 raise RuntimeError('no monospace')
             return f
         except Exception:
             return pygame.font.Font(None, size + 4)
     _glyph_cache.clear()
+    _volatile_glyphs.clear()
+    _face_trim.clear()
     _font_aa.clear()
     # Sizes render at the 720x450 native framebuffer and are doubled by the
     # HVS on the way to a 1440x900 panel, so the effective on-screen size is
@@ -1450,21 +1570,116 @@ def _fmt_fof2(value):
     return value
 
 
-def _blit_text(screen, font, text, color, x, y):
+# Rows each face drops from the top of every string it renders, decided once
+# per face by _face_top_trim. Cleared by _make_fonts (font ids are reused).
+_face_trim = {}
+
+# Glyphs that overrun the line box in these faces: descenders, brackets,
+# rules. If none of them reaches the top row, the face's top row is padding.
+_TRIM_PROBE = 'Agjpqy|_()[]{}/\\;'
+
+
+def _face_top_trim(font):
+    """How many rows to drop from the top of every string `font` renders.
+
+    It must be the same number for every string of a face, or text shifts
+    against its neighbours: cropping only the strings that overrun moved
+    'Kp' a pixel above its value, and '15 spots' above the rest of the bar."""
+    k = id(font)
+    t = _face_trim.get(k)
+    if t is None:
+        t = 0
+        try:
+            gh = font.get_height()
+            probe = font.render(_TRIM_PROBE, True, (255, 255, 255))
+            extra = probe.get_height() - gh
+            if extra > 0 and probe.get_flags() & pygame.SRCALPHA:
+                ink = probe.get_bounding_rect(min_alpha=1)
+                if ink.h > 0:
+                    t = min(extra, ink.y)
+        except Exception:
+            t = 0
+        _face_trim[k] = t
+    return t
+
+
+def _trim_to_line(surf, gh, top=0):
+    """`surf` as exactly `gh` rows, starting `top` rows down.
+
+    Font.render can return a surface one row taller than Font.get_height():
+    measured between 6 and 36 px in FreeMono, FreeMonoBold and DejaVu alike,
+    including FreeMonoBold's 18 px body face at 1440x900, which renders 19
+    rows. Every layout calculation in this file sizes its rows from
+    get_height(), so that extra row is painted one pixel outside the box it
+    was measured for. `top` comes from _face_top_trim and is the same for
+    every string of a face, so a string that does not overrun moves exactly
+    as far as one that does."""
+    h = surf.get_height()
+    if gh <= 0 or (top <= 0 and h <= gh):
+        return surf
+    try:
+        if top + gh <= h:
+            return surf.subsurface(pygame.Rect(0, top, surf.get_width(), gh)).copy()
+        out = pygame.Surface((surf.get_width(), gh), surf.get_flags(), surf)
+        if surf.get_flags() & pygame.SRCALPHA:
+            out.fill((0, 0, 0, 0))
+        out.blit(surf, (0, -top))
+        return out
+    except Exception:
+        return surf
+
+
+# Glyph-cache counters for the diagnostics report. Integers bumped in place:
+# no allocation on the hit path, which runs for every string on every redraw.
+_glyph_stats = {'hit': 0, 'miss': 0, 'evict': 0, 'volatile': 0}
+
+# Strings that change every second get their own tiny cache: big enough for
+# the current second's clock and status strings to be redrawn for free (a
+# full repaint, a notice clearing mid-second), too small to matter.
+_VOLATILE_CAP = 8
+_volatile_glyphs = collections.OrderedDict()
+
+
+def _blit_text(screen, font, text, color, x, y, cache=True):
+    """Blit `text`, rendering it at most once while it stays in the cache.
+
+    cache=False is for strings that change every second: the UTC and local
+    clock, and the status bar's ages. They used to share the main 256-entry
+    LRU, pushing about 180 one-off entries into it a minute and evicting every
+    panel's strings before that panel's next once-a-minute redraw. Each redraw
+    then re-rendered all of its text from the font — likely most of what the
+    report's panel_ms figures were measuring, though only the misses are
+    measured, not what each costs on the Pi's ARMv6. They now live in
+    _volatile_glyphs instead."""
     try:
         s = str(text)
         if not isinstance(color, tuple):
             color = tuple(color)
+        if not cache:
+            key = (_font_key(font), s, color)
+            surf = _volatile_glyphs.get(key)
+            if surf is None:
+                _glyph_stats['volatile'] += 1
+                surf = _trim_to_line(
+                    font.render(s, _font_aa.get(id(font), True), color),
+                    font.get_height(), _face_top_trim(font))
+                _volatile_glyphs[key] = surf
+                if len(_volatile_glyphs) > _VOLATILE_CAP:
+                    _volatile_glyphs.popitem(last=False)
+            screen.blit(surf, (x, y))
+            return surf.get_width()
         key = (_font_key(font), s, color)
         surf = _glyph_cache.get(key)
         if surf is None:
+            _glyph_stats['miss'] += 1
             # Tier-1a perf: per-font AA flag (set in _make_fonts) read via
             # the _font_aa side-channel dict (pygame Font rejects attr set).
             # AA only for 'title' at 22 px; smaller fonts render flat to
             # dodge the 5-10x AA cost on armv6. Default True for fonts not
             # registered (e.g. ad-hoc fonts in recovery overlay).
             aa = _font_aa.get(id(font), True)
-            surf = font.render(s, aa, color)
+            surf = _trim_to_line(font.render(s, aa, color), font.get_height(),
+                                 _face_top_trim(font))
             # Tier-1a perf: convert glyph to the display's pixel format once
             # at cache-insert time so subsequent blits skip the per-pixel
             # format-conversion the blitter would otherwise pay.
@@ -1488,7 +1703,9 @@ def _blit_text(screen, font, text, color, x, y):
             _glyph_cache[key] = surf
             if len(_glyph_cache) > _GLYPH_CACHE_CAP:
                 _glyph_cache.popitem(last=False)
+                _glyph_stats['evict'] += 1
         else:
+            _glyph_stats['hit'] += 1
             _glyph_cache.move_to_end(key)
         screen.blit(surf, (x, y))
         return surf.get_width()
@@ -1537,9 +1754,12 @@ def _fit_text(font, text, max_w):
         return text
 
 
-def _blit_fit(screen, font, text, color, x, y, max_w):
+def _blit_fit(screen, font, text, color, x, y, max_w, cache=True):
     """_blit_text with a hard width clamp. See _fit_text."""
-    return _blit_text(screen, font, _fit_text(font, text, max_w), color, x, y)
+    fitted = _fit_text(font, text, max_w)
+    if cache:
+        return _blit_text(screen, font, fitted, color, x, y)
+    return _blit_text(screen, font, fitted, color, x, y, cache=False)
 
 
 def _smoothscale_safe(surface, size):
@@ -1633,11 +1853,19 @@ def draw_header(screen, rect, callsign, fonts, theme, data=None):
     utc_x = rect.x + int(rect.w * 0.53)
     loc_x = rect.x + int(rect.w * 0.75)
     dot_x = rect.x + rect.w - 18
-    _blit_fit(screen, fonts['title'], 'HAMCLOCK LITE', theme['accent'],
-              title_x, rect.y + 4, call_x - title_x - 4)
+    # The time is what a clock is for, so it gets the large face. It was drawn
+    # in 'body' — 10 px capitals at 1440x900, smaller than the app's own name —
+    # at fixed offsets from the top that left the bottom half of the bar
+    # empty. Everything is now centred vertically. 'UTC 17:29:32' in the title
+    # face is 216 px against a 313 px column at 1440x900, and 108 px against
+    # 155 px at 720x450.
+    f = fonts['title']
+    ty = rect.y + max(0, (rect.h - f.get_height()) // 2)
+    _blit_fit(screen, f, 'HAMCLOCK LITE', theme['accent'],
+              title_x, ty, call_x - title_x - 4)
     if callsign:
-        _blit_fit(screen, fonts['body'], str(callsign), theme['bright'],
-                  call_x, rect.y + 8, utc_x - call_x - 4)
+        _blit_fit(screen, f, str(callsign), theme['bright'],
+                  call_x, ty, utc_x - call_x - 4)
     if data is not None:
         cached = _formatted_strings(data)
         utc_str = cached["utc"]
@@ -1648,12 +1876,14 @@ def draw_header(screen, rect, callsign, fonts, theme, data=None):
             local_str = 'LOC ' + time.strftime('%H:%M:%S')
         except Exception:
             utc_str = local_str = '--:--:--'
-    _blit_fit(screen, fonts['body'], utc_str, theme['fg'],
-              utc_x, rect.y + 8, loc_x - utc_x - 4)
-    _blit_fit(screen, fonts['body'], local_str, theme['fg'],
-              loc_x, rect.y + 8, dot_x - 6 - loc_x)
+    # cache=False: a new string every second, never drawn twice.
+    _blit_fit(screen, f, utc_str, theme['fg'],
+              utc_x, ty, loc_x - utc_x - 4, cache=False)
+    _blit_fit(screen, f, local_str, theme['fg'],
+              loc_x, ty, dot_x - 6 - loc_x, cache=False)
     dot_color = theme['good'] if (int(time.time()) % 2 == 0) else theme['fair']
-    pygame.draw.circle(screen, dot_color, (dot_x, rect.y + 14), 5)
+    pygame.draw.circle(screen, dot_color, (dot_x, rect.centery),
+                       max(5, rect.h // 12))
 
 
 def draw_solar(screen, rect, solar, fonts, theme, data_refresh_ts=None):
@@ -1924,8 +2154,16 @@ def _draw_value_and_bar(screen, rect, text, value, vmax, color, fonts, theme):
 
 
 def draw_muf_text(screen, rect, solar, fonts, theme, surf=None,
-                  image_key=None, fetched_at=None):
+                  image_key=None, fetched_at=None, status=None):
     """MUF map across the top of the panel, the numbers beneath it.
+
+    Returns the Rect the map was drawn into, or None when no map was drawn,
+    so the render loop can tell which part of the panel actually changed.
+
+    `status` is _image_status_text for the map, drawn over its bottom edge.
+    The SDO and PROPAGATION panels label an old picture; the MUF map lost
+    that label when it moved here from a propagation tab, while the server
+    can keep serving the last good map for up to 24 hours.
 
     The map used to live in a tab of the propagation panel, where it got about
     7% of the screen while this panel spent 35% on five numbers — the one
@@ -1942,6 +2180,7 @@ def draw_muf_text(screen, rect, solar, fonts, theme, surf=None,
     that has no image (and the theme tests) still gets.
     """
     map_h = 0
+    map_rect = None
     if surf is not None:
         try:
             iw, ih = surf.get_size()
@@ -1965,10 +2204,12 @@ def draw_muf_text(screen, rect, solar, fonts, theme, surf=None,
                     map_rect = pygame.Rect(rect.x + (rect.w - draw_w) // 2,
                                            rect.y, draw_w, draw_h)
                     draw_image(screen, map_rect, surf, fonts, theme,
-                               image_key=image_key, fetched_at=fetched_at)
+                               image_key=image_key, fetched_at=fetched_at,
+                               status=status)
                     map_h = draw_h + max(4, rect.h // 40)
         except Exception:
             map_h = 0
+            map_rect = None
     if map_h:
         rect = pygame.Rect(rect.x, rect.y + map_h, rect.w, rect.h - map_h)
 
@@ -1990,7 +2231,7 @@ def draw_muf_text(screen, rect, solar, fonts, theme, surf=None,
     val_h = val_f.get_height()
     glyph_h = max(lab_f.get_height(), val_h)
     if rect.w <= 0 or rect.h < glyph_h:
-        return
+        return map_rect
     foot_h = foot_f.get_height() + 4 if rect.h >= glyph_h * 2 + 12 else 0
     n = len(rows)
     top = rect.y + min(20, max(0, (rect.h - foot_h - glyph_h) // 4))
@@ -2027,6 +2268,7 @@ def draw_muf_text(screen, rect, solar, fonts, theme, surf=None,
                   else 'MUF(3000)km  ·  prop.kc2g.com  (map loading)',
                   theme['label'],
                   lab_x, rect.bottom - foot_h, rect.right - lab_x)
+    return map_rect
 
 
 def draw_dx_spots(screen, rect, dxspots, fonts, theme):
@@ -2044,33 +2286,43 @@ def draw_dx_spots(screen, rect, dxspots, fonts, theme):
     glyph_h = max(lab_f.get_height(), val_f.get_height())
     if rect.w <= 0 or rect.h < glyph_h:
         return
-    fracs = (0.0, 0.26, 0.40, 0.60, 0.85)
+    # DX gets the widest column because it is the call an operator is looking
+    # for, and DXpedition and portable calls run long ('PJ2/K8PGX'). TIME
+    # needs only the four HHMM digits now that the date is dropped.
+    fracs = (0.0, 0.21, 0.33, 0.62, 0.89)
     xs = [rect.x + int(rect.w * f) for f in fracs]
     ws = [xs[i + 1] - xs[i] - 4 for i in range(4)] + [rect.right - xs[4]]
-    n_rows = 1 + 5
-    pitch = max(lab_f.get_height(),
-                min(lab_f.get_height() + 4,
-                    (rect.h - glyph_h) // max(1, n_rows - 1)))
+    pitch = max(glyph_h, lab_f.get_height() + 4)
     for i, head in enumerate(('FREQ', 'BND', 'DX', 'SPOTTER', 'TIME')):
         _blit_fit(screen, lab_f, head, theme['label'], xs[i], rect.y, ws[i])
     y = rect.y + pitch
-    for spot in dxspots[:5]:
+    # As many spots as the panel holds: the row check below stops at the first
+    # one that does not fit. A fixed five came from the 720x450 layout and left
+    # the bottom of the 1440x900 panel empty. 30 bounds the work if a feed ever
+    # sends thousands.
+    for spot in dxspots[:30]:
         if not isinstance(spot, dict):
             continue
         if y + glyph_h > rect.bottom:
             break
         freq = _safe(spot, 'frequency')
         band = _safe(spot, 'band')
-        dx = _safe(spot, 'dxCall')
+        # The server sends the spotted station as 'dx'. This read 'dxCall',
+        # which nothing has ever sent, so the most important column on the
+        # panel showed '--' on every row from the first pygame commit until
+        # 1.0.11. 'dxCall' stays as a fallback for any other producer.
+        dx = _safe(spot, 'dx', _safe(spot, 'dxCall'))
         spotter = _safe(spot, 'spotter')
-        tm = _safe(spot, 'time')
+        # The feed's time field is 'HHMM YYYY-MM-DD'. In a column sized for a
+        # time, the date only ever produced '1728 …'.
+        tm = str(_safe(spot, 'time')).split(' ', 1)[0]
         _blit_fit(screen, val_f, str(freq), theme['accent'], xs[0], y, ws[0])
         _blit_fit(screen, val_f, str(band),
                   band_lut.get(str(band), theme['fg']), xs[1], y, ws[1])
         _blit_fit(screen, val_f, str(dx), theme['bright'], xs[2], y, ws[2])
-        _blit_fit(screen, val_f, str(spotter)[:10], theme['fg'],
-                  xs[3], y, ws[3])
-        _blit_fit(screen, val_f, str(tm), theme['label'], xs[4], y, ws[4])
+        # No silent [:10] cut: _blit_fit marks anything it clips.
+        _blit_fit(screen, val_f, str(spotter), theme['fg'], xs[3], y, ws[3])
+        _blit_fit(screen, val_f, tm, theme['label'], xs[4], y, ws[4])
         y += pitch
 
 
@@ -2203,45 +2455,74 @@ def draw_xray(screen, rect, solar, fonts, theme, data_refresh_ts=None):
         v = _solar_view(solar, data_refresh_ts)
         xray = v['xray_raw']
     else:
-        xray = _safe(solar, 'xray', 'A0.0')
+        xray = _safe(solar, 'xray')
     s = str(xray)
     try:
-        letter = s[0]
+        # A GOES class is one of A/B/C/M/X and a finite magnitude. Anything
+        # else — '--', the server's 'N/A', junk — is no reading, and gets an
+        # empty bar in the label colour rather than a verdict of quiet.
+        scale = {'A': 0, 'B': 1, 'C': 2, 'M': 3, 'X': 4}[s[0].upper()]
         mag = float(s[1:]) if len(s) > 1 else 0.0
-        scale = {'A': 0, 'B': 1, 'C': 2, 'M': 3, 'X': 4}.get(letter.upper(), 0)
+        if not math.isfinite(mag):
+            raise ValueError(s)
         value = scale + (mag / 10.0)
+        color = (theme['good'] if value < 2
+                 else theme['fair'] if value < 3
+                 else theme['poor'])
     except Exception:
         value = 0.0
-    color = (theme['good'] if value < 2
-             else theme['fair'] if value < 3
-             else theme['poor'])
+        color = theme['label']
     _draw_value_and_bar(screen, rect, s, value, 5.0, color, fonts, theme)
 
 
-def draw_open_bands(screen, rect, bands, fonts, theme, data_refresh_ts=None):
+def draw_open_bands(screen, rect, bands, fonts, theme, data_refresh_ts=None,
+                    period=None):
     """Item 7: build the OPEN / CLOSED labels once per data refresh; until
-    the next refresh tick we just read the cached strings."""
-    o, c = _open_bands_strings(bands, data_refresh_ts)
-    # Tier 1.1: 'OPEN: 80m-40m, 30m-20m, 17m-15m' is 31 chars — 155 px in the
-    # label font, in a content rect 128 px wide at 720x450. Step down to the
-    # smaller face before truncating so the band list survives, and derive the
-    # second row's offset from the font instead of a fixed 16 px.
+    the next refresh tick we just read the cached strings.
+
+    `period` is 'day' or 'night'; None means _band_period() — by the clock."""
+    if period not in ('day', 'night'):
+        period = _band_period()
+    o, c = _open_bands_strings(bands, data_refresh_ts, period)
     f = fonts['label']
-    if rect.w > 0 and (f.size(o)[0] > rect.w or f.size(c)[0] > rect.w):
-        f = fonts['small']
     gh = f.get_height()
-    if rect.h < gh:
+    if rect.w <= 0 or rect.h < gh:
         return
-    pitch = min(gh + 6, rect.h - gh)
-    _blit_fit(screen, f, o, theme['good'], rect.x, rect.y, rect.w)
-    if pitch > 0:
-        _blit_fit(screen, f, c, theme['poor'], rect.x, rect.y + pitch, rect.w)
+    # When conditions are best, the OPEN list is longest: three groups ran to
+    # 310 px in a 272 px rect at 1440x900 and the third was cut to '12…'.
+    # Wrap between bands while the lines fit the panel. (This used to step
+    # down to fonts['small'], but 'small' and 'label' are the same size, so
+    # that never helped.)
+    pitch = gh + 4
+    room = 1 + max(0, rect.h - gh) // pitch
+    opens = [(t, theme['good']) for t in _wrap_band_list(f, o, rect.w)]
+    closes = [(t, theme['poor']) for t in _wrap_band_list(f, c, rect.w)]
+    # Fill the room in order of what an operator acts on. The OPEN list is
+    # kept whole if it fits at all (the 720x450 panel is 27 px tall: two
+    # lines); CLOSED is the complement of it, so it is the one to give up.
+    if len(opens) + len(closes) <= room:
+        lines = opens + closes
+    elif len(opens) + 1 <= room:
+        lines = opens + [(c, theme['poor'])]
+    elif len(opens) <= room:
+        lines = opens
+    else:
+        # Not even the OPEN list wraps into the room: one line each, and let
+        # _blit_fit mark whatever it has to cut.
+        lines = [(o, theme['good']), (c, theme['poor'])]
+        pitch = min(gh + 6, rect.h - gh)
+    y = rect.y
+    for i, (text, colour) in enumerate(lines):
+        if i and (pitch <= 0 or y + gh > rect.bottom):
+            break
+        _blit_fit(screen, f, text, colour, rect.x, y, rect.w)
+        y += pitch
 
 
 def draw_status_bar(screen, rect, data, fonts, theme,
                     notice=None, notice_color='accent', update_label=None):
-    """Item 8: status bar text is pulled from _strfmt_cache so the format
-    string is built at most once per UTC second.
+    """The status bar: each feed's age (_status_segments), or a notice, plus
+    the REPORT and UPDATE chips and the quit hint.
 
     Returns {'send_report': Rect} — and, when `update_label` is given,
     {'update': Rect} as well: the hit targets for the opt-in diagnostics
@@ -2269,7 +2550,9 @@ def draw_status_bar(screen, rect, data, fonts, theme,
     # its measured width and give the status string the rest.
     hint = 'ESC/Q to quit'
     hint_x = max(rect.x, rect.right - 6 - f.size(hint)[0])
-    ty = rect.y + max(0, min(4, rect.h - f.get_height()))
+    # Centred: a fixed 4 px from the top was centred in the 720x450 bar and
+    # sat 7 px high in the 40 px one at 1440x900.
+    ty = rect.y + max(0, (rect.h - f.get_height()) // 2)
 
     btn_label = 'REPORT [T]'
     btn_w = f.size(btn_label)[0] + 10
@@ -2301,16 +2584,117 @@ def draw_status_bar(screen, rect, data, fonts, theme,
             text_right = ubtn.x
 
     if notice:
-        text = notice
-        color = theme.get(notice_color, theme['accent'])
+        _blit_fit(screen, f, notice, theme.get(notice_color, theme['accent']),
+                  rect.x + 6, ty, text_right - rect.x - 12)
     else:
-        text = _formatted_strings(data)["status"]
-        color = theme['label']
-    _blit_fit(screen, f, text, color, rect.x + 6, ty,
-              text_right - rect.x - 12)
+        _blit_segments(screen, f, _status_segments(data, theme, time.time()),
+                       rect.x + 6, ty, text_right - rect.x - 12)
     _blit_fit(screen, f, hint, theme['label'], hint_x, ty,
               rect.right - hint_x)
     return regions
+
+
+# A feed counts as stale once it is this many seconds old, i.e. three missed
+# server fetches (server.py polls hamqsl every 300 s and the DX cluster every
+# 120 s). One miss is a transient; three is an outage the operator should see.
+_FEED_STALE_S = {'solar': 900.0, 'bands': 900.0, 'dx': 360.0}
+
+# How long the client may go without reaching its own server before the bar
+# says so. The data layer polls every 60 s.
+_SERVER_SILENT_S = 180.0
+
+
+def _status_segments(data, theme, now):
+    """The status bar's data-freshness line, as [(text, colour), ...].
+
+    It used to read 'Data:42s Img:403s Solar:OK Bands:OK DX:15', where 42 s
+    was the time since the client last POLLED its own server. The poll kept
+    succeeding while an upstream feed was down, so an outage read as fresh
+    data indefinitely, and 'Solar:OK' meant only that a dict was non-empty.
+    The server has always published each feed's real age on /api/health;
+    this shows those ages, advanced by the time since that poll, and colours
+    a feed that has missed three fetches in a row.
+
+    TOTAL: everything off the wire is type-checked, and anything this cannot
+    read falls back to the old poll age, labelled as what it is."""
+    label = theme['label']
+    poor = theme.get('poor', label)
+    segs = []
+
+    def _stamp(name, fallback):
+        v = getattr(data, name, fallback)
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else 0.0
+
+    try:
+        polled = _stamp('last_data_refresh', 0)
+        # A data layer from before 1.0.11 has neither stamp; its poll stamp
+        # is the best it can offer.
+        contact = _stamp('last_contact', polled) if hasattr(data, 'last_contact') else polled
+        health_at = _stamp('health_at', polled) if hasattr(data, 'health_at') else polled
+        if polled and not contact:
+            # Polled, and never once answered. The client and server start
+            # together at boot and the first poll can beat the server to its
+            # port; the data layer then waits a minute to poll again. Give
+            # it the same grace as "silent" before calling it a fault.
+            if _mono() - _IMPORT_MONO < _SERVER_SILENT_S:
+                segs.append(('waiting for server', label))
+            else:
+                segs.append(('server unreachable', poor))
+        elif contact and now - contact >= _SERVER_SILENT_S:
+            segs.append(('server silent %s' % _fmt_age(now - contact), poor))
+        health = getattr(data, 'health', None)
+        have = False
+        if isinstance(health, dict):
+            for name, key in (('Solar', 'solar_age'), ('Bands', 'bands_age'),
+                              ('DX', 'dx_age')):
+                age = health.get(key)
+                if (not isinstance(age, (int, float)) or isinstance(age, bool)
+                        or age != age):
+                    continue
+                have = True
+                if age < 0:
+                    # Never fetched. True for the first seconds of every boot,
+                    # so not red: a feed that never arrives is already plain
+                    # from its panel, which shows '--' for every value.
+                    segs.append(('%s --' % name, label))
+                    continue
+                # The ages were true at health_at. If the server has gone
+                # quiet since, they keep growing from there — which is what
+                # turns them red during an outage of the Pi's own server.
+                age = float(age) + (max(0.0, now - health_at) if health_at else 0.0)
+                stale = age >= _FEED_STALE_S.get(name.lower(), 900.0)
+                segs.append(('%s %s' % (name, _fmt_age(age)),
+                             poor if stale else label))
+        if not have and contact:
+            segs.append(('polled %s ago' % _fmt_age(max(0.0, now - contact)), label))
+        elif not have and not polled:
+            segs.append(('no data yet', label))
+        spots = getattr(data, 'dxspots', None)
+        if isinstance(spots, list):
+            segs.append(('%d spots' % len(spots), label))
+    except Exception:
+        segs = [('status unavailable', label)]
+    return segs
+
+
+def _blit_segments(screen, font, segs, x, y, max_w, gap=None):
+    """Draw [(text, colour), ...] left to right within max_w. Never raises.
+
+    Uncached: the ages change every second. A segment that does not fit is
+    clipped with the usual marker and nothing after it is drawn."""
+    try:
+        gap = font.size('  ')[0] if gap is None else gap
+        right = x + max(0, max_w)
+        for text, colour in segs:
+            room = right - x
+            if room <= 0:
+                break
+            w = _blit_fit(screen, font, text, colour, x, y, room, cache=False)
+            if w <= 0 or font.size(text)[0] > room:
+                break
+            x += w + gap
+    except Exception:
+        pass
 
 
 # Tier 1.2: keys whose payload failed to decode, stamped with the fetch ts
@@ -2708,18 +3092,138 @@ def _record_frame_ms(t0):
     global _frame_ms_pos, _frame_ms_n
     ms = (_mono() - t0) * 1000.0
     if ms < 0.0 or ms > _FRAME_MS_SANE_MAX:
-        return
+        return None
     _frame_ms_ring[_frame_ms_pos] = ms
     _frame_ms_pos = (_frame_ms_pos + 1) % _FRAME_MS_CAP
     if _frame_ms_n < _FRAME_MS_CAP:
         _frame_ms_n += 1
+    return ms
 
 
 def _record_panel_ms(name, t0):
-    """Record the last draw cost of one panel. Same no-allocation contract."""
+    """Record the last draw cost of one panel. Same no-allocation contract.
+
+    ONE sample per panel, overwritten every draw — so comparing two reports
+    panel by panel compares two moments, not two builds."""
     ms = (_mono() - t0) * 1000.0
     if 0.0 <= ms <= _FRAME_MS_SANE_MAX:
         _panel_ms[name] = ms
+
+
+# ---- present cost --------------------------------------------------------
+# The whole display.update()/flip() call, timed on its own — on the Pi chiefly
+# SDL's texture upload — with the height of the band it uploads. frame_ms
+# includes this cost but
+# cannot separate it from drawing, and it is the part that depends on WHERE
+# things were drawn rather than what (see _SLOW_PHASE_OFFSET_S). Same
+# fixed-size ring discipline as frame_ms.
+_present_ms_ring = [0.0] * _FRAME_MS_CAP
+_present_span_ring = [0] * _FRAME_MS_CAP
+_present_pos = 0
+_present_n = 0
+_present_flips = 0
+
+
+def _dirty_span(rects):
+    """Rows SDL uploads for these dirty rects: one full-width band from the
+    top of the highest to the bottom of the lowest, whatever lies between."""
+    if not rects:
+        return 0
+    return max(r.bottom for r in rects) - min(r.top for r in rects)
+
+
+def _record_present(ms, span_rows, flipped):
+    """One presented frame: upload cost in ms, rows uploaded, full flip?"""
+    global _present_pos, _present_n, _present_flips
+    if ms is None or ms < 0.0 or ms > _FRAME_MS_SANE_MAX:
+        return
+    _present_ms_ring[_present_pos] = ms
+    _present_span_ring[_present_pos] = int(span_rows)
+    _present_pos = (_present_pos + 1) % _FRAME_MS_CAP
+    if _present_n < _FRAME_MS_CAP:
+        _present_n += 1
+    if flipped:
+        _present_flips += 1
+
+
+def _present_summary():
+    """{'n','p50','p90','max','span_p50','span_max','flips_total'}, ms/rows."""
+    n = _present_n
+    if n <= 0:
+        return {'n': 0}
+    vals = sorted(_present_ms_ring[:n])
+    spans = sorted(_present_span_ring[:n])
+    return {
+        'n': n,
+        'p50': round(_percentile(vals, 0.50), 1),
+        'p90': round(_percentile(vals, 0.90), 1),
+        'max': round(vals[-1], 1),
+        'span_p50': _percentile(spans, 0.50),
+        'span_max': spans[-1],
+        'flips_total': _present_flips,
+    }
+
+
+# The slowest recent frames and what each one drew. p99 alone said frames
+# were slow but not which or why, and a reader had to guess; the guess that
+# five heavy panels were piling up turned out to be wrong. Appended to only
+# when a frame is actually slow, so ordinary frames allocate nothing.
+_SLOW_FRAME_MS = 80.0
+_slow_frames = collections.deque(maxlen=32)
+
+
+def _note_slow_frame(frame_ms, present_ms, span_rows, drew, flipped):
+    if frame_ms is None or frame_ms < _SLOW_FRAME_MS:
+        return
+    _slow_frames.append((
+        _mono(), round(frame_ms, 1),
+        None if present_ms is None else round(present_ms, 1),
+        int(span_rows), '+'.join(sorted(drew)) or '-', bool(flipped)))
+
+
+def _slow_frames_summary(limit=8, window_s=120.0):
+    """The `limit` slowest frames of the last `window_s`, slowest first."""
+    try:
+        now = _mono()
+        recent = sorted((f for f in _slow_frames if now - f[0] <= window_s),
+                        key=lambda f: f[1], reverse=True)[:limit]
+        return [{'ago_s': round(now - t, 1), 'ms': ms, 'present_ms': pm,
+                 'span': sp, 'drew': drew, 'flip': fl}
+                for (t, ms, pm, sp, drew, fl) in recent]
+    except Exception:
+        return []
+
+
+# Wall clock minus monotonic clock at import. If the wall clock is stepped
+# while the process runs (an NTP correction on a Pi with no RTC), the
+# difference between this and the same figure at report time is the step.
+# The Oct 2026 report revealed a ~10 s backward step in the seven minutes
+# before it was sent; nothing in it said so.
+_WALL_MINUS_MONO_AT_IMPORT = time.time() - _mono() if hasattr(time, 'monotonic') else None
+_IMPORT_MONO = _mono()
+
+
+def _clock_step_s():
+    """Net wall-clock step since this process started, in seconds, or None."""
+    try:
+        if _WALL_MINUS_MONO_AT_IMPORT is None:
+            return None
+        return round((time.time() - time.monotonic()) - _WALL_MINUS_MONO_AT_IMPORT, 1)
+    except Exception:
+        return None
+
+
+def _ntp_synced():
+    """True when systemd-timesyncd has synchronised the clock since boot,
+    False when it has not, None when this is not a timesyncd system."""
+    try:
+        if os.path.exists('/run/systemd/timesync/synchronized'):
+            return True
+        if os.path.isdir('/run/systemd/timesync'):
+            return False
+    except Exception:
+        pass
+    return None
 
 
 def _percentile(vals, q):
@@ -3243,14 +3747,22 @@ def _collect_telemetry(screen, data, fonts=None, settings=None,
             'version': _app_version(),
             'mode': 'pygame',
             'install': _install_kind(),
+            # host.uptime_s is the machine's. The Oct 2026 report read as six
+            # days of clean fetches; both processes were seven minutes old.
+            'proc_age_s': _process_age_s(),
         },
-        'host': _collect_host(),
+        'host': dict(_collect_host(), clock_step_s=_clock_step_s(),
+                     ntp_synced=_ntp_synced()),
         'display': _collect_display(screen),
         'versions': _collect_versions(),
         'perf': {
             'frame_ms': _frame_ms_summary(),
             'panel_ms': dict((k, round(v, 1)) for k, v in _panel_ms.items()),
             'boot_to_first_paint_s': _first_paint_s,
+            'present': _present_summary(),
+            'slow_frames': _slow_frames_summary(),
+            'glyph': dict(_glyph_stats, size=len(_glyph_cache),
+                          cap=_GLYPH_CACHE_CAP),
         },
         # defer_server: leave this for the sender thread. Collecting it here
         # blocks the 10 FPS render loop while the confirm dialog is being
@@ -4334,9 +4846,6 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
         print('data start error:', e, file=sys.stderr)
 
     active_tab = 'drap'
-    # Absolute deadline rather than a countdown, so a long frame or a paused
-    # process cannot make the panel drift slower than the configured interval.
-    next_tab_at = time.time() + TAB_CYCLE_S
     image_cache = {}
     image_cache_ts = {}
     tab_regions = {}
@@ -4370,7 +4879,19 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
     # Fixed anchor for every panel's cadence grid. Never reassigned: the grid
     # must survive full flips, which is precisely what the previous scheme did
     # not do.
-    _sched_epoch = time.time()
+    # On a whole second, so the header's 1 s grid ticks with the clock it
+    # displays: anchored at an arbitrary fraction, the seconds shown could
+    # lag true time by up to a second. Integer grid points stay aligned with
+    # true seconds across any later wall-clock step.
+    _sched_epoch = float(math.floor(time.time()))
+    # Wall time last frame, to notice the clock being stepped backwards.
+    _last_now = [None]
+    # The first tab advance, on the propagation panel's grid. An absolute
+    # deadline rather than a countdown, so a long frame or a paused process
+    # cannot make the panel drift slower than the configured interval.
+    next_tab_at = _next_tab_at(_sched_epoch, _sched_epoch, TAB_CYCLE_S)
+    # What the MUF map looked like the last time the panel was presented.
+    _muf_last_sig = [None]
 
     clock = pygame.time.Clock()
     running = True
@@ -4512,7 +5033,8 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                                 # this map. Give them the full interval to
                                 # read it rather than yanking it away partway
                                 # through whatever the cycle had left.
-                                next_tab_at = time.time() + TAB_CYCLE_S
+                                next_tab_at = _next_tab_at(
+                                    time.time(), _sched_epoch, TAB_CYCLE_S)
                                 break
 
             if _report_poll(report):
@@ -4584,6 +5106,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
             # paint the new tab into a partial-update frame and leave the old
             # tab's pixels behind until something else forced a flip.
             if TAB_CYCLE_S > 0 and time.time() >= next_tab_at:
+                _tab_slot = next_tab_at
                 _cycled = _next_cycle_tab(active_tab, PROP_TABS,
                                           tab_image_key, data)
                 if _cycled != active_tab:
@@ -4593,7 +5116,7 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     # redrew all twelve panels in one frame — measured at
                     # 314 ms against a 100 ms budget. That was tolerable when
                     # a human clicked a tab; it is not when the panel cycles
-                    # itself every five minutes.
+                    # itself every minute.
                     #
                     # prev_active_tab is advanced here so the will_full_flip
                     # predicate does not see a tab change and force the flip
@@ -4604,8 +5127,15 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     # path: it is rare, and someone standing at the screen is
                     # better served by a guaranteed-clean repaint.
                     dirty_state['prev_active_tab'] = active_tab
-                    _panel_due_at['propagation'] = 0.0
-                next_tab_at = time.time() + TAB_CYCLE_S
+                    # Due at the slot, not 0.0, which read as long overdue
+                    # and so skipped the one-frame deferral.
+                    _panel_due_at['propagation'] = min(
+                        _panel_due_at['propagation'], _tab_slot)
+                # The next slot on the grid, not now + interval: this frame is
+                # already a grid slot plus however late the loop came round.
+                next_tab_at = _next_tab_at(
+                    time.time(), _sched_epoch,
+                    TAB_CYCLE_S - _CADENCE_S['propagation'] / 2.0)
 
             sw, sh = screen.get_size()
             # Tier-0 perf: only memset the whole 720x450 framebuffer when this
@@ -4635,14 +5165,43 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
             # display.update() rect list from the actual draws, instead of
             # the speculative dirty-rect helper.
             now_ts = time.time()
+            if _last_now[0] is not None and now_ts < _last_now[0] - 0.5:
+                # The wall clock went backwards (an NTP correction: the Pi
+                # has no RTC; the Oct 2026 report caught a 9.6 s step). Every
+                # due time is now that far in the future, so the header froze
+                # for the length of the step. Re-plan from the new time.
+                for _n in _panel_due_at:
+                    _panel_due_at[_n] = min(
+                        _panel_due_at[_n], _next_due(_n, now_ts, _sched_epoch))
+                next_tab_at = min(next_tab_at, _next_tab_at(
+                    now_ts, _sched_epoch,
+                    TAB_CYCLE_S - _CADENCE_S['propagation'] / 2.0))
+            _last_now[0] = now_ts
             force_all = will_full_flip
+
+            # Set once the header and status bar have had their turn. The
+            # quarter-second phases keep slow panels out of those frames in
+            # steady state, but a long frame (a decode, a GC pause) can land
+            # the loop late enough that the next frame owes both — and then
+            # SDL uploads the band from row 0 to the panel's bottom edge.
+            # Deferring the slow panels by one frame makes it a rule.
+            _defer_slow = [False]
 
             def _panel_due(name):
                 if force_all:
                     return True
-                return _panel_due_at[name] <= now_ts
+                due = _panel_due_at[name]
+                if due > now_ts:
+                    return False
+                # Only a panel that has only just come due waits. One that is
+                # already late draws now: when frames run long, the header is
+                # due on every one of them, and holding late panels back too
+                # would freeze everything but the clock.
+                return not (_defer_slow[0] and _CADENCE_S.get(name, 0.0) > 1.0
+                            and now_ts - due < _DEFER_MAX_LATE_S)
 
             redrawn_this_frame = set()
+            _muf_push_rect = None
 
             header = layout["header"]
             if _panel_due('header'):
@@ -4674,11 +5233,18 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 redrawn_this_frame.add('status')
                 _panel_due_at['status'] = _next_due('status', now_ts, _sched_epoch)
 
+            _defer_slow[0] = (not force_all
+                              and bool(redrawn_this_frame & {'header', 'status'}))
+
             panel_gap = 4
 
             # ---- LEFT COLUMN ----
+            # The title names the forecast half on show, so 'OPEN' is never
+            # read as a statement about the whole day.
+            _ob_period = _band_period(now_ts)
             titles = ['SOLAR', 'BANDS', 'SDO IMAGE',
-                      'GEOMAGNETIC', 'X-RAY FLUX', 'OPEN BANDS']
+                      'GEOMAGNETIC', 'X-RAY FLUX',
+                      'OPEN BANDS (%s)' % _ob_period.upper()]
             layout_keys = ['solar', 'bands', 'sdo',
                            'geomag', 'xray', 'open_bands']
             # Compute inner rects without re-issuing draw_panel chrome on
@@ -4728,9 +5294,14 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('sdo', _t0)
                 redrawn_this_frame.add('sdo')
-                _panel_due_at['sdo'] = now_ts + (
-                    _CADENCE_S['sdo'] if sdo_surf is not None
-                    else _CADENCE_S_NO_IMAGE.get('sdo', _CADENCE_S['sdo']))
+                # On the grid like every other panel. now_ts + cadence let the
+                # image panels drift onto the header's whole seconds.
+                _panel_due_at['sdo'] = (
+                    _next_due('sdo', now_ts, _sched_epoch)
+                    if sdo_surf is not None
+                    else _next_due('sdo', now_ts, _sched_epoch,
+                                   _CADENCE_S_NO_IMAGE.get('sdo'),
+                                   _NO_IMAGE_SHIFT_S))
             if _panel_due('geomag'):
                 _t0 = _mono()
                 try:
@@ -4755,7 +5326,8 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                 _t0 = _mono()
                 try:
                     draw_open_bands(screen, panel_rects[5], data.bands or {},
-                                    fonts, theme, data_refresh_ts=data_ts)
+                                    fonts, theme, data_refresh_ts=data_ts,
+                                    period=_ob_period)
                 except Exception:
                     pass
                 _record_panel_ms('open_bands', _t0)
@@ -4773,18 +5345,39 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                                                  image_cache, image_cache_ts)
                 except Exception:
                     muf_surf = None
+                _muf_fetched = (data.image_fetched_at.get('muf-map', 0.0)
+                                if isinstance(
+                                    getattr(data, 'image_fetched_at', None),
+                                    dict) else 0.0)
+                _muf_status = _image_status_text(data, 'muf-map')
+                _muf_map = None
                 try:
-                    draw_muf_text(
+                    _muf_map = draw_muf_text(
                         screen, mid_inner, data.solar or {}, fonts, theme,
                         surf=muf_surf, image_key='muf-map',
-                        fetched_at=(data.image_fetched_at.get('muf-map', 0.0)
-                                    if isinstance(
-                                        getattr(data, 'image_fetched_at', None),
-                                        dict) else 0.0))
+                        fetched_at=_muf_fetched, status=_muf_status)
                 except Exception:
                     pass
                 _record_panel_ms('muf_text', _t0)
                 redrawn_this_frame.add('muf_text')
+                # This panel is 796 rows tall and the map above the numbers
+                # changes once every 900 s, but the numbers redraw every
+                # minute. When the map is the very one already on screen —
+                # same surface, same fetch, same place, same age label — its
+                # pixels are unchanged, so only the band beneath it is
+                # pushed: about half the upload. (draw_panel and the map are
+                # repainted into the back buffer either way; they are
+                # identical to what is already displayed.)
+                _sig = (id(muf_surf), _muf_fetched,
+                        tuple(_muf_map) if _muf_map else None, _muf_status)
+                if (_muf_map and _sig == _muf_last_sig[0]
+                        and not will_full_flip):
+                    _muf_push_rect = pygame.Rect(
+                        mid_rect.x, _muf_map.bottom, mid_rect.w,
+                        max(1, mid_rect.bottom - _muf_map.bottom))
+                else:
+                    _muf_push_rect = mid_rect
+                _muf_last_sig[0] = _sig
                 _panel_due_at['muf_text'] = _next_due('muf_text', now_ts, _sched_epoch)
 
             # ---- RIGHT COLUMN ----
@@ -4836,21 +5429,27 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                     pass
                 _record_panel_ms('propagation', _t0)
                 redrawn_this_frame.add('propagation')
-                _panel_due_at['propagation'] = now_ts + (
-                    _CADENCE_S['propagation'] if surf is not None
-                    else _CADENCE_S_NO_IMAGE.get('propagation',
-                                                 _CADENCE_S['propagation']))
+                _panel_due_at['propagation'] = (
+                    _next_due('propagation', now_ts, _sched_epoch)
+                    if surf is not None
+                    else _next_due('propagation', now_ts, _sched_epoch,
+                                   _CADENCE_S_NO_IMAGE.get('propagation'),
+                                   _NO_IMAGE_SHIFT_S))
 
             panel_rects_map = {
                 'header': header,
                 'status': status,
-                'solar': panel_rects[0],
-                'bands': panel_rects[1],
-                'sdo': panel_rects[2],
-                'geomag': panel_rects[3],
-                'xray': panel_rects[4],
-                'open_bands': panel_rects[5],
-                'muf_text': mid_rect,
+                # The whole panel, not its inner rect: a due left-column
+                # panel repaints its chrome too, and OPEN BANDS' title now
+                # changes (DAY/NIGHT). Pushing only the inner rect left the
+                # old title on screen until something else uploaded its rows.
+                'solar': layout['solar'],
+                'bands': layout['bands'],
+                'sdo': layout['sdo'],
+                'geomag': layout['geomag'],
+                'xray': layout['xray'],
+                'open_bands': layout['open_bands'],
+                'muf_text': _muf_push_rect or mid_rect,
                 'dx_spots': dx_r,
                 'band_activity': ba_r,
                 'propagation': prop_r,
@@ -4859,22 +5458,34 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
             # _compute_dirty_rects contract (first frame, tab change, pending
             # flag). Otherwise we update only the rects of panels actually
             # redrawn this frame; if nothing was due, we present nothing.
+            _present_ms = None
+            _span = 0
+            _flipped = False
             if (dirty_state.get('full_flip_pending')
                     or dirty_state.get('prev_active_tab') != active_tab):
                 dirty_state['full_flip_pending'] = False
                 dirty_state['prev_active_tab'] = active_tab
+                _pt0 = _mono()
                 pygame.display.flip()
+                _present_ms = (_mono() - _pt0) * 1000.0
+                _span, _flipped = sh, True
                 _note_first_paint()
             else:
                 rects = [panel_rects_map[n] for n in redrawn_this_frame
                          if n in panel_rects_map]
                 if rects:
+                    _pt0 = _mono()
                     pygame.display.update(rects)
+                    _present_ms = (_mono() - _pt0) * 1000.0
+                    _span = _dirty_span(rects)
+            if _present_ms is not None:
+                _record_present(_present_ms, _span, _flipped)
             # Diagnostics: one ring-buffer slot, written in place. Measures
             # the render work, not the tick() sleep that pads it out to the
             # frame budget — the question this answers is whether an ARMv6 Pi
             # can do a frame inside 100 ms, and a sleep would mask that.
-            _record_frame_ms(frame_t0)
+            _note_slow_frame(_record_frame_ms(frame_t0), _present_ms, _span,
+                             redrawn_this_frame, _flipped)
             clock.tick(10)
             consecutive_errors = 0
         except Exception as e:
@@ -4883,6 +5494,13 @@ def _run_render_loop(screen, fonts, theme, settings, injected_iter=None):
                   % (consecutive_errors, e), file=sys.stderr)
             backoff_ms = min(100 * consecutive_errors, 500)
             _render_recovering_overlay(screen, fonts, theme if 'theme' in dir() else THEMES["kstate"])
+            # The overlay painted over the dashboard; the next good frame
+            # must repaint all of it. Without this, panels returned one at a
+            # time on their own cadences and the MUF map — whose rows are
+            # only pushed when the map changes — stayed blank for a minute
+            # on the Pi and indefinitely where SDL uploads exact rects.
+            dirty_state['full_flip_pending'] = True
+            _muf_last_sig[0] = None
             if consecutive_errors > 15:
                 print("too many render errors — exiting for a clean restart",
                       file=sys.stderr)
